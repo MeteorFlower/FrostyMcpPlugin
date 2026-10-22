@@ -90,7 +90,7 @@ namespace FrostyMcpPlugin.Bridge
                 if (p["hash"] != null || LooksLikeHash(idStr))
                 {
                     uint hash = p["hash"] != null
-                        ? Convert.ToUInt32(p["hash"].ToString(), CultureInfo.InvariantCulture)
+                        ? ParseHash(p["hash"].ToString())
                         : ParseHash(idStr);
                     value = LocalizedStringDatabase.Current.GetString(hash);
                     idOut = hash;
@@ -133,7 +133,7 @@ namespace FrostyMcpPlugin.Bridge
                 if (p["hash"] != null || LooksLikeHash(idStr))
                 {
                     uint hash = p["hash"] != null
-                        ? Convert.ToUInt32(p["hash"].ToString(), CultureInfo.InvariantCulture)
+                        ? ParseHash(p["hash"].ToString())
                         : ParseHash(idStr);
                     LocalizedStringDatabase.Current.SetString(hash, value);
                     return new Dictionary<string, object>
@@ -172,7 +172,7 @@ namespace FrostyMcpPlugin.Bridge
             {
                 uint hash;
                 if (p["hash"] != null)
-                    hash = Convert.ToUInt32(p["hash"].ToString(), CultureInfo.InvariantCulture);
+                    hash = ParseHash(p["hash"].ToString());
                 else
                 {
                     string idStr = (p.Value<string>("id") ?? "").Trim();
