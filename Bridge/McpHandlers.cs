@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Threading;
 using FrostySdk.Managers.Entries;
@@ -188,6 +189,8 @@ namespace FrostyMcpPlugin.Bridge
             int maxChars = p.Value<int?>("max_chars") ?? DefaultXmlMaxChars;
             if (maxChars <= 0)
                 maxChars = DefaultXmlMaxChars;
+            bool summary = p.Value<bool?>("summary") ?? false;
+            string filter = (p.Value<string>("filter") ?? "").Trim();
 
             try
             {
@@ -213,6 +216,56 @@ namespace FrostyMcpPlugin.Bridge
                             writer.WriteObjects(asset.RootObjects);
                     }
                     text = Encoding.UTF8.GetString(ms.ToArray());
+                }
+
+                if (summary)
+                {
+                    var counts = new Dictionary<string, int>();
+                    foreach (Match m in Regex.Matches(text, @"<([A-Za-z_][A-Za-z0-9_]*)(?:\s|>|/)"))
+                    {
+                        string tag = m.Groups[1].Value;
+                        counts[tag] = counts.TryGetValue(tag, out int n) ? n + 1 : 1;
+                    }
+                    var top = counts
+                        .OrderByDescending(kv => kv.Value)
+                        .Take(40)
+                        .ToDictionary(kv => kv.Key, kv => kv.Value);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["type"] = entry.Type,
+                        ["guid"] = entry.Guid.ToString(),
+                        ["format"] = xml ? "xml" : "yaml",
+                        ["summary"] = true,
+                        ["length"] = text.Length,
+                        ["elements"] = top
+                    };
+                }
+
+                if (!string.IsNullOrEmpty(filter))
+                {
+                    string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    List<string> hits = lines
+                        .Where(l => l.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+                        .ToList();
+                    string filtered = string.Join("\n", hits);
+                    bool cut = filtered.Length > maxChars;
+                    if (cut)
+                        filtered = filtered.Substring(0, maxChars);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["type"] = entry.Type,
+                        ["guid"] = entry.Guid.ToString(),
+                        ["format"] = xml ? "xml" : "yaml",
+                        ["filter"] = filter,
+                        ["match_count"] = hits.Count,
+                        ["truncated"] = cut,
+                        ["length"] = filtered.Length,
+                        ["content"] = filtered
+                    };
                 }
 
                 bool truncated = text.Length > maxChars;

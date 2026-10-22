@@ -28,7 +28,7 @@ Cursor / Claude / Codex  --stdio-->  mcp_frosty.py  --Named Pipe-->  FrostyMcpPl
 Wire protocol: `uint32_le(payload_length)` + UTF-8 JSON-RPC (same layout as the Cheat Engine MCP bridge).
 
 Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1`  
-Plugin version: **1.13.0**
+Plugin version: **1.13.1**
 
 # Usage
 
@@ -46,7 +46,7 @@ Build `FrostyMcpPlugin.sln` as **Developer - Debug | x64**. A PostBuild step cop
 Start Frosty, load a profile, and check the editor log:
 
 ```
-[MCP v1.13.0] Listening on: Frosty_MCP_Bridge_v1
+[MCP v1.13.1] Listening on: Frosty_MCP_Bridge_v1
 ```
 
 Menu: **Tools → MCP Bridge Status**
@@ -69,7 +69,7 @@ Shared stdio launch:
 |-------|--------|
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
-| `env` | `FROSTY_MCP_VERSION=1.13.0` (optional; bump it when tool schemas change so clients reload) |
+| `env` | `FROSTY_MCP_VERSION=1.13.1` (optional; bump it when tool schemas change so clients reload) |
 
 After changing tools, bump `FROSTY_MCP_VERSION` and restart the MCP server in that client. Call `ping` first; it should return `profile_loaded: true` once Frosty has a profile open.
 
@@ -85,7 +85,7 @@ Or: Cursor Settings → MCP.
     "frosty": {
       "command": "python",
       "args": ["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"],
-      "env": { "FROSTY_MCP_VERSION": "1.13.0" }
+      "env": { "FROSTY_MCP_VERSION": "1.13.1" }
     }
   }
 }
@@ -127,7 +127,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 
 [mcp_servers.frosty.env]
-FROSTY_MCP_VERSION = "1.13.0"
+FROSTY_MCP_VERSION = "1.13.1"
 ```
 
 CLI equivalent:

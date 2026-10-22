@@ -1,5 +1,18 @@
 import sys
 import os
+import json as _json
+
+
+def _json_arg(value, name):
+    """Accept either a JSON string or an already-parsed object."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            return _json.loads(value)
+        except Exception as e:
+            raise ValueError(name + " is not valid JSON: " + str(e))
+    return value
 
 # ============================================================================
 # CRITICAL: WINDOWS LINE ENDING FIX FOR MCP (MONKEY-PATCH)
@@ -121,7 +134,7 @@ def format_result(result):
 # CONFIGURATION
 # ============================================================================
 
-PIPE_NAME = r"\\.\pipe\Frosty_MCP_Bridge_v1"
+PIPE_NAME = os.environ.get("FROSTY_MCP_PIPE") or r"\\.\pipe\Frosty_MCP_Bridge_v1"
 MCP_SERVER_NAME = "frosty"
 MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
 
@@ -295,7 +308,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "1.13.0")
+        + os.environ.get("FROSTY_MCP_VERSION", "1.13.1")
         + ". Includes Type Explorer (search_types, get_type_info, get_type_field, "
         "list_type_namespaces) and BF1 helpers: set_root_flags, add_to_network_registry, "
         "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles."
@@ -494,34 +507,44 @@ def get_ebx_entry(name: str = "", guid: str = "") -> str:
 
 
 @mcp.tool()
-def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 200000) -> str:
+def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 200000,
+                summary: bool = False, filter: str = "") -> str:
     """Export an EBX asset as XML text (truncated if larger than max_chars).
 
     Args:
         name: EBX asset name/path.
         guid: EBX file GUID.
         max_chars: Maximum characters to return (default 200000).
+        summary: return tag counts instead of the full text.
+        filter: return only lines containing this text.
     """
     return format_result(frosty_client.send_command("get_ebx_xml", {
         "name": name,
         "guid": guid,
         "max_chars": max_chars,
+        "summary": summary,
+        "filter": filter,
     }))
 
 
 @mcp.tool()
-def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 200000) -> str:
+def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 200000,
+                 summary: bool = False, filter: str = "") -> str:
     """Export an EBX asset as YAML text (truncated if larger than max_chars).
 
     Args:
         name: EBX asset name/path.
         guid: EBX file GUID.
         max_chars: Maximum characters to return (default 200000).
+        summary: return tag counts instead of the full text.
+        filter: return only lines containing this text.
     """
     return format_result(frosty_client.send_command("get_ebx_yaml", {
         "name": name,
         "guid": guid,
         "max_chars": max_chars,
+        "summary": summary,
+        "filter": filter,
     }))
 
 
@@ -637,6 +660,7 @@ def search_types(
     kind: str = "all",
     hide_empty: bool = False,
     match_subclass: bool = True,
+    compact: bool = True,
     offset: int = 0,
     limit: int = 100,
 ) -> str:
@@ -645,6 +669,7 @@ def search_types(
     query matches type name, Module.Name, or (if match_subclass) subclasses of query.
     namespace filters EbxClassMeta module (e.g. 'Audio', 'TunguskaShared').
     kind is 'all' | 'class' | 'struct' | 'enum'. hide_empty hides types with no fields.
+    compact (default true) returns name/kind/namespace only; set false for full details.
     """
     return format_result(frosty_client.send_command("search_types", {
         "query": query,
@@ -652,6 +677,7 @@ def search_types(
         "namespace": namespace,
         "kind": kind,
         "hide_empty": hide_empty,
+        "compact": compact,
         "match_subclass": match_subclass,
         "offset": offset,
         "limit": limit,
@@ -913,14 +939,20 @@ def import_mesh(name: str = "", guid: str = "", path: str = "", skeleton: str = 
 
 @mcp.tool()
 def list_connections(name: str = "", guid: str = "", kind: str = "all",
-                     offset: int = 0, limit: int = 200) -> str:
+                     offset: int = 0, limit: int = 200,
+                     compact: bool = True, component_guid: str = "",
+                     filter: str = "") -> str:
     """List Property / Event / Link connections on a blueprint EBX.
 
     Args:
         kind: all | property | event | link
+        compact: one-line source/target instead of full pointer objects (default true)
+        component_guid: only connections touching this component GUID
+        filter: only connections whose serialized fields contain this text
     """
     return format_result(frosty_client.send_command("list_connections", {
         "name": name, "guid": guid, "kind": kind, "offset": offset, "limit": limit,
+        "compact": compact, "component_guid": component_guid, "filter": filter,
     }))
 
 
@@ -1124,11 +1156,14 @@ def decode_connection_flags(flags: str = "0") -> str:
 
 @mcp.tool()
 def list_components(name: str = "", guid: str = "", query: str = "", type: str = "",
-                    offset: int = 0, limit: int = 200) -> str:
-    """List internal EBX objects/components with class_guid, Flags, Realm."""
+                    offset: int = 0, limit: int = 200, compact: bool = True) -> str:
+    """List internal EBX objects/components with class_guid, Flags, Realm.
+
+    compact (default true) omits the object_flags breakdown; set false for it.
+    """
     return format_result(frosty_client.send_command("list_components", {
         "name": name, "guid": guid, "query": query, "type": type,
-        "offset": offset, "limit": limit,
+        "offset": offset, "limit": limit, "compact": compact,
     }))
 
 
@@ -1151,7 +1186,7 @@ def create_component(
     array: str = "Objects",
     flag_preset: str = "",
     realm: str = "",
-    properties_json: str = "",
+    properties_json: object = "",
 ) -> str:
     """Create a new internal component from Frostbite SDK type (e.g. DelayEntityData).
 
@@ -1160,19 +1195,16 @@ def create_component(
         array: Root list to append PointerRef into (Objects or Components).
         flag_preset: client | server | client_and_server (optional).
         realm: e.g. ClientAndServer / Client / Server.
-        properties_json: JSON object of initial property values.
+        properties_json: JSON object of initial property values (string or object).
     """
-    import json as _json
     params = {"name": name, "guid": guid, "type": type, "array": array}
     if flag_preset:
         params["flag_preset"] = flag_preset
     if realm:
         params["realm"] = realm
-    if properties_json:
-        try:
-            params["properties"] = _json.loads(properties_json)
-        except Exception:
-            pass
+    props = _json_arg(properties_json, "properties_json")
+    if props is not None:
+        params["properties"] = props
     return format_result(frosty_client.send_command("create_component", params))
 
 
@@ -1183,18 +1215,15 @@ def duplicate_component(
     class_guid: str = "",
     index: int = -1,
     array: str = "Objects",
-    properties_json: str = "",
+    properties_json: object = "",
 ) -> str:
     """Duplicate an internal component (new GUIDs via FrostyClipboard DeepCopy)."""
-    import json as _json
     params = {"name": name, "guid": guid, "class_guid": class_guid, "array": array}
     if index >= 0:
         params["index"] = index
-    if properties_json:
-        try:
-            params["properties"] = _json.loads(properties_json)
-        except Exception:
-            pass
+    props = _json_arg(properties_json, "properties_json")
+    if props is not None:
+        params["properties"] = props
     return format_result(frosty_client.send_command("duplicate_component", params))
 
 
@@ -1379,7 +1408,7 @@ def create_ebx_class(
     create_only: bool = False,
     flag_preset: str = "",
     realm: str = "",
-    properties_json: str = "",
+    properties_json: object = "",
 ) -> str:
     """Create a new class inside an EBX (Frosty property-grid 'Create Class' on PointerRef).
 
@@ -1396,7 +1425,6 @@ def create_ebx_class(
         create_only: Only AddObject; do not assign to a path.
         flag_preset / realm / properties_json: Same as create_component.
     """
-    import json as _json
     params = {
         "name": name, "guid": guid, "type": type, "path": path,
         "class_guid": class_guid, "mode": mode,
@@ -1408,11 +1436,9 @@ def create_ebx_class(
         params["flag_preset"] = flag_preset
     if realm:
         params["realm"] = realm
-    if properties_json:
-        try:
-            params["properties"] = _json.loads(properties_json)
-        except Exception:
-            pass
+    props = _json_arg(properties_json, "properties_json")
+    if props is not None:
+        params["properties"] = props
     return format_result(frosty_client.send_command("create_ebx_class", params))
 
 
@@ -1645,8 +1671,14 @@ def research_component_usage(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def hash_string(text: str = "", lowercase: bool = False, float_value: str = "") -> str:
-    """Compute FNV1 / localized hash (and optional float→hex). text may be '0x...' to parse hex."""
+def hash_string(text: str = "", lowercase: bool = False, float_value: str = "",
+                value: str = "") -> str:
+    """Compute FNV1 / localized hash (and optional float→hex). text may be '0x...' to parse hex.
+
+    value is accepted as an alias for text.
+    """
+    if not text:
+        text = value
     params = {"text": text, "lowercase": lowercase}
     if float_value:
         params["float"] = float_value
@@ -1726,16 +1758,13 @@ def create_struct(
     guid: str = "",
     path: str = "",
     class_guid: str = "",
-    properties_json: str = "",
+    properties_json: object = "",
 ) -> str:
     """Create a Frostbite struct (DataField, LinearTransform, ...). Optionally append to EBX path list."""
-    import json as _json
     params = {"type": type, "name": name, "guid": guid, "path": path, "class_guid": class_guid}
-    if properties_json:
-        try:
-            params["properties"] = _json.loads(properties_json)
-        except Exception:
-            pass
+    props = _json_arg(properties_json, "properties_json")
+    if props is not None:
+        params["properties"] = props
     return format_result(frosty_client.send_command("create_struct", params))
 
 

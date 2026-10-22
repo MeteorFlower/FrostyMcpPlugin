@@ -26,6 +26,7 @@ namespace FrostyMcpPlugin.Bridge
             string kindFilter = (p.Value<string>("kind") ?? "all").Trim().ToLowerInvariant();
             bool hideEmpty = p.Value<bool?>("hide_empty") ?? false;
             bool matchSubclass = p.Value<bool?>("match_subclass") ?? true;
+            bool compact = p.Value<bool?>("compact") ?? true;
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
 
@@ -91,7 +92,7 @@ namespace FrostyMcpPlugin.Bridge
                 .ToList();
 
             List<object> page = all.Skip(offset).Take(limit)
-                .Select(t => (object)SummarizeType(t))
+                .Select(t => (object)SummarizeType(t, compact))
                 .ToList();
 
             return new Dictionary<string, object>
@@ -106,6 +107,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["namespace"] = nsFilter,
                 ["kind"] = kindFilter,
                 ["hide_empty"] = hideEmpty,
+                ["compact"] = compact,
                 ["types"] = page
             };
         }
@@ -432,19 +434,23 @@ namespace FrostyMcpPlugin.Bridge
             return field;
         }
 
-        private static Dictionary<string, object> SummarizeType(Type t)
+        private static Dictionary<string, object> SummarizeType(Type t, bool compact = false)
         {
             string ebxNs = GetEbxNamespace(t);
-            return new Dictionary<string, object>
+            var d = new Dictionary<string, object>
             {
                 ["name"] = t.Name,
                 ["kind"] = GetKind(t),
-                ["ebx_namespace"] = ebxNs ?? "",
-                ["display_name"] = string.IsNullOrEmpty(ebxNs) ? t.Name : (ebxNs + "." + t.Name),
-                ["full_name"] = t.FullName,
-                ["base_type"] = (t.BaseType != null && t.BaseType != typeof(object) && !t.IsEnum) ? t.BaseType.Name : (t.IsEnum ? "Enum" : null),
-                ["field_count"] = t.IsEnum ? (t.GetEnumNames()?.Length ?? 0) : CountDeclaredFields(t)
+                ["ebx_namespace"] = ebxNs ?? ""
             };
+            if (!compact)
+            {
+                d["display_name"] = string.IsNullOrEmpty(ebxNs) ? t.Name : (ebxNs + "." + t.Name);
+                d["full_name"] = t.FullName;
+                d["base_type"] = (t.BaseType != null && t.BaseType != typeof(object) && !t.IsEnum) ? t.BaseType.Name : (t.IsEnum ? "Enum" : null);
+                d["field_count"] = t.IsEnum ? (t.GetEnumNames()?.Length ?? 0) : CountDeclaredFields(t);
+            }
+            return d;
         }
 
         private static Type ResolveType(string typeName)
