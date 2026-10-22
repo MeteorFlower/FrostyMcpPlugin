@@ -1,3 +1,5 @@
+> This branch targets the official Frosty Toolsuite 1.0.6.3; the [Adapt-Virjoinga branch](https://github.com/MeteorFlower/FrostyMcpPlugin/tree/Adapt-Virjoinga) supports the BFN-specific Frosty Toolsuite.
+
 # Frosty MCP Bridge
 
 A plugin for [Frosty Editor](https://github.com/CadeEvs/FrostyToolsuite) that exposes the currently loaded game project to any MCP client (Cursor, Claude Desktop, Claude Code, OpenAI Codex, and others) over the [Model Context Protocol](https://modelcontextprotocol.io/).
