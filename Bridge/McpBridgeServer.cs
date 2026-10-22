@@ -24,9 +24,9 @@ namespace FrostyMcpPlugin.Bridge
             {
                 string profile = ProfilesLibrary.ProfileName;
                 if (!string.IsNullOrEmpty(profile))
-                    return "Frosty_MCP_Bridge_v1_" + profile;
+                    return PipeProfiles.PipeNameFor(profile);
 
-                return "Frosty_MCP_Bridge_v1";
+                return PipeProfiles.BasePipeName;
             }
         }
 

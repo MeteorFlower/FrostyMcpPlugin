@@ -134,7 +134,60 @@ def format_result(result):
 # CONFIGURATION
 # ============================================================================
 
-PIPE_NAME = os.environ.get("FROSTY_MCP_PIPE") or r"\\.\pipe\Frosty_MCP_Bridge_v1"
+PIPE_PREFIX = r"\\.\pipe\Frosty_MCP_Bridge_v1"
+PIPE_PROFILES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "pipe_profiles.json"
+)
+
+
+def _load_pipe_profiles():
+    """Read the generated profile table written by gen_pipe_profiles.py."""
+    try:
+        with open(PIPE_PROFILES_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except OSError:
+        return None
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, list):
+        return None
+    return profiles
+
+
+def _resolve_pipe_name():
+    explicit = os.environ.get("FROSTY_MCP_PIPE")
+    if explicit:
+        return explicit
+
+    wanted = os.environ.get("FROSTY_MCP_PROFILE", "").strip()
+    if not wanted:
+        return PIPE_PREFIX
+
+    profiles = _load_pipe_profiles()
+    if profiles is None:
+        debug_log("pipe_profiles.json is missing; using the raw profile name")
+        return PIPE_PREFIX + "_" + wanted
+
+    folded = wanted.casefold()
+    for entry in profiles:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        display_name = entry.get("display_name")
+        if isinstance(name, str) and name.casefold() == folded:
+            return PIPE_PREFIX + "_" + name
+        if isinstance(display_name, str) and display_name.casefold() == folded:
+            return PIPE_PREFIX + "_" + name
+
+    # Plugin-supplied profiles are not in Frosty's database. The plugin uses
+    # the raw profile name as the suffix too, so this stays consistent.
+    debug_log(
+        'profile "%s" is not in pipe_profiles.json; using it as the pipe suffix'
+        % wanted
+    )
+    return PIPE_PREFIX + "_" + wanted
+
+
+PIPE_NAME = _resolve_pipe_name()
 MCP_SERVER_NAME = "frosty"
 MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
 
@@ -258,8 +311,9 @@ class FrostyNamedPipeBridgeClient:
             if not self.connected:
                 if not self.connect():
                     raise ConnectionError(
-                        "Frosty MCP Bridge is not reachable. "
+                        "Frosty MCP Bridge is not reachable at %s. "
                         "Start Frosty Editor with FrostyMcpPlugin loaded first."
+                        % PIPE_NAME
                     )
 
             request = {

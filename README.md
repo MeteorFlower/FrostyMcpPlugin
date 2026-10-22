@@ -27,8 +27,11 @@ Cursor / Claude / Codex  --stdio-->  mcp_frosty.py  --Named Pipe-->  FrostyMcpPl
 
 Wire protocol: `uint32_le(payload_length)` + UTF-8 JSON-RPC (same layout as the Cheat Engine MCP bridge).
 
-Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1`  
+Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1_<profile>` (falls back to `Frosty_MCP_Bridge_v1` when no profile is loaded)
+
 Plugin version: **1.13.1**
+
+The `<profile>` suffix comes from Frosty's own profile database (`FrostySdk/Profiles.bin`). The table is generated at build time; no game names are hardcoded in the plugin or the Python server.
 
 # Usage
 
@@ -46,7 +49,7 @@ Build `FrostyMcpPlugin.sln` as **Developer - Debug | x64**. A PostBuild step cop
 Start Frosty, load a profile, and check the editor log:
 
 ```
-[MCP v1.13.1] Listening on: Frosty_MCP_Bridge_v1
+[MCP v1.13.1] Listening on: Frosty_MCP_Bridge_v1_<profile>
 ```
 
 Menu: **Tools → MCP Bridge Status**
@@ -70,8 +73,14 @@ Shared stdio launch:
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
 | `env` | `FROSTY_MCP_VERSION=1.13.1` (optional; bump it when tool schemas change so clients reload) |
+| `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix) |
+| `env` | `FROSTY_MCP_PIPE=\\.\pipe\...` (optional; full pipe path override, wins over `FROSTY_MCP_PROFILE`) |
 
 After changing tools, bump `FROSTY_MCP_VERSION` and restart the MCP server in that client. Call `ping` first; it should return `profile_loaded: true` once Frosty has a profile open.
+
+### Multiple editor profiles
+
+Every Frosty editor instance listens on `Frosty_MCP_Bridge_v1_<profile>`, so several editors can run at the same time. Add one server entry per profile and set `FROSTY_MCP_PROFILE` to the internal profile name or the display name shown in Frosty (for example `PVZBattleforNeighborville` or `Plants vs Zombies: Battle for Neighborville™`). `mcp_frosty.py` resolves it through `MCP_Server/pipe_profiles.json`; an unknown profile is used verbatim as the suffix, which matches the plugin.
 
 ### Cursor
 
@@ -201,6 +210,21 @@ To launch from Visual Studio, set the debug start program to your `FrostyEditor.
 msbuild FrostyMcpPlugin.csproj /p:Configuration="Developer - Debug" /p:Platform=x64
 ```
 
+## Pipe profile database
+
+`FrostySdk/Profiles.bin` is Frosty's profile database. `MCP_Server/gen_pipe_profiles.py` reads it and regenerates the two checked-in tables:
+
+- `Bridge/PipeProfiles.g.cs` - compiled into the plugin
+- `MCP_Server/pipe_profiles.json` - read by the Python server
+
+Re-run it after updating Frosty:
+
+```bash
+python MCP_Server/gen_pipe_profiles.py --profiles-bin /path/to/FrostyToolsuite/FrostySdk/Profiles.bin
+```
+
+Do not edit the generated files by hand. A profile that is not in the table still works; the plugin and the Python server both fall back to the raw profile name as the pipe suffix.
+
 ## Optional Frosty plugins
 
 Some MCP tools call into other editor plugins by reflection. They no-op or return a clear error if those plugins are missing:
@@ -235,6 +259,7 @@ The Python file `MCP_Server/mcp_frosty.py` is the source of truth for tool names
 ## Contribution guidelines
 
 - Keep the **core bridge** (pipe server, generic EBX / bundle / connection tools) game-agnostic. If you add something that only makes sense for one title, say so in the tool's docstring.
+- Do not hardcode game or profile names. The known profiles live in the generated table (`Bridge/PipeProfiles.g.cs` and `MCP_Server/pipe_profiles.json`); regenerate it instead of editing source lists.
 - Document new MCP tools in this README and in the `@mcp.tool()` docstring. Bump `McpBridgeServer.Version`, `[assembly: PluginVersion]`, and `FROSTY_MCP_VERSION` together so MCP clients reload the schema.
 - Prefer comments on new handlers: reflection against Frosty APIs is brittle, and the next person needs to know *why* an optional argument is padded.
 

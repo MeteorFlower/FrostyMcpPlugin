@@ -76,6 +76,7 @@
     <Compile Include="Bridge\McpMediaHandlers.cs" />
     <Compile Include="Bridge\McpMoreHandlers.cs" />
     <Compile Include="Bridge\McpTypeExplorerHandlers.cs" />
+    <Compile Include="Bridge\PipeProfiles.g.cs" />
     <Compile Include="Extensions\McpStartupAction.cs" />
     <Compile Include="Extensions\McpStatusMenuExtension.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
