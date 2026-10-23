@@ -30,7 +30,7 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        public const string Version = "1.13.1";
+        public const string Version = "1.13.2";
         public const int MaxRequestBytes = 32 * 1024 * 1024;
 
         public static McpBridgeServer Instance { get; } = new McpBridgeServer();

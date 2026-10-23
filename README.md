@@ -26,7 +26,7 @@ Cursor / Claude / Codex  --stdio-->  mcp_frosty.py  --Named Pipe-->  FrostyMcpPl
 Wire protocol: `uint32_le(payload_length)` + UTF-8 JSON-RPC (same layout as the Cheat Engine MCP bridge).
 
 Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1_<profile>` (falls back to `Frosty_MCP_Bridge_v1` when no profile is loaded)  
-Plugin version: **1.13.1**
+Plugin version: **1.13.2**
 
 The `<profile>` suffix comes from Frosty's own profile database (`FrostySdk/Profiles.bin`). The table is generated at build time; no game names are hardcoded in the plugin or the Python server.
 
@@ -46,7 +46,7 @@ Build `FrostyMcpPlugin.sln` as **Developer - Debug | x64**. A PostBuild step cop
 Start Frosty, load a profile, and check the editor log:
 
 ```
-[MCP v1.13.1] Listening on: Frosty_MCP_Bridge_v1_<profile>
+[MCP v1.13.2] Listening on: Frosty_MCP_Bridge_v1_<profile>
 ```
 
 Menu: **Tools → MCP Bridge Status**
@@ -69,7 +69,7 @@ Shared stdio launch:
 |-------|--------|
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
-| `env` | `FROSTY_MCP_VERSION=1.13.1` (optional; bump it when tool schemas change so clients reload) |
+| `env` | `FROSTY_MCP_VERSION=1.13.2` (optional; bump it when tool schemas change so clients reload) |
 | `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix) |
 | `env` | `FROSTY_MCP_PIPE=\\.\pipe\...` (optional; full pipe path override, wins over `FROSTY_MCP_PROFILE`) |
 
@@ -91,7 +91,7 @@ Or: Cursor Settings → MCP.
     "frosty": {
       "command": "python",
       "args": ["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"],
-      "env": { "FROSTY_MCP_VERSION": "1.13.1" }
+      "env": { "FROSTY_MCP_VERSION": "1.13.2" }
     }
   }
 }
@@ -133,7 +133,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 
 [mcp_servers.frosty.env]
-FROSTY_MCP_VERSION = "1.13.1"
+FROSTY_MCP_VERSION = "1.13.2"
 ```
 
 CLI equivalent:
