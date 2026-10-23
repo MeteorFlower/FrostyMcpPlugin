@@ -207,9 +207,10 @@ namespace FrostyMcpPlugin.Bridge
                 dynamic obj = newAsset.RootObject;
                 obj.Name = newName;
 
-                AssetClassGuid guid = new AssetClassGuid(
-                    Utils.GenerateDeterministicGuid(newAsset.Objects, (Type)obj.GetType(), newAsset.FileGuid), -1);
-                obj.SetInstanceGuid(guid);
+                // Renumber every object, not just the root. Duplicated assets that
+                // share a bundle with their source otherwise keep the source object
+                // GUIDs and can collide in the game's asset/type registry at load time.
+                RenumberAssetObjectGuids(newAsset);
 
                 EbxAssetEntry newEntry = App.AssetManager.AddEbx(newName, newAsset);
                 newEntry.AddedBundles.AddRange(entry.EnumerateBundles());
@@ -237,6 +238,34 @@ namespace FrostyMcpPlugin.Bridge
             catch (Exception ex)
             {
                 return McpHandlers.Error(ex.Message, "DUPLICATE_FAILED");
+            }
+        }
+
+        internal static void RenumberAssetObjectGuids(EbxAsset asset)
+        {
+            HashSet<Guid> usedGuids = new HashSet<Guid>();
+            foreach (object assetObj in asset.Objects)
+            {
+                AssetClassGuid oldGuid = ((dynamic)assetObj).GetInstanceGuid();
+                if (oldGuid.ExportedGuid != Guid.Empty)
+                    usedGuids.Add(oldGuid.ExportedGuid);
+            }
+
+            foreach (object assetObj in asset.Objects)
+            {
+                dynamic dynObj = assetObj;
+                AssetClassGuid oldGuid = dynObj.GetInstanceGuid();
+                if (oldGuid.ExportedGuid == Guid.Empty)
+                    continue;
+
+                Guid newGuid;
+                do
+                {
+                    newGuid = Guid.NewGuid();
+                }
+                while (!usedGuids.Add(newGuid));
+
+                dynObj.SetInstanceGuid(new AssetClassGuid(newGuid, oldGuid.InternalId));
             }
         }
 

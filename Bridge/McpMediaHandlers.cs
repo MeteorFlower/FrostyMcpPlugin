@@ -963,6 +963,16 @@ namespace FrostyMcpPlugin.Bridge
                 EbxAssetEntry newEntry = (EbxAssetEntry)InvokeCompat(
                     extension, "DuplicateAsset", entry, newName, createNew, newType);
 
+                // DuplicationPlugin only renumbers the root object; renumber the
+                // whole graph so the copy cannot collide with its source at load.
+                EbxAsset newAsset = App.AssetManager.GetEbx(newEntry);
+                if (newAsset != null)
+                {
+                    McpEditHandlers.RenumberAssetObjectGuids(newAsset);
+                    newAsset.Update();
+                    App.AssetManager.ModifyEbx(newEntry.Name, newAsset);
+                }
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
