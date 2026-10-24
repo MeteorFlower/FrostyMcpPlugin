@@ -755,19 +755,22 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
-                ExportMeshViaReflection(entry, path, format, version, scale, flatten, singleLod, skeleton);
+                string fullPath = Path.GetFullPath(path);
+                string dir = Path.GetDirectoryName(fullPath);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+                ExportMeshViaReflection(entry, fullPath, format, version, scale, flatten, singleLod, skeleton);
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
-                    ["path"] = Path.GetFullPath(path),
+                    ["path"] = fullPath,
                     ["format"] = format
                 };
             }
             catch (Exception ex)
             {
-                return McpHandlers.Error(ex.Message, "EXPORT_FAILED");
+                return McpHandlers.Error(Unwrap(ex), "EXPORT_FAILED");
             }
         }
 
@@ -799,7 +802,7 @@ namespace FrostyMcpPlugin.Bridge
             }
             catch (Exception ex)
             {
-                return McpHandlers.Error(ex.Message, "IMPORT_FAILED");
+                return McpHandlers.Error(Unwrap(ex), "IMPORT_FAILED");
             }
         }
 
@@ -1429,13 +1432,28 @@ namespace FrostyMcpPlugin.Bridge
 
             EbxAsset asset = App.AssetManager.GetEbx(entry);
             dynamic meshAsset = asset.RootObject;
-            ulong resRid = meshAsset.MeshSetResource;
+            ulong resRid;
+            try
+            {
+                resRid = (ulong)meshAsset.MeshSetResource;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Asset is not a mesh (no MeshSetResource): " + entry.Type, ex);
+            }
+            if (resRid == 0)
+                throw new InvalidOperationException("MeshSetResource is 0");
+
             ResAssetEntry rEntry = App.AssetManager.GetResEntry(resRid);
+            if (rEntry == null)
+                throw new InvalidOperationException("MeshSet RES not found for rid " + resRid);
 
             MethodInfo getResAs = typeof(AssetManager).GetMethods()
                 .First(m => m.Name == "GetResAs" && m.IsGenericMethodDefinition);
             MethodInfo getResAsClosed = getResAs.MakeGenericMethod(meshSetType);
             object meshSet = getResAsClosed.Invoke(App.AssetManager, new object[] { rEntry, null });
+            if (meshSet == null)
+                throw new InvalidOperationException("Failed to load MeshSet resource: " + rEntry.Name);
 
             if (string.IsNullOrEmpty(skeleton))
                 skeleton = Config.Get<string>("MeshSetExportSkeleton", "", ConfigScope.Game);
@@ -1443,7 +1461,8 @@ namespace FrostyMcpPlugin.Bridge
             string fbxVer = version.Replace("FBX_", "");
             object exporter = Activator.CreateInstance(exporterType, new object[] { null });
             MethodInfo export = exporterType.GetMethod("ExportFBX");
-            // ExportFBX(dynamic meshAsset, string filename, string fbxVersion, string units, bool flatten, bool singleLod, string skeleton, string fileType, params MeshSet[] meshSets)
+            if (export == null)
+                throw new InvalidOperationException("FBXExporter.ExportFBX not found");
             object meshSetArray = Array.CreateInstance(meshSetType, 1);
             ((Array)meshSetArray).SetValue(meshSet, 0);
 
@@ -1504,6 +1523,16 @@ namespace FrostyMcpPlugin.Bridge
             {
                 try { fi.SetValue(obj, value); } catch { }
             }
+        }
+
+        private static string Unwrap(Exception ex)
+        {
+            Exception cur = ex;
+            while (cur is TargetInvocationException tie && tie.InnerException != null)
+                cur = tie.InnerException;
+            if (cur.InnerException != null && string.IsNullOrWhiteSpace(cur.Message))
+                cur = cur.InnerException;
+            return cur.GetType().Name + ": " + cur.Message;
         }
     }
 }
