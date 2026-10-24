@@ -300,7 +300,7 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrEmpty(bundleName) || string.IsNullOrEmpty(superName))
                 return McpHandlers.Error("bundle and super_bundle are required", "INVALID_PARAMS");
 
-            int bid = App.AssetManager.GetBundleId(bundleName);
+            int bid = McpHandlers.ResolveBundleId(bundleName);
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found", "NOT_FOUND");
 
@@ -336,7 +336,7 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrEmpty(bundleName))
                 return McpHandlers.Error("bundle is required", "INVALID_PARAMS");
 
-            int bid = App.AssetManager.GetBundleId(bundleName);
+            int bid = McpHandlers.ResolveBundleId(bundleName);
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found", "NOT_FOUND");
 
@@ -683,7 +683,7 @@ namespace FrostyMcpPlugin.Bridge
                 error = McpHandlers.Error("bundle is required", "INVALID_PARAMS");
                 return false;
             }
-            int bid = App.AssetManager.GetBundleId(bundleName);
+            int bid = McpHandlers.ResolveBundleId(bundleName);
             if (bid < 0)
             {
                 error = McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");

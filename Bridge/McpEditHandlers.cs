@@ -213,7 +213,15 @@ namespace FrostyMcpPlugin.Bridge
                 RenumberAssetObjectGuids(newAsset);
 
                 EbxAssetEntry newEntry = App.AssetManager.AddEbx(newName, newAsset);
-                newEntry.AddedBundles.AddRange(entry.EnumerateBundles());
+
+                // Source bundles are optional on purpose. Inheriting them puts the
+                // duplicate next to the original, which is wrong when the duplicate
+                // gets its own bundle: the game then installs two bundle definition
+                // assets for the same bundle and crashes while building the mesh
+                // variation database. Pass copy_bundles=true when the duplicate is
+                // meant to live in the source bundle.
+                if (p.Value<bool?>("copy_bundles") ?? false)
+                    newEntry.AddedBundles.AddRange(entry.EnumerateBundles());
                 newEntry.ModifiedEntry.DependentAssets.AddRange(newAsset.Dependencies);
 
                 bool copyLinked = p.Value<bool?>("copy_linked") ?? false;
@@ -580,7 +588,7 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrEmpty(bundleName))
                 return McpHandlers.Error("bundle is required", "INVALID_PARAMS");
 
-            int bid = App.AssetManager.GetBundleId(bundleName);
+            int bid = McpHandlers.ResolveBundleId(bundleName);
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
 
@@ -609,7 +617,7 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrEmpty(bundleName))
                 return McpHandlers.Error("bundle is required", "INVALID_PARAMS");
 
-            int bid = App.AssetManager.GetBundleId(bundleName);
+            int bid = McpHandlers.ResolveBundleId(bundleName);
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
 
