@@ -120,7 +120,7 @@ namespace FrostyMcpPlugin.Bridge
             if (App.AssetManager == null)
                 return Error("AssetManager not ready", "NOT_READY");
 
-            string query = (p.Value<string>("query") ?? "").Trim().ToLowerInvariant();
+            string query = (p.Value<string>("query") ?? p.Value<string>("name") ?? "").Trim().ToLowerInvariant();
             string typeFilter = (p.Value<string>("type") ?? "").Trim();
             bool modifiedOnly = p.Value<bool?>("modified_only") ?? false;
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);

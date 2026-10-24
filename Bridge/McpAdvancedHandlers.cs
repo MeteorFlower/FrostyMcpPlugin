@@ -290,6 +290,43 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
+        public static object SetBundleSuper(JObject p)
+        {
+            if (App.AssetManager == null)
+                return McpHandlers.Error("AssetManager not ready", "NOT_READY");
+
+            string bundleName = (p.Value<string>("bundle") ?? p.Value<string>("name") ?? "").Trim().ToLowerInvariant();
+            string superName = (p.Value<string>("super_bundle") ?? "").Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(bundleName) || string.IsNullOrEmpty(superName))
+                return McpHandlers.Error("bundle and super_bundle are required", "INVALID_PARAMS");
+
+            int bid = App.AssetManager.GetBundleId(bundleName);
+            if (bid < 0)
+                return McpHandlers.Error("Bundle not found", "NOT_FOUND");
+
+            int sbIndex = App.AssetManager.GetSuperBundleId(superName);
+            if (sbIndex < 0)
+            {
+                App.AssetManager.AddSuperBundle(superName);
+                sbIndex = App.AssetManager.GetSuperBundleId(superName);
+            }
+            if (sbIndex < 0)
+                return McpHandlers.Error("SuperBundle not found and could not be created", "NOT_FOUND");
+
+            BundleEntry be = App.AssetManager.GetBundleEntry(bid);
+            int oldIndex = be.SuperBundleId;
+            be.SuperBundleId = sbIndex;
+
+            return new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["bundle"] = be.Name,
+                ["bundle_id"] = bid,
+                ["old_super_bundle"] = App.AssetManager.GetSuperBundle(oldIndex)?.Name,
+                ["super_bundle"] = App.AssetManager.GetSuperBundle(sbIndex)?.Name
+            };
+        }
+
         public static object ListBundleContents(JObject p)
         {
             if (App.AssetManager == null)

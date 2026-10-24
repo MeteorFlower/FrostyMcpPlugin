@@ -362,7 +362,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "1.13.2")
+        + os.environ.get("FROSTY_MCP_VERSION", "2.0.1")
         + ". Includes Type Explorer (search_types, get_type_info, get_type_field, "
         "list_type_namespaces) and BF1 helpers: set_root_flags, add_to_network_registry, "
         "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles."
@@ -525,6 +525,7 @@ def search_ebx(
     modified_only: bool = False,
     offset: int = 0,
     limit: int = 100,
+    name: str = "",
 ) -> str:
     """Search EBX assets by name substring and optional type filter.
 
@@ -538,7 +539,7 @@ def search_ebx(
     Returns JSON with: success, total, offset, limit, returned, assets.
     """
     return format_result(frosty_client.send_command("search_ebx", {
-        "query": query,
+        "query": query or name,
         "type": type,
         "modified_only": modified_only,
         "offset": offset,
@@ -2227,6 +2228,70 @@ def create_advanced_bundle(
         "bundle": bundle, "super_bundle": super_bundle,
         "bundle_type": bundle_type, "generate_blueprints": generate_blueprints,
         "blueprint_type": blueprint_type,
+    }))
+
+
+@mcp.tool()
+def set_bundle_super(bundle: str = "", super_bundle: str = "") -> str:
+    """Repoint an existing (added) bundle to a different super bundle. Frosty's AddBundle returns the existing bundle unchanged, so this is the only way to fix a bundle's super bundle after creation."""
+    return format_result(frosty_client.send_command("set_bundle_super", {
+        "bundle": bundle, "super_bundle": super_bundle,
+    }))
+
+
+@mcp.tool()
+def delete_bundle(bundle: str = "", clear_members: bool = True) -> str:
+    """Delete an added bundle (Frosty's RevertBundle removes it). Optionally clears its id from every asset's added bundles."""
+    return format_result(frosty_client.send_command("delete_bundle", {
+        "bundle": bundle, "clear_members": clear_members,
+    }))
+
+
+@mcp.tool()
+def list_super_bundles() -> str:
+    """List super bundles with their bundle counts."""
+    return format_result(frosty_client.send_command("list_super_bundles", {}))
+
+
+@mcp.tool()
+def project_stats() -> str:
+    """Project totals: modified/dirty counts, added vs modified EBX, added bundles/res/chunks."""
+    return format_result(frosty_client.send_command("project_stats", {}))
+
+
+@mcp.tool()
+def batch_set_field(items: list = []) -> str:
+    """Apply many field writes in one call. items entries use the same params as set_ebx_field, or set_component_property when index/component_type is present."""
+    return format_result(frosty_client.send_command("batch_set_field", {"items": items}))
+
+
+@mcp.tool()
+def diff_ebx(name: str = "", guid: str = "", limit: int = 200) -> str:
+    """Field-level YAML diff of a modified EBX against its unmodified (vanilla) data."""
+    return format_result(frosty_client.send_command("diff_ebx", {
+        "name": name, "guid": guid, "limit": limit,
+    }))
+
+
+@mcp.tool()
+def validate_refs(names: list = [], limit: int = 200) -> str:
+    """Scan modified assets (or the given names) for dangling external/self/internal pointer refs."""
+    return format_result(frosty_client.send_command("validate_refs", {"names": names, "limit": limit}))
+
+
+@mcp.tool()
+def bundle_closure_check(bundle: str = "", include_outside: bool = False, limit: int = 200) -> str:
+    """Check a bundle's EBX dependency closure: dangling deps and (optionally) deps that live outside the bundle."""
+    return format_result(frosty_client.send_command("bundle_closure_check", {
+        "bundle": bundle, "include_outside": include_outside, "limit": limit,
+    }))
+
+
+@mcp.tool()
+def registry_gap(name: str = "", names: list = [], registry: str = "", registries: list = [], limit: int = 200) -> str:
+    """Compare an asset's exported object GUIDs against NetworkRegistry entries and list what is missing."""
+    return format_result(frosty_client.send_command("registry_gap", {
+        "name": name, "names": names, "registry": registry, "registries": registries, "limit": limit,
     }))
 
 
