@@ -11,6 +11,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace FrostyMcpPlugin.Bridge
 {
@@ -183,7 +184,21 @@ namespace FrostyMcpPlugin.Bridge
                 return new Dictionary<string, object> { ["success"] = true, ["name"] = entry.Name, ["unchanged"] = true };
 
             EbxAsset modified = App.AssetManager.GetEbx(entry);
-            EbxAsset original = App.AssetManager.GetEbx(entry, true);
+
+            // GetEbx(entry, true) still reads through GetAsset(), which returns the
+            // modified stream whenever ModifiedEntry.Data exists, so the flag alone
+            // never reaches vanilla data. Hide the modification for this one read.
+            ModifiedAssetEntry stash = entry.ModifiedEntry;
+            EbxAsset original;
+            entry.ModifiedEntry = null;
+            try
+            {
+                original = App.AssetManager.GetEbx(entry);
+            }
+            finally
+            {
+                entry.ModifiedEntry = stash;
+            }
             if (original == null)
                 return McpHandlers.Error("No unmodified data available for this asset", "NO_VANILLA_DATA");
 
@@ -374,13 +389,22 @@ namespace FrostyMcpPlugin.Bridge
             catch { return Guid.Empty; }
         }
 
+        private static readonly Regex s_internalRef = new Regex(
+            "00000000-0000-0000-0000-[0-9a-fA-F]{12}", RegexOptions.Compiled);
+
         private static string[] ToYamlLines(EbxAsset asset)
         {
             using (MemoryStream ms = new MemoryStream())
             {
                 using (EbxYamlWriter writer = new EbxYamlWriter(ms, App.AssetManager))
-                    writer.WriteObjects(asset.RootObjects);
-                return Encoding.UTF8.GetString(ms.ToArray()).Replace("\r\n", "\n").Split('\n');
+                    writer.WriteObjects(asset.Objects);
+                string text = Encoding.UTF8.GetString(ms.ToArray());
+
+                // Object instance ids are assigned per read by the reader, so the
+                // same object gets a different placeholder id each time. Collapse
+                // them or every object header and pointer becomes a false diff.
+                text = s_internalRef.Replace(text, "<ref>");
+                return text.Replace("\r\n", "\n").Split('\n');
             }
         }
 

@@ -249,6 +249,8 @@ Some MCP tools call into other editor plugins by reflection. They no-op or retur
 | SDK types | `search_types`, `get_type_info`, `get_type_field`, `list_type_namespaces` |
 | EBX edit | `get/set_ebx_property`, `get/set_ebx_field`, `create_ebx`, `duplicate_ebx`, `revert_asset` |
 | Bundles | `add_to_bundle`, `safe_add_to_bundle`, `add_to_bundle_smart`, `list_bundles` |
+| Bundle management | `delete_bundle`, `list_super_bundles`, `set_bundle_super` |
+| Project diagnostics | `project_stats`, `diff_ebx`, `validate_refs`, `bundle_closure_check`, `registry_gap`, `batch_set_field` |
 | Blueprint | `list/create/duplicate_component`, `add_*_connection`, `list_interface` |
 | Media | texture, mesh, lua, wav, atlas, svg |
 | BF1 helpers | `set_root_flags`, `add_to_network_registry`, `add_to_bf1_map_bundles` |

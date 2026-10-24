@@ -44,14 +44,22 @@ namespace FrostyMcpPlugin.Bridge
             string kind = (p.Value<string>("kind") ?? "all").Trim().ToLowerInvariant();
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 200);
+            bool compact = p.Value<bool?>("compact") ?? true;
+            string componentGuid = (p.Value<string>("component_guid") ?? "").Trim();
+            string textFilter = (p.Value<string>("filter") ?? "").Trim();
 
             List<object> items = new List<object>();
             if (kind == "all" || kind == "property")
-                AppendPropertyConnections(root, items);
+                AppendPropertyConnections(root, items, compact);
             if (kind == "all" || kind == "event")
-                AppendEventConnections(root, items);
+                AppendEventConnections(root, items, compact);
             if (kind == "all" || kind == "link")
-                AppendLinkConnections(root, items);
+                AppendLinkConnections(root, items, compact);
+
+            if (!string.IsNullOrEmpty(componentGuid) || !string.IsNullOrEmpty(textFilter))
+            {
+                items = items.Where(x => ConnectionMatches(x, componentGuid, textFilter)).ToList();
+            }
 
             List<object> page = items.Skip(offset).Take(limit).ToList();
             return new Dictionary<string, object>
@@ -62,6 +70,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
+                ["compact"] = compact,
                 ["connections"] = page
             };
         }
@@ -324,8 +333,17 @@ namespace FrostyMcpPlugin.Bridge
                 if (index >= list.Count)
                     return McpHandlers.Error("Index out of range", "INVALID_PARAMS");
 
+                object removed = list[index];
                 list.RemoveAt(index);
-                SaveAsset(entry, asset);
+                try
+                {
+                    SaveAsset(entry, asset);
+                }
+                catch (Exception ex)
+                {
+                    list.Insert(index, removed);
+                    return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                }
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -377,6 +395,7 @@ namespace FrostyMcpPlugin.Bridge
             string typeFilter = (p.Value<string>("type") ?? "").Trim();
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 200);
+            bool compact = p.Value<bool?>("compact") ?? true;
 
             List<object> all = new List<object>();
             int i = 0;
@@ -398,7 +417,7 @@ namespace FrostyMcpPlugin.Bridge
                     continue;
                 }
 
-                all.Add(SerializeComponent(obj, i, asset));
+                all.Add(SerializeComponent(obj, i, asset, compact));
                 i++;
             }
 
@@ -527,6 +546,8 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                List<object> preexisting = asset.Objects.Cast<object>().ToList();
+
                 // Clipboard DeepCopy regenerates GUIDs correctly (same as BF1DevPlugin)
                 FrostyClipboard.Current.SetData(source);
                 object copy = FrostyClipboard.Current.GetData(asset, entry);
@@ -537,6 +558,11 @@ namespace FrostyMcpPlugin.Bridge
                 // ensure top-level object is registered.
                 if (!asset.Objects.Contains(copy) && !IsContainedInObjects(asset, copy))
                     asset.AddObject(copy);
+
+                // Older FrostySdk builds assign InternalId = objects.Count, which can
+                // collide with an existing object when the object list has gaps.
+                // Renumber only the objects this duplicate added.
+                RepairInternalIdCollisions(asset, preexisting);
 
                 PointerRef pref = new PointerRef(copy);
                 string arrayName = p.Value<string>("array") ?? "Objects";
@@ -681,17 +707,25 @@ namespace FrostyMcpPlugin.Bridge
             if (ReferenceEquals(comp, asset.RootObject))
                 return McpHandlers.Error("Cannot remove root object", "FORBIDDEN");
 
+            Guid classGuid = GetClassGuid(comp);
+            if (p["index"] == null && !IsClassGuidUnique(asset, classGuid))
+                return McpHandlers.Error(
+                    "class_guid matches multiple components; pass index to select one",
+                    "AMBIGUOUS_COMPONENT");
+
             try
             {
-                Guid classGuid = GetClassGuid(comp);
                 dynamic root = asset.RootObject;
+                bool guidUnique = IsClassGuidUnique(asset, classGuid);
 
-                // Remove connections referencing this component
-                RemoveConnectionsTouching(root, classGuid);
+                // Remove only the connections/pointers that belong to this instance.
+                // A class-guid sweep would also hit another object that happens to
+                // share the same guid.
+                RemoveConnectionsTouchingObject(root, comp, guidUnique);
 
                 // Remove from Components / Objects arrays
-                RemovePointerFromArray(root, "Components", classGuid);
-                RemovePointerFromArray(root, "Objects", classGuid);
+                RemovePointerFromArray(root, "Components", comp, guidUnique);
+                RemovePointerFromArray(root, "Objects", comp, guidUnique);
 
                 bool removeObject = p.Value<bool?>("remove_object") ?? true;
                 if (removeObject)
@@ -809,7 +843,7 @@ namespace FrostyMcpPlugin.Bridge
                             int beforeP = CountList(asset.RootObject, "PropertyConnections");
                             int beforeE = CountList(asset.RootObject, "EventConnections");
                             int beforeL = CountList(asset.RootObject, "LinkConnections");
-                            RemoveConnectionsTouching(asset.RootObject, itemGuid);
+                            RemoveConnectionsTouchingObject(asset.RootObject, unwrapped, IsClassGuidUnique(asset, itemGuid));
                             connectionsCleared =
                                 (beforeP - CountList(asset.RootObject, "PropertyConnections")) +
                                 (beforeE - CountList(asset.RootObject, "EventConnections")) +
@@ -1011,8 +1045,17 @@ namespace FrostyMcpPlugin.Bridge
                 if (index < 0)
                     return McpHandlers.Error("Field not found", "NOT_FOUND");
 
+                object removed = iface.Fields[index];
                 iface.Fields.RemoveAt(index);
-                SaveAsset(entry, asset);
+                try
+                {
+                    SaveAsset(entry, asset);
+                }
+                catch (Exception ex)
+                {
+                    iface.Fields.Insert(index, removed);
+                    return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                }
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -1101,8 +1144,17 @@ namespace FrostyMcpPlugin.Bridge
                 if (index < 0 || index >= list.Count)
                     return McpHandlers.Error("Event not found", "NOT_FOUND");
 
+                object removed = list[index];
                 list.RemoveAt(index);
-                SaveAsset(entry, asset);
+                try
+                {
+                    SaveAsset(entry, asset);
+                }
+                catch (Exception ex)
+                {
+                    list.Insert(index, removed);
+                    return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                }
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -1831,57 +1883,61 @@ namespace FrostyMcpPlugin.Bridge
             App.AssetManager.ModifyEbx(entry.Name, asset);
         }
 
-        private static void AppendPropertyConnections(dynamic root, List<object> items)
+        private static void AppendPropertyConnections(dynamic root, List<object> items, bool compact)
         {
             try
             {
                 for (int i = 0; i < root.PropertyConnections.Count; i++)
-                    items.Add(SerializePropertyConnection(root.PropertyConnections[i], i));
+                    items.Add(SerializePropertyConnection(root.PropertyConnections[i], i, compact));
             }
             catch { /* asset may not be a blueprint */ }
         }
 
-        private static void AppendEventConnections(dynamic root, List<object> items)
+        private static void AppendEventConnections(dynamic root, List<object> items, bool compact)
         {
             try
             {
                 for (int i = 0; i < root.EventConnections.Count; i++)
-                    items.Add(SerializeEventConnection(root.EventConnections[i], i));
+                    items.Add(SerializeEventConnection(root.EventConnections[i], i, compact));
             }
             catch { }
         }
 
-        private static void AppendLinkConnections(dynamic root, List<object> items)
+        private static void AppendLinkConnections(dynamic root, List<object> items, bool compact)
         {
             try
             {
                 for (int i = 0; i < root.LinkConnections.Count; i++)
-                    items.Add(SerializeLinkConnection(root.LinkConnections[i], i));
+                    items.Add(SerializeLinkConnection(root.LinkConnections[i], i, compact));
             }
             catch { }
         }
 
-        private static Dictionary<string, object> SerializePropertyConnection(dynamic conn, int index)
+        private static Dictionary<string, object> SerializePropertyConnection(dynamic conn, int index, bool compact = false)
         {
             uint flags = (uint)conn.Flags;
             DecodePropertyConnectionFlags(flags, out string realm, out string propType, out bool sourceCantBeStatic);
-            return new Dictionary<string, object>
+            var d = new Dictionary<string, object>
             {
                 ["kind"] = "property",
                 ["index"] = index,
-                ["source"] = SerializePointerRef(conn.Source),
-                ["target"] = SerializePointerRef(conn.Target),
+                ["source"] = compact ? SerializePointerRefShort(conn.Source) : SerializePointerRef(conn.Source),
+                ["target"] = compact ? SerializePointerRefShort(conn.Target) : SerializePointerRef(conn.Target),
                 ["source_field"] = (string)(CString)conn.SourceField,
                 ["target_field"] = (string)(CString)conn.TargetField,
-                ["flags"] = flags,
                 ["flags_hex"] = "0x" + flags.ToString("X8"),
                 ["realm"] = realm,
-                ["prop_type"] = propType,
-                ["source_cant_be_static"] = sourceCantBeStatic
+                ["prop_type"] = propType
             };
+            if (!compact)
+            {
+                d["flags"] = flags;
+                d["source_cant_be_static"] = sourceCantBeStatic;
+            }
+            return d;
         }
 
-        private static Dictionary<string, object> SerializeEventConnection(dynamic conn, int index)
+        private static Dictionary<string, object> SerializeEventConnection(dynamic conn, int index, bool compact = false)
         {
             string sourceEvent = "";
             string targetEvent = "";
@@ -1894,25 +1950,100 @@ namespace FrostyMcpPlugin.Bridge
             {
                 ["kind"] = "event",
                 ["index"] = index,
-                ["source"] = SerializePointerRef(conn.Source),
-                ["target"] = SerializePointerRef(conn.Target),
+                ["source"] = compact ? SerializePointerRefShort(conn.Source) : SerializePointerRef(conn.Source),
+                ["target"] = compact ? SerializePointerRefShort(conn.Target) : SerializePointerRef(conn.Target),
                 ["source_event"] = sourceEvent,
                 ["target_event"] = targetEvent,
                 ["target_type"] = targetType
             };
         }
 
-        private static Dictionary<string, object> SerializeLinkConnection(dynamic conn, int index)
+        private static Dictionary<string, object> SerializeLinkConnection(dynamic conn, int index, bool compact = false)
         {
             return new Dictionary<string, object>
             {
                 ["kind"] = "link",
                 ["index"] = index,
-                ["source"] = SerializePointerRef(conn.Source),
-                ["target"] = SerializePointerRef(conn.Target),
+                ["source"] = compact ? SerializePointerRefShort(conn.Source) : SerializePointerRef(conn.Source),
+                ["target"] = compact ? SerializePointerRefShort(conn.Target) : SerializePointerRef(conn.Target),
                 ["source_field"] = (string)(CString)conn.SourceField,
                 ["target_field"] = (string)(CString)conn.TargetField
             };
+        }
+
+        /// <summary>
+        /// One-line pointer description for compact connection listings. Full
+        /// SerializePointerRef output is kept for callers that need every field.
+        /// </summary>
+        private static string SerializePointerRefShort(PointerRef pref)
+        {
+            if (pref.Type == PointerRefType.External)
+            {
+                EbxAssetEntry e = App.AssetManager?.GetEbxEntry(pref.External.FileGuid);
+                if (e != null)
+                    return e.Name + " [" + pref.External.FileGuid + "]";
+                return "External [" + pref.External.FileGuid + "]";
+            }
+            if (pref.Type == PointerRefType.Internal && pref.Internal != null)
+                return pref.Internal.GetType().Name + " [" + GetClassGuid(pref.Internal) + "]";
+            return "null";
+        }
+
+        private static bool ConnectionMatches(object item, string componentGuid, string textFilter)
+        {
+            if (!(item is Dictionary<string, object> d))
+                return false;
+
+            if (!string.IsNullOrEmpty(componentGuid))
+            {
+                bool hit = false;
+                foreach (string key in new[] { "source", "target" })
+                {
+                    if (!d.TryGetValue(key, out object v))
+                        continue;
+                    if (v is Dictionary<string, object> pd)
+                    {
+                        if (pd.TryGetValue("class_guid", out object cg) &&
+                            cg != null &&
+                            cg.ToString().IndexOf(componentGuid, StringComparison.OrdinalIgnoreCase) >= 0)
+                            hit = true;
+                    }
+                    else if (v != null &&
+                             v.ToString().IndexOf(componentGuid, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hit = true;
+                    }
+                }
+                if (!hit)
+                    return false;
+            }
+
+            if (!string.IsNullOrEmpty(textFilter))
+                return ContainsText(item, textFilter, StringComparison.OrdinalIgnoreCase);
+            return true;
+        }
+
+        private static bool ContainsText(object value, string needle, StringComparison cmp)
+        {
+            if (value == null)
+                return false;
+            if (value is string s)
+                return s.IndexOf(needle, cmp) >= 0;
+            if (value is IDictionary<string, object> dict)
+            {
+                foreach (KeyValuePair<string, object> kv in dict)
+                    if (ContainsText(kv.Value, needle, cmp))
+                        return true;
+                return false;
+            }
+            if (value is System.Collections.IEnumerable list && !(value is string))
+            {
+                foreach (object x in list)
+                    if (ContainsText(x, needle, cmp))
+                        return true;
+                return false;
+            }
+            return value.ToString().IndexOf(needle, cmp) >= 0;
         }
 
         private static Dictionary<string, object> SerializePointerRef(PointerRef pref)
@@ -1938,11 +2069,11 @@ namespace FrostyMcpPlugin.Bridge
             return d;
         }
 
-        private static Dictionary<string, object> SerializeComponent(object obj, int index, EbxAsset asset)
+        private static Dictionary<string, object> SerializeComponent(object obj, int index, EbxAsset asset, bool compact = false)
         {
             Guid classGuid = GetClassGuid(obj);
             uint flags = GetObjectFlagsRaw(obj);
-            return new Dictionary<string, object>
+            var d = new Dictionary<string, object>
             {
                 ["index"] = index,
                 ["type"] = obj.GetType().Name,
@@ -1951,9 +2082,11 @@ namespace FrostyMcpPlugin.Bridge
                 ["is_root"] = ReferenceEquals(obj, asset.RootObject),
                 ["flags"] = flags,
                 ["flags_hex"] = "0x" + flags.ToString("X8"),
-                ["object_flags"] = DecodeObjectFlags(flags),
                 ["realm"] = TryGetEnumString(obj, "Realm")
             };
+            if (!compact)
+                d["object_flags"] = DecodeObjectFlags(flags);
+            return d;
         }
 
         private static PointerRef ResolvePointerRef(EbxAsset asset, JObject p, string prefix)
@@ -2081,22 +2214,96 @@ namespace FrostyMcpPlugin.Bridge
             int i = 0;
             foreach (object obj in asset.Objects)
             {
-                if (ReferenceEquals(obj, target) || GetClassGuid(obj) == GetClassGuid(target))
+                if (ReferenceEquals(obj, target))
                     return i;
                 i++;
             }
-            return -1;
+
+            // Fallback for pointer graphs that were rebuilt with new instances:
+            // only trust the class-guid match when it identifies exactly one object.
+            Guid g = GetClassGuid(target);
+            int match = -1;
+            int count = 0;
+            i = 0;
+            foreach (object obj in asset.Objects)
+            {
+                if (GetClassGuid(obj) == g)
+                {
+                    match = i;
+                    count++;
+                }
+                i++;
+            }
+            return count == 1 ? match : -1;
         }
 
         private static bool IsContainedInObjects(EbxAsset asset, object target)
         {
-            Guid g = GetClassGuid(target);
             foreach (object obj in asset.Objects)
             {
-                if (ReferenceEquals(obj, target) || GetClassGuid(obj) == g)
+                if (ReferenceEquals(obj, target))
                     return true;
             }
             return false;
+        }
+
+        private static bool IsClassGuidUnique(EbxAsset asset, Guid classGuid)
+        {
+            int count = 0;
+            foreach (object obj in asset.Objects)
+            {
+                if (GetClassGuid(obj) == classGuid)
+                {
+                    count++;
+                    if (count > 1)
+                        return false;
+                }
+            }
+            return count == 1;
+        }
+
+        /// <summary>
+        /// Gives every internal object added since <paramref name="preexisting"/> a
+        /// unique InternalId. Needed because AddObject used objects.Count, which is
+        /// not a free id once the asset contains exported objects or gaps.
+        /// </summary>
+        private static void RepairInternalIdCollisions(EbxAsset asset, List<object> preexisting)
+        {
+            HashSet<object> oldObjects = new HashSet<object>(preexisting, ReferenceEqualityComparer.Instance);
+            HashSet<int> usedIds = new HashSet<int>();
+            int maxId = -1;
+
+            foreach (object obj in asset.Objects)
+            {
+                if (!oldObjects.Contains(obj))
+                    continue;
+                AssetClassGuid g = ((dynamic)obj).GetInstanceGuid();
+                if (g.IsExported || g.InternalId < 0)
+                    continue;
+                usedIds.Add(g.InternalId);
+                if (g.InternalId > maxId)
+                    maxId = g.InternalId;
+            }
+
+            foreach (object obj in asset.Objects)
+            {
+                if (oldObjects.Contains(obj))
+                    continue;
+                AssetClassGuid g = ((dynamic)obj).GetInstanceGuid();
+                if (g.IsExported)
+                    continue;
+
+                int id = g.InternalId;
+                if (id < 0 || usedIds.Contains(id))
+                {
+                    id = maxId + 1;
+                    ((dynamic)obj).SetInstanceGuid(new AssetClassGuid(g.ExportedGuid, id));
+                }
+
+                usedIds.Add(id);
+                if (id > maxId)
+                    maxId = id;
+            }
         }
 
         private static string GetObjectName(object obj)
@@ -2520,7 +2727,7 @@ namespace FrostyMcpPlugin.Bridge
             return names;
         }
 
-        private static void RemovePointerFromArray(object root, string arrayName, Guid classGuid)
+        private static void RemovePointerFromArray(object root, string arrayName, object target, bool guidUnique)
         {
             PropertyInfo pi = root.GetType().GetProperty(arrayName);
             if (pi == null)
@@ -2532,17 +2739,60 @@ namespace FrostyMcpPlugin.Bridge
             {
                 if (list[i] is PointerRef pr && pr.Type == PointerRefType.Internal && pr.Internal != null)
                 {
-                    if (GetClassGuid(pr.Internal) == classGuid)
+                    if (PointerRefersTo(pr.Internal, target, guidUnique))
                         list.RemoveAt(i);
                 }
             }
         }
 
-        private static void RemoveConnectionsTouching(dynamic root, Guid classGuid)
+        private static bool PointerRefersTo(object candidate, object target, bool guidUnique)
         {
-            RemoveConnectionsTouchingKind(root, classGuid, "property");
-            RemoveConnectionsTouchingKind(root, classGuid, "event");
-            RemoveConnectionsTouchingKind(root, classGuid, "link");
+            if (ReferenceEquals(candidate, target))
+                return true;
+            return guidUnique && candidate != null && target != null &&
+                   GetClassGuid(candidate) == GetClassGuid(target);
+        }
+
+        private static void RemoveConnectionsTouchingObject(dynamic root, object target, bool guidUnique)
+        {
+            RemoveConnectionsTouchingKindObject(root, target, guidUnique, "property");
+            RemoveConnectionsTouchingKindObject(root, target, guidUnique, "event");
+            RemoveConnectionsTouchingKindObject(root, target, guidUnique, "link");
+        }
+
+        private static void RemoveConnectionsTouchingKindObject(dynamic root, object target, bool guidUnique, string kind)
+        {
+            try
+            {
+                if (kind == "property")
+                {
+                    for (int i = root.PropertyConnections.Count - 1; i >= 0; i--)
+                    {
+                        dynamic c = root.PropertyConnections[i];
+                        if (PointerTouchesObject(c.Source, target, guidUnique) || PointerTouchesObject(c.Target, target, guidUnique))
+                            root.PropertyConnections.RemoveAt(i);
+                    }
+                }
+                else if (kind == "event")
+                {
+                    for (int i = root.EventConnections.Count - 1; i >= 0; i--)
+                    {
+                        dynamic c = root.EventConnections[i];
+                        if (PointerTouchesObject(c.Source, target, guidUnique) || PointerTouchesObject(c.Target, target, guidUnique))
+                            root.EventConnections.RemoveAt(i);
+                    }
+                }
+                else if (kind == "link")
+                {
+                    for (int i = root.LinkConnections.Count - 1; i >= 0; i--)
+                    {
+                        dynamic c = root.LinkConnections[i];
+                        if (PointerTouchesObject(c.Source, target, guidUnique) || PointerTouchesObject(c.Target, target, guidUnique))
+                            root.LinkConnections.RemoveAt(i);
+                    }
+                }
+            }
+            catch { }
         }
 
         private static void RemoveConnectionsTouchingKind(dynamic root, Guid classGuid, string kind)
@@ -2682,6 +2932,15 @@ namespace FrostyMcpPlugin.Bridge
             return false;
         }
 
+        private static bool PointerTouchesObject(PointerRef pr, object target, bool guidUnique)
+        {
+            if (pr.Type == PointerRefType.Internal && pr.Internal != null)
+                return PointerRefersTo(pr.Internal, target, guidUnique);
+            if (pr.Type == PointerRefType.External && target != null)
+                return guidUnique && pr.External.ClassGuid == GetClassGuid(target);
+            return false;
+        }
+
         private static Dictionary<string, object> DumpPublicProperties(object obj)
         {
             var dump = new Dictionary<string, object>();
@@ -2755,6 +3014,24 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // Minimal path get/set for component properties (mirrors McpEditHandlers)
+        /// <summary>
+        /// Some Frostbite roots expose the object list as Objects while others use
+        /// Components (and some tools use one name for both). Fall back to the other
+        /// name instead of failing with "Missing property".
+        /// </summary>
+        private static PropertyInfo GetPropertyAliased(Type type, string name)
+        {
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
+            PropertyInfo pi = type.GetProperty(name, flags);
+            if (pi != null)
+                return pi;
+            if (string.Equals(name, "Components", StringComparison.OrdinalIgnoreCase))
+                return type.GetProperty("Objects", flags);
+            if (string.Equals(name, "Objects", StringComparison.OrdinalIgnoreCase))
+                return type.GetProperty("Components", flags);
+            return null;
+        }
+
         private static object ResolvePath(object root, string path, out string typeName)
         {
             object current = root;
@@ -2774,7 +3051,7 @@ namespace FrostyMcpPlugin.Bridge
 
                 if (!string.IsNullOrEmpty(name))
                 {
-                    PropertyInfo pi = current.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)
+                    PropertyInfo pi = GetPropertyAliased(current.GetType(), name)
                         ?? throw new InvalidOperationException("Missing property: " + name);
                     current = pi.GetValue(current);
                 }
@@ -2807,8 +3084,11 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 if (!string.IsNullOrEmpty(name))
                 {
-                    PropertyInfo pi = current.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                    PropertyInfo pi = GetPropertyAliased(current.GetType(), name)
+                        ?? throw new InvalidOperationException("Missing property: " + name);
                     current = pi.GetValue(current);
+                    if (current == null)
+                        throw new InvalidOperationException("Null at path part: " + name);
                 }
                 if (idx >= 0)
                     current = ((IList)current)[idx];
@@ -2839,7 +3119,7 @@ namespace FrostyMcpPlugin.Bridge
 
         private static void SetMemberValue(object obj, string name, JToken value, EbxAsset asset = null)
         {
-            PropertyInfo pi = obj.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)
+            PropertyInfo pi = GetPropertyAliased(obj.GetType(), name)
                 ?? throw new InvalidOperationException("Missing property: " + name);
             if (!pi.CanWrite)
                 throw new InvalidOperationException("Property is read-only: " + name);
@@ -2884,11 +3164,39 @@ namespace FrostyMcpPlugin.Bridge
             if (u == typeof(bool)) return token.Type == JTokenType.Boolean ? token.Value<bool>() : Convert.ToBoolean(token.ToString());
             if (u == typeof(float)) return Convert.ToSingle(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
             if (u == typeof(double)) return Convert.ToDouble(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
-            if (u == typeof(int)) return Convert.ToInt32(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
-            if (u == typeof(uint)) return Convert.ToUInt32(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
-            if (u == typeof(long)) return Convert.ToInt64(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
-            if (u == typeof(ulong)) return Convert.ToUInt64(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
+            if (u == typeof(int))
+            {
+                if (token.Type == JTokenType.String && TryGetHexDigits(token.Value<string>(), out string hex))
+                    return unchecked((int)uint.Parse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture));
+                return Convert.ToInt32(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
+            }
+            if (u == typeof(uint))
+            {
+                if (token.Type == JTokenType.String && TryGetHexDigits(token.Value<string>(), out string hex))
+                    return uint.Parse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture);
+                return Convert.ToUInt32(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
+            }
+            if (u == typeof(long))
+            {
+                if (token.Type == JTokenType.String && TryGetHexDigits(token.Value<string>(), out string hex))
+                    return unchecked((long)ulong.Parse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture));
+                return Convert.ToInt64(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
+            }
+            if (u == typeof(ulong))
+            {
+                if (token.Type == JTokenType.String && TryGetHexDigits(token.Value<string>(), out string hex))
+                    return ulong.Parse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture);
+                return Convert.ToUInt64(token.ToString(), System.Globalization.CultureInfo.InvariantCulture);
+            }
             if (u == typeof(string)) return token.Type == JTokenType.String ? token.Value<string>() : token.ToString();
+
+            if (targetType == typeof(TypeRef) || targetType.Name == "TypeRef")
+            {
+                string s = token.ToString().Trim();
+                if (s.StartsWith("TypeRef '") && s.EndsWith("'") && s.Length >= 10)
+                    s = s.Substring(9, s.Length - 10);
+                return new TypeRef(s);
+            }
 
             if (token is JObject jobj && u.IsValueType)
             {
@@ -2901,6 +3209,34 @@ namespace FrostyMcpPlugin.Bridge
             }
 
             return token.ToObject(targetType);
+        }
+
+        /// <summary>
+        /// Accepts 0x1234 and $1234 for integer fields. Frosty hashes are usually
+        /// written in hex, so forcing callers to convert to decimal is error prone.
+        /// </summary>
+        private static bool TryGetHexDigits(string text, out string digits)
+        {
+            digits = null;
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+            text = text.Trim();
+            if (text.StartsWith("-"))
+                return false;
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                digits = text.Substring(2);
+            else if (text.StartsWith("$"))
+                digits = text.Substring(1);
+            else
+                return false;
+            if (digits.Length == 0 || digits.Length > 16)
+                return false;
+            foreach (char c in digits)
+            {
+                if (!Uri.IsHexDigit(c))
+                    return false;
+            }
+            return true;
         }
 
         // =====================================================================
@@ -3436,7 +3772,7 @@ namespace FrostyMcpPlugin.Bridge
                 throw new InvalidOperationException("Invalid path ending: " + last);
             }
 
-            property = parent.GetType().GetProperty(lastName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)
+            property = GetPropertyAliased(parent.GetType(), lastName)
                 ?? throw new InvalidOperationException("Missing property: " + lastName);
 
             EbxFieldMetaAttribute meta = property.GetCustomAttribute<EbxFieldMetaAttribute>();
@@ -3481,7 +3817,7 @@ namespace FrostyMcpPlugin.Bridge
 
             if (!string.IsNullOrEmpty(name))
             {
-                PropertyInfo pi = current.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)
+                PropertyInfo pi = GetPropertyAliased(current.GetType(), name)
                     ?? throw new InvalidOperationException("Missing property: " + name);
                 current = pi.GetValue(current);
             }
