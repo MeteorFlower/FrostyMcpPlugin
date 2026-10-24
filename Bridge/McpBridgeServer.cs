@@ -1,3 +1,4 @@
+using FrostySdk;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
@@ -17,14 +18,26 @@ namespace FrostyMcpPlugin.Bridge
     /// </summary>
     public sealed class McpBridgeServer
     {
-        public const string PipeName = "Frosty_MCP_Bridge_v1";
-        public const string Version = "1.13.0";
+        public static string PipeName
+        {
+            get
+            {
+                string profile = ProfilesLibrary.ProfileName;
+                if (!string.IsNullOrEmpty(profile))
+                    return PipeProfiles.PipeNameFor(profile);
+
+                return PipeProfiles.BasePipeName;
+            }
+        }
+
+        public const string Version = "2.0.1";
         public const int MaxRequestBytes = 32 * 1024 * 1024;
 
         public static McpBridgeServer Instance { get; } = new McpBridgeServer();
 
         private readonly object _stateLock = new object();
         private CancellationTokenSource _cts;
+        private string _pipeName;
         private Task _listenTask;
         private long _clientsServed;
 
@@ -46,6 +59,7 @@ namespace FrostyMcpPlugin.Bridge
                 if (_cts != null)
                     return;
 
+                _pipeName = PipeName;
                 _cts = new CancellationTokenSource();
                 CancellationToken token = _cts.Token;
                 _listenTask = Task.Factory.StartNew(
@@ -77,7 +91,7 @@ namespace FrostyMcpPlugin.Bridge
                 try
                 {
                     pipe = new NamedPipeServerStream(
-                        PipeName,
+                        _pipeName,
                         PipeDirection.InOut,
                         NamedPipeServerStream.MaxAllowedServerInstances,
                         PipeTransmissionMode.Byte,

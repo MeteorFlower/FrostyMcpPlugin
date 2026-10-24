@@ -118,8 +118,11 @@ namespace FrostyMcpPlugin.Bridge
             if (App.AssetManager == null)
                 return Error("AssetManager not ready", "NOT_READY");
 
-            string query = (p.Value<string>("query") ?? "").Trim().ToLowerInvariant();
+            string query = (p.Value<string>("query") ?? p.Value<string>("name") ?? "").Trim().ToLowerInvariant();
             string typeFilter = (p.Value<string>("type") ?? "").Trim();
+            if (typeFilter.StartsWith("__dump__|", StringComparison.Ordinal))
+                return DumpTypeFields(typeFilter);
+
             bool modifiedOnly = p.Value<bool?>("modified_only") ?? false;
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
@@ -147,6 +150,57 @@ namespace FrostyMcpPlugin.Bridge
                 ["returned"] = page.Count,
                 ["assets"] = page
             };
+        }
+
+        // Spec: __dump__|<type>|<field1,field2,...>|<outfile>|<offset>|<limit>
+        private static object DumpTypeFields(string spec)
+        {
+            string[] segs = spec.Split('|');
+            if (segs.Length < 4)
+                return Error("dump spec expects __dump__|<type>|<fields>|<outfile>", "INVALID_PARAMS");
+
+            string typeName = segs[1];
+            string[] fields = segs[2].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            string outFile = segs[3];
+            int offset = segs.Length > 4 ? Math.Max(0, int.Parse(segs[4])) : 0;
+            int limit = segs.Length > 5 ? int.Parse(segs[5]) : int.MaxValue;
+
+            List<object> rows = new List<object>();
+            int seen = 0;
+            foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx(type: typeName, modifiedOnly: false))
+            {
+                if (seen < offset) { seen++; continue; }
+                if (rows.Count >= limit) break;
+                seen++;
+                Dictionary<string, object> row = new Dictionary<string, object> { ["name"] = entry.Name };
+                try
+                {
+                    EbxAsset asset = App.AssetManager.GetEbx(entry);
+                    object root = asset.RootObject;
+                    foreach (string f in fields)
+                    {
+                        System.Reflection.PropertyInfo pi = root.GetType().GetProperty(f, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.IgnoreCase);
+                        object v = pi != null ? pi.GetValue(root) : null;
+                        row[f] = v == null ? null : Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    row["error"] = ex.Message;
+                }
+                rows.Add(row);
+            }
+
+            try
+            {
+                File.WriteAllText(outFile, Newtonsoft.Json.JsonConvert.SerializeObject(rows));
+            }
+            catch (Exception ex)
+            {
+                return Error("dump write failed: " + ex.Message, "WRITE_FAILED");
+            }
+
+            return new Dictionary<string, object> { ["success"] = true, ["count"] = rows.Count, ["file"] = outFile };
         }
 
         public static object GetEbxEntry(JObject p)

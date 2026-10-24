@@ -1,0 +1,106 @@
+{
+  "generated_from": "FrostySdk/Profiles.bin",
+  "pipe_prefix": "Frosty_MCP_Bridge_v1",
+  "profiles": [
+    {
+      "name": "DragonAgeInquisition",
+      "display_name": "Dragon Age™: Inquisition"
+    },
+    {
+      "name": "NFS16",
+      "display_name": "Need for Speed™"
+    },
+    {
+      "name": "starwarsbattlefront",
+      "display_name": "STAR WARS™ Battlefront™"
+    },
+    {
+      "name": "MirrorsEdgeCatalyst",
+      "display_name": "Mirror's Edge™ Catalyst"
+    },
+    {
+      "name": "FIFA17",
+      "display_name": "FIFA 17"
+    },
+    {
+      "name": "MassEffectAndromeda",
+      "display_name": "Mass Effect: Andromeda"
+    },
+    {
+      "name": "FIFA18",
+      "display_name": "FIFA 18"
+    },
+    {
+      "name": "starwarsbattlefrontii",
+      "display_name": "STAR WARS™ Battlefront™ II"
+    },
+    {
+      "name": "NeedForSpeedPayback",
+      "display_name": "Need for Speed™ Payback"
+    },
+    {
+      "name": "Madden19",
+      "display_name": "Madden NFL 19™"
+    },
+    {
+      "name": "bf1",
+      "display_name": "Battlefield™ 1"
+    },
+    {
+      "name": "PVZ.Main_Win64_Retail",
+      "display_name": "Plants vs Zombies™ Garden Warfare"
+    },
+    {
+      "name": "GW2.Main_Win64_Retail",
+      "display_name": "Plants vs Zombies™ Garden Warfare 2"
+    },
+    {
+      "name": "FIFA19",
+      "display_name": "FIFA 19"
+    },
+    {
+      "name": "bf4",
+      "display_name": "Battlefield™ 4"
+    },
+    {
+      "name": "NFS14",
+      "display_name": "Need for Speed™ Rivals"
+    },
+    {
+      "name": "bfv",
+      "display_name": "Battlefield™ V"
+    },
+    {
+      "name": "Anthem",
+      "display_name": "Anthem™"
+    },
+    {
+      "name": "Madden20",
+      "display_name": "Madden NFL 20™"
+    },
+    {
+      "name": "FIFA20",
+      "display_name": "FIFA 20"
+    },
+    {
+      "name": "PVZBattleforNeighborville",
+      "display_name": "Plants vs Zombies: Battle for Neighborville™"
+    },
+    {
+      "name": "NeedForSpeedHeat",
+      "display_name": "Need for Speed™ Heat"
+    },
+    {
+      "name": "bfh",
+      "display_name": "Battlefield™ Hardline"
+    },
+    {
+      "name": "starwarssquadrons",
+      "display_name": "STAR WARS™: Squadrons"
+    },
+    {
+      "name": "NFSOL",
+      "display_name": "Need for Speed™ ONLINE"
+    }
+  ]
+}

@@ -1,78 +1,122 @@
-<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
-    <Configurations>Developer - Debug;Release - Alpha;Release - Beta;Release - Final</Configurations>
-    <Platforms>x64</Platforms>
-    <TargetFrameworks>net48</TargetFrameworks>
-    <AssemblyTitle>FrostyMcpPlugin</AssemblyTitle>
-    <Product>FrostyMcpPlugin</Product>
-    <Copyright>Copyright ©  2026</Copyright>
-    <CodeAnalysisRuleSet>MinimumRecommendedRules.ruleset</CodeAnalysisRuleSet>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <UseWPF>true</UseWPF>
-    <OutputType>Library</OutputType>
-    <!-- Frosty Toolsuite root (folder that contains FrostyEditor / FrostySdk).
-         Default assumes this repo lives at FrostyToolsuite/Plugins/FrostyMcpPlugin.
-         Override with /p:FrostyRoot=... or edit this path (same idea as MagixGames/FrostyBlueprintEditor). -->
+    <Configuration Condition=" '$(Configuration)' == '' ">Developer - Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x64</Platform>
+    <!-- Frosty Toolsuite root (folder that contains FrostyEditor / FrostySdk). -->
     <FrostyRoot Condition="'$(FrostyRoot)' == ''">$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\'))</FrostyRoot>
+    <ProjectGuid>{2E3A47C1-3F4B-4A5D-9C61-AB7DF1E8B2E3}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>FrostyMcpPlugin</RootNamespace>
+    <AssemblyName>FrostyMcpPlugin</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
   </PropertyGroup>
-
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Developer - Debug|x64' ">
     <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
     <OutputPath>bin\Developer\Debug\</OutputPath>
     <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
   </PropertyGroup>
-  
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release - Alpha|x64' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
     <OutputPath>bin\Release\Alpha\</OutputPath>
     <DefineConstants>TRACE</DefineConstants>
-    <Optimize>true</Optimize>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
   </PropertyGroup>
-  
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release - Beta|x64'">
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release - Beta|x64' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
     <OutputPath>bin\Release\Beta\</OutputPath>
     <DefineConstants>TRACE</DefineConstants>
-    <Optimize>true</Optimize>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
   </PropertyGroup>
-  
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release - Final|x64'">
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release - Final|x64' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
     <OutputPath>bin\Release\Final\</OutputPath>
     <DefineConstants>TRACE</DefineConstants>
-    <Optimize>true</Optimize>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
   </PropertyGroup>
-
   <ItemGroup>
     <Reference Include="PresentationCore" />
     <Reference Include="PresentationFramework" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
     <Reference Include="System.Xaml" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Xml.Linq" />
     <Reference Include="WindowsBase" />
-    <!-- Frosty binaries / third-party (adjust FrostyRoot if your Toolsuite is elsewhere) -->
+    <!-- Frosty binaries / third-party -->
     <Reference Include="Newtonsoft.Json">
       <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\Newtonsoft.Json.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
-
+  <ItemGroup>
+    <Compile Include="Bridge\McpAdvancedHandlers.cs" />
+    <Compile Include="Bridge\McpBf1Handlers.cs" />
+    <Compile Include="Bridge\McpBlueprintHandlers.cs" />
+    <Compile Include="Bridge\McpBridgeServer.cs" />
+    <Compile Include="Bridge\McpCommandRouter.cs" />
+    <Compile Include="Bridge\McpEditHandlers.cs" />
+    <Compile Include="Bridge\EbxYamlWriter.cs" />
+    <Compile Include="Bridge\McpExtraHandlers.cs" />
+    <Compile Include="Bridge\McpHandlers.cs" />
+    <Compile Include="Bridge\McpMediaHandlers.cs" />
+    <Compile Include="Bridge\McpMoreHandlers.cs" />
+    <Compile Include="Bridge\McpProjectTools.cs" />
+    <Compile Include="Bridge\PipeProfiles.g.cs" />
+    <Compile Include="Bridge\McpTypeExplorerHandlers.cs" />
+    <Compile Include="Extensions\McpStartupAction.cs" />
+    <Compile Include="Extensions\McpStatusMenuExtension.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Page Include="Themes\Generic.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="$(FrostyRoot)FrostyControls\FrostyControls.csproj">
+      <Project>{5205C8E0-5BC6-4C9F-A53B-AF6F2FED9F0A}</Project>
+      <Name>FrostyControls</Name>
       <Private>false</Private>
     </ProjectReference>
     <ProjectReference Include="$(FrostyRoot)FrostyHash\FrostyHash.vcxproj">
+      <Project>{2A18A3FF-8CE7-4D50-8D7E-6C0B4BDD8E0A}</Project>
+      <Name>FrostyHash</Name>
       <Private>false</Private>
     </ProjectReference>
     <ProjectReference Include="$(FrostyRoot)FrostyPlugin\FrostyCore.csproj">
+      <Project>{E13DCCE2-8F12-4FA1-8F33-D7E0E48DEAF7}</Project>
+      <Name>FrostyCore</Name>
       <Private>false</Private>
     </ProjectReference>
     <ProjectReference Include="$(FrostyRoot)FrostySdk\FrostySdk.csproj">
+      <Project>{93FB4A0C-DF89-4169-80B5-C4E2277FF7A0}</Project>
+      <Name>FrostySdk</Name>
       <Private>false</Private>
     </ProjectReference>
   </ItemGroup>
-
-  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <Target Name="CopyToFrostyEditor" AfterTargets="Build" Condition="'$(Configuration)|$(Platform)' == 'Developer - Debug|x64'">
     <PropertyGroup>
       <_FrostyEditorPluginsDir>$(FrostyRoot)FrostyEditor\$(OutDir)Plugins\</_FrostyEditorPluginsDir>
     </PropertyGroup>
     <MakeDir Directories="$(_FrostyEditorPluginsDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(_FrostyEditorPluginsDir)" SkipUnchangedFiles="true" />
   </Target>
-
 </Project>

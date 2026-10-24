@@ -372,6 +372,10 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                // Bulk mode: properties = { "__bulk_file__": path, "__offset__": n, "__limit__": n }
+                if (p["properties"] is JObject bulkOpts && bulkOpts["__bulk_file__"] != null)
+                    return BulkCreateStructsFromFile(p, typeName, bulkOpts);
+
                 object inst = TypeLibrary.CreateObject(typeName);
                 if (inst == null)
                     return McpHandlers.Error("CreateObject returned null", "CREATE_FAILED");
@@ -434,6 +438,97 @@ namespace FrostyMcpPlugin.Bridge
             {
                 return McpHandlers.Error(ex.Message, "CREATE_FAILED");
             }
+        }
+
+        // Bulk-create structs from a JSON file, one object per entry, appended to a list path
+        private static object BulkCreateStructsFromFile(JObject p, string typeName, JObject opts)
+        {
+            string file = (opts.Value<string>("__bulk_file__") ?? "").Trim();
+            if (string.IsNullOrEmpty(file) || !System.IO.File.Exists(file))
+                return McpHandlers.Error("bulk file not found: " + file, "NOT_FOUND");
+
+            JArray items;
+            try
+            {
+                items = JArray.Parse(System.IO.File.ReadAllText(file));
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error("bulk file parse failed: " + ex.Message, "PARSE_FAILED");
+            }
+
+            EbxAssetEntry entry = McpHandlers.ResolveEbxEntry(p.Value<string>("name"), p.Value<string>("guid"));
+            if (entry == null)
+                return McpHandlers.Error("EBX not found for bulk assign", "NOT_FOUND");
+
+            string path = (p.Value<string>("path") ?? "").Trim();
+            if (string.IsNullOrEmpty(path))
+                return McpHandlers.Error("path is required for bulk assign", "INVALID_PARAMS");
+
+            int offset = Math.Max(0, opts.Value<int?>("__offset__") ?? 0);
+            int limit = opts.Value<int?>("__limit__") ?? int.MaxValue;
+
+            EbxAsset asset = App.AssetManager.GetEbx(entry);
+            object host = asset.RootObject;
+            string classGuid = (p.Value<string>("class_guid") ?? "").Trim();
+            if (!string.IsNullOrEmpty(classGuid) && Guid.TryParse(classGuid, out Guid cg))
+            {
+                foreach (object o in asset.Objects)
+                {
+                    try
+                    {
+                        if (((dynamic)o).GetInstanceGuid().ExportedGuid == cg) { host = o; break; }
+                    }
+                    catch { }
+                }
+            }
+
+            int created = 0;
+            List<string> errors = new List<string>();
+            int end = Math.Min(items.Count, offset + limit);
+            for (int i = offset; i < end; i++)
+            {
+                if (!(items[i] is JObject item))
+                    continue;
+                try
+                {
+                    object inst = TypeLibrary.CreateObject(typeName);
+                    if (inst == null)
+                    {
+                        errors.Add("item " + i + ": CreateObject returned null");
+                        continue;
+                    }
+                    foreach (JProperty prop in item.Properties())
+                    {
+                        PropertyInfo pi = inst.GetType().GetProperty(prop.Name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                        if (pi == null || !pi.CanWrite)
+                            continue;
+                        pi.SetValue(inst, ConvertSimple(prop.Value, pi.PropertyType));
+                    }
+                    AppendOrSetStruct(host, path, inst);
+                    created++;
+                }
+                catch (Exception ex)
+                {
+                    errors.Add("item " + i + ": " + ex.Message);
+                }
+            }
+
+            asset.Update();
+            App.AssetManager.ModifyEbx(entry.Name, asset);
+
+            return new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["type"] = typeName,
+                ["assigned_to"] = entry.Name,
+                ["path"] = path,
+                ["created"] = created,
+                ["total"] = items.Count,
+                ["offset"] = offset,
+                ["failed"] = errors.Count,
+                ["errors"] = errors.GetRange(0, Math.Min(errors.Count, 20))
+            };
         }
 
         // =====================================================================
