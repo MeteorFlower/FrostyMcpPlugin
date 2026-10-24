@@ -536,7 +536,7 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrEmpty(name))
                 return Error("name is required", "INVALID_PARAMS");
 
-            int bundleId = App.AssetManager.GetBundleId(name);
+            int bundleId = ResolveBundleId(name);
             if (bundleId < 0)
                 return Error("Bundle not found", "NOT_FOUND");
 
@@ -712,6 +712,28 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // ---- helpers (shared with edit handlers) ----
+
+        // Bundle names keep the case they were indexed with ("Win32/...", "Gameplay/..."),
+        // while callers pass whatever the client typed. Match exactly first, then fall
+        // back to a case-insensitive scan.
+        internal static int ResolveBundleId(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name) || App.AssetManager == null)
+                return -1;
+
+            name = name.Trim();
+            int bid = App.AssetManager.GetBundleId(name);
+            if (bid >= 0)
+                return bid;
+
+            foreach (BundleEntry be in App.AssetManager.EnumerateBundles())
+            {
+                if (string.Equals(be.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return App.AssetManager.GetBundleId(be.Name);
+            }
+
+            return -1;
+        }
 
         internal static EbxAssetEntry ResolveEbxEntry(string name, string guidStr)
         {
