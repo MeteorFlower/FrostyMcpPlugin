@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
 using FrostySdk.Managers;
@@ -64,10 +64,21 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("EBX not found", "NOT_FOUND");
 
-            ushort flags;
             if (p["flags"] == null)
                 return McpHandlers.Error("flags is required (e.g. 15 for SpatialPrefabBlueprint)", "INVALID_PARAMS");
-            flags = Convert.ToUInt16(p["flags"].ToString());
+
+            ushort flags;
+            string flagText = p["flags"].ToString().Trim();
+            try
+            {
+                flags = flagText.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    ? Convert.ToUInt16(flagText.Substring(2), 16)
+                    : Convert.ToUInt16(flagText);
+            }
+            catch
+            {
+                return McpHandlers.Error("flags must be a decimal or 0x-prefixed 16-bit integer", "INVALID_PARAMS");
+            }
 
             try
             {
@@ -140,11 +151,13 @@ namespace FrostyMcpPlugin.Bridge
                     ["success"] = true,
                     ["name"] = entry.Name,
                     ["type"] = typeName,
-                    ["file_guid"] = asset.FileGuid.ToString(),
+                    ["file_guid"] = entry.Guid.ToString(),
                     ["class_guid"] = classGuid.ToString(),
+                    ["asset_file_guid"] = asset.FileGuid.ToString(),
+                    ["guid_invariant_ok"] = asset.FileGuid == entry.Guid,
                     ["pointer"] = new Dictionary<string, object>
                     {
-                        ["file_guid"] = asset.FileGuid.ToString(),
+                        ["file_guid"] = entry.Guid.ToString(),
                         ["class_guid"] = classGuid.ToString()
                     },
                     ["hint"] = "Use add_to_network_registry with this pointer (never register MpSoldierAI root)"
@@ -172,7 +185,11 @@ namespace FrostyMcpPlugin.Bridge
                 var item = SerializeNetRef(pr, i++);
                 if (!string.IsNullOrEmpty(query))
                 {
-                    string hay = (item["file_guid"] + " " + item["class_guid"] + " " + item["asset_name"] + " " + item["type"]).ToLowerInvariant();
+                    item.TryGetValue("file_guid", out object fg);
+                    item.TryGetValue("class_guid", out object cg);
+                    item.TryGetValue("asset_name", out object an);
+                    item.TryGetValue("type", out object ty);
+                    string hay = (fg + " " + cg + " " + an + " " + ty).ToLowerInvariant();
                     if (hay.IndexOf(query.ToLowerInvariant(), StringComparison.Ordinal) < 0)
                         continue;
                 }
@@ -197,7 +214,9 @@ namespace FrostyMcpPlugin.Bridge
             if (!TryLoadNetReg(p, out EbxAssetEntry entry, out EbxAsset asset, out dynamic root, out object err))
                 return err;
 
-            List<PointerRef> toAdd = ParsePointerList(p);
+            List<PointerRef> toAdd = ParsePointerList(p, out string parseError);
+            if (parseError != null)
+                return McpHandlers.Error(parseError, "INVALID_PARAMS");
             if (toAdd.Count == 0)
                 return McpHandlers.Error("Provide refs_json / file_guid+class_guid / asset name(+class_guid)", "INVALID_PARAMS");
 
@@ -246,11 +265,14 @@ namespace FrostyMcpPlugin.Bridge
             if (!TryLoadNetReg(p, out EbxAssetEntry entry, out EbxAsset asset, out dynamic root, out object err))
                 return err;
 
-            List<PointerRef> targets = ParsePointerList(p);
+            List<PointerRef> targets = ParsePointerList(p, out string parseError);
+            if (parseError != null)
+                return McpHandlers.Error(parseError, "INVALID_PARAMS");
             if (targets.Count == 0 && p["index"] == null)
                 return McpHandlers.Error("Provide refs or index", "INVALID_PARAMS");
 
-            var removed = new List<object>();
+            var indices = new List<int>();
+            var removedPlan = new List<object>();
             try
             {
                 if (p["index"] != null)
@@ -258,40 +280,68 @@ namespace FrostyMcpPlugin.Bridge
                     int idx = Convert.ToInt32(p["index"].ToString());
                     if (idx < 0 || idx >= root.Objects.Count)
                         return McpHandlers.Error("index out of range", "INVALID_PARAMS");
-                    PointerRef pr = root.Objects[idx];
-                    removed.Add(SerializeNetRef(pr, idx));
-                    root.Objects.RemoveAt(idx);
+                    indices.Add(idx);
+                    removedPlan.Add(SerializeNetRef(root.Objects[idx], idx));
                 }
                 else
                 {
-                    for (int i = root.Objects.Count - 1; i >= 0; i--)
+                    for (int i = 0; i < root.Objects.Count; i++)
                     {
                         PointerRef pr = root.Objects[i];
                         foreach (PointerRef t in targets)
                         {
                             if (PointerEquals(pr, t))
                             {
-                                removed.Add(SerializeNetRef(pr, i));
-                                root.Objects.RemoveAt(i);
+                                indices.Add(i);
+                                removedPlan.Add(SerializeNetRef(pr, i));
                                 break;
                             }
                         }
                     }
                 }
-
-                App.AssetManager.ModifyEbx(entry.Name, asset);
-                return new Dictionary<string, object>
-                {
-                    ["success"] = true,
-                    ["registry"] = entry.Name,
-                    ["removed_count"] = removed.Count,
-                    ["removed"] = removed
-                };
             }
             catch (Exception ex)
             {
                 return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
             }
+
+            if (indices.Count == 0)
+                return McpHandlers.Error("No matching entries in this registry", "NOT_FOUND");
+
+            var plan = new Dictionary<string, object>
+            {
+                ["registry"] = entry.Name,
+                ["removed_count"] = indices.Count,
+                ["removed"] = removedPlan
+            };
+
+            return McpCommit.Require("remove_from_network_registry", p, plan, () =>
+            {
+                try
+                {
+                    var removed = new List<object>();
+                    for (int i = indices.Count - 1; i >= 0; i--)
+                    {
+                        int idx = indices[i];
+                        if (idx < 0 || idx >= root.Objects.Count)
+                            continue;
+                        removed.Add(SerializeNetRef(root.Objects[idx], idx));
+                        root.Objects.RemoveAt(idx);
+                    }
+                    App.AssetManager.ModifyEbx(entry.Name, asset);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["registry"] = entry.Name,
+                        ["removed_count"] = removed.Count,
+                        ["removed"] = removed
+                    };
+                }
+                catch (Exception ex)
+                {
+                    return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
+                }
+            });
         }
 
         public static object SafeAddToBundle(JObject p)
@@ -311,18 +361,22 @@ namespace FrostyMcpPlugin.Bridge
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
 
-            bool already = entry.Bundles.Contains(bid) || entry.AddedBundles.Contains(bid);
-            bool added = false;
-            if (!already)
-                added = entry.AddToBundle(bid);
+            bool hadTombstone = entry.RemBundles.Contains(bid);
+            bool added = McpHandlers.AddToBundleExportable(entry, bid);
+            bool already = !added && entry.IsInBundle(bid);
 
-            // Touch EBX so export picks up bundle changes (BF1DevPlugin General.cs warning)
-            try
+            // Touch EBX so export picks up bundle changes (BF1DevPlugin General.cs warning).
+            // Only when something actually changed: ModifyEbx marks the asset dirty,
+            // which would rewrite an untouched asset into the mod.
+            if (added || hadTombstone)
             {
-                EbxAsset asset = App.AssetManager.GetEbx(entry);
-                App.AssetManager.ModifyEbx(entry.Name, asset);
+                try
+                {
+                    EbxAsset asset = App.AssetManager.GetEbx(entry);
+                    App.AssetManager.ModifyEbx(entry.Name, asset);
+                }
+                catch { }
             }
-            catch { }
 
             return new Dictionary<string, object>
             {
@@ -371,7 +425,7 @@ namespace FrostyMcpPlugin.Bridge
                     continue;
                 }
 
-                entry.AddToBundle(bid);
+                McpHandlers.AddToBundleExportable(entry, bid);
                 added.Add(new Dictionary<string, object> { ["bundle"] = name, ["bundle_id"] = bid });
             }
 
@@ -481,8 +535,9 @@ namespace FrostyMcpPlugin.Bridge
             catch { return false; }
         }
 
-        private static List<PointerRef> ParsePointerList(JObject p)
+        private static List<PointerRef> ParsePointerList(JObject p, out string error)
         {
+            error = null;
             var list = new List<PointerRef>();
 
             // refs_json: [{"file_guid":"...","class_guid":"..."}, ...]
@@ -525,9 +580,36 @@ namespace FrostyMcpPlugin.Bridge
                     EbxAsset a = App.AssetManager.GetEbx(ae);
                     Guid classGuid = a.RootInstanceGuid;
                     string cgs = (p.Value<string>("asset_class_guid") ?? p.Value<string>("class_guid") ?? "").Trim();
-                    // Only override class if asset_class_guid explicitly set (avoid clashing with netreg class_guid)
-                    if (!string.IsNullOrEmpty(p.Value<string>("asset_class_guid")) && Guid.TryParse(p.Value<string>("asset_class_guid"), out Guid acg))
+                    if (!string.IsNullOrEmpty(cgs))
+                    {
+                        if (!Guid.TryParse(cgs, out Guid acg))
+                        {
+                            error = "class_guid invalid";
+                            return list;
+                        }
+                        bool found = acg == a.RootInstanceGuid;
+                        if (!found)
+                        {
+                            foreach (object obj in a.ExportedObjects)
+                            {
+                                try
+                                {
+                                    if (((dynamic)obj).GetInstanceGuid().ExportedGuid == acg)
+                                    {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                        if (!found)
+                        {
+                            error = "class_guid " + acg + " is not an exported object of " + ae.Name;
+                            return list;
+                        }
                         classGuid = acg;
+                    }
                     list.Add(new PointerRef(new EbxImportReference { FileGuid = a.FileGuid, ClassGuid = classGuid }));
                 }
             }
@@ -575,22 +657,16 @@ namespace FrostyMcpPlugin.Bridge
                 d["file_guid"] = pr.External.FileGuid.ToString();
                 d["class_guid"] = pr.External.ClassGuid.ToString();
                 EbxAssetEntry e = App.AssetManager?.GetEbxEntry(pr.External.FileGuid);
-                d["asset_name"] = e?.Name ?? "";
-                d["type"] = e?.Type ?? "";
+                if (e != null)
+                {
+                    d["asset_name"] = e.Name;
+                    d["type"] = e.Type;
+                }
             }
             else if (pr.Type == FrostySdk.IO.PointerRefType.Internal && pr.Internal != null)
             {
                 d["type"] = pr.Internal.GetType().Name;
-                try { d["class_guid"] = ((dynamic)pr.Internal).GetInstanceGuid().ExportedGuid.ToString(); } catch { d["class_guid"] = ""; }
-                d["file_guid"] = "";
-                d["asset_name"] = "";
-            }
-            else
-            {
-                d["file_guid"] = "";
-                d["class_guid"] = "";
-                d["asset_name"] = "";
-                d["type"] = "";
+                try { d["class_guid"] = ((dynamic)pr.Internal).GetInstanceGuid().ExportedGuid.ToString(); } catch { }
             }
             return d;
         }

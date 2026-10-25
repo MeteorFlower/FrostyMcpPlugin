@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.IO;
 using FrostySdk.Managers;
@@ -18,7 +18,7 @@ namespace FrostyMcpPlugin.Bridge
     {
         private const int DefaultLimit = 100;
         private const int MaxLimit = 10000;
-        private const int DefaultXmlMaxChars = 200000;
+        private const int DefaultXmlMaxChars = 60000;
 
         public static object Ping(JObject _)
         {
@@ -88,10 +88,34 @@ namespace FrostyMcpPlugin.Bridge
             string name = p.Value<string>("name");
             string guidStr = p.Value<string>("guid");
             bool createDefault = p.Value<bool?>("create_default_editor") ?? true;
+            string kind = (p.Value<string>("kind") ?? "ebx").Trim().ToLowerInvariant();
 
-            EbxAssetEntry entry = ResolveEbxEntry(name, guidStr);
-            if (entry == null)
-                return Error("EBX asset not found", "NOT_FOUND");
+            AssetEntry assetEntry;
+            if (kind == "ebx")
+            {
+                assetEntry = ResolveEbxEntry(name, guidStr);
+                if (assetEntry == null)
+                    return Error("EBX asset not found", "NOT_FOUND");
+            }
+            else if (kind == "res")
+            {
+                assetEntry = string.IsNullOrEmpty(guidStr) || !ulong.TryParse(guidStr, out ulong rid)
+                    ? (string.IsNullOrEmpty(name) ? null : App.AssetManager.GetResEntry(name))
+                    : App.AssetManager.GetResEntry(rid);
+                if (assetEntry == null)
+                    return Error("RES asset not found", "NOT_FOUND");
+            }
+            else if (kind == "chunk")
+            {
+                string idText = string.IsNullOrEmpty(guidStr) ? name : guidStr;
+                assetEntry = Guid.TryParse(idText, out Guid chunkId) ? App.AssetManager.GetChunkEntry(chunkId) : null;
+                if (assetEntry == null)
+                    return Error("Chunk not found", "NOT_FOUND");
+            }
+            else
+            {
+                return Error("kind must be ebx, res or chunk", "INVALID_PARAMS");
+            }
 
             try
             {
@@ -99,7 +123,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     if (App.EditorWindow == null)
                         throw new InvalidOperationException("Editor window is not available");
-                    App.EditorWindow.OpenAsset(entry, createDefault);
+                    App.EditorWindow.OpenAsset(assetEntry, createDefault);
                 });
             }
             catch (Exception ex)
@@ -110,7 +134,8 @@ namespace FrostyMcpPlugin.Bridge
             return new Dictionary<string, object>
             {
                 ["success"] = true,
-                ["asset"] = SerializeEbxEntry(entry)
+                ["kind"] = kind,
+                ["asset"] = SerializeAssetEntry(assetEntry)
             };
         }
 
@@ -215,8 +240,15 @@ namespace FrostyMcpPlugin.Bridge
 
             Dictionary<string, object> result = SerializeEbxEntry(entry);
             result["success"] = true;
+            result["is_modified"] = entry.IsModified;
             AttachBundleInfo(result, entry);
-            result["linked_assets"] = entry.LinkedAssets.Select(SerializeAssetEntry).ToList();
+
+            int linkedLimit = ClampLimit(p.Value<int?>("linked_limit") ?? 200);
+            List<AssetEntry> linked = entry.LinkedAssets.ToList();
+            result["linked_count"] = linked.Count;
+            result["linked_assets"] = linked.Take(linkedLimit).Select(SerializeAssetEntry).ToList();
+            if (linked.Count > linkedLimit)
+                result["linked_truncated"] = true;
             return result;
         }
 
@@ -242,6 +274,7 @@ namespace FrostyMcpPlugin.Bridge
             int maxChars = p.Value<int?>("max_chars") ?? DefaultXmlMaxChars;
             if (maxChars <= 0)
                 maxChars = DefaultXmlMaxChars;
+            int charOffset = Math.Max(0, p.Value<int?>("char_offset") ?? 0);
             bool summary = p.Value<bool?>("summary") ?? false;
             string filter = (p.Value<string>("filter") ?? "").Trim();
 
@@ -256,23 +289,30 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     if (xml)
                     {
+                        // Frosty 1.0.6.3: EbxXmlWriter is (Stream, AssetManager) and
+                        // WriteObjects takes the object list. asset.Objects (not
+                        // RootObjects) so PointerRef-referenced components appear too.
+                        // Same indent as the editor's own exporter so text diffs line up.
+                        int tabSize = Config.Get<int>("ExportTabSize", 2);
                         using (EbxXmlWriter writer = new EbxXmlWriter(ms, App.AssetManager))
-                            writer.WriteObjects(asset.RootObjects);
+                            writer.WriteObjects(asset.Objects);
                     }
                     else
                     {
                         using (EbxYamlWriter writer = new EbxYamlWriter(ms, App.AssetManager))
-                            writer.WriteObjects(asset.RootObjects);
+                            writer.WriteObjects(asset.Objects);
                     }
                     text = Encoding.UTF8.GetString(ms.ToArray());
                 }
 
                 if (summary)
                 {
+                    // Count objects by type. Scanning the serialized text only worked
+                    // for XML; YAML has no tags, so the summary was always empty.
                     var counts = new Dictionary<string, int>();
-                    foreach (Match m in Regex.Matches(text, @"<([A-Za-z_][A-Za-z0-9_]*)(?:\s|>|/)"))
+                    foreach (object obj in asset.Objects)
                     {
-                        string tag = m.Groups[1].Value;
+                        string tag = obj.GetType().Name;
                         counts[tag] = counts.TryGetValue(tag, out int n) ? n + 1 : 1;
                     }
                     var top = counts
@@ -287,6 +327,7 @@ namespace FrostyMcpPlugin.Bridge
                         ["guid"] = entry.Guid.ToString(),
                         ["format"] = xml ? "xml" : "yaml",
                         ["summary"] = true,
+                        ["object_count"] = asset.Objects.Count(),
                         ["length"] = text.Length,
                         ["elements"] = top
                     };
@@ -299,9 +340,12 @@ namespace FrostyMcpPlugin.Bridge
                         .Where(l => l.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
                         .ToList();
                     string filtered = string.Join("\n", hits);
-                    bool cut = filtered.Length > maxChars;
+                    if (charOffset > filtered.Length)
+                        charOffset = filtered.Length;
+                    string slice = filtered.Substring(charOffset);
+                    bool cut = slice.Length > maxChars;
                     if (cut)
-                        filtered = filtered.Substring(0, maxChars);
+                        slice = slice.Substring(0, maxChars);
                     return new Dictionary<string, object>
                     {
                         ["success"] = true,
@@ -312,14 +356,20 @@ namespace FrostyMcpPlugin.Bridge
                         ["filter"] = filter,
                         ["match_count"] = hits.Count,
                         ["truncated"] = cut,
-                        ["length"] = filtered.Length,
-                        ["content"] = filtered
+                        ["char_offset"] = charOffset,
+                        ["next_offset"] = cut ? charOffset + maxChars : -1,
+                        ["total_length"] = filtered.Length,
+                        ["length"] = slice.Length,
+                        ["content"] = slice
                     };
                 }
 
-                bool truncated = text.Length > maxChars;
+                if (charOffset > text.Length)
+                    charOffset = text.Length;
+                string body = text.Substring(charOffset);
+                bool truncated = body.Length > maxChars;
                 if (truncated)
-                    text = text.Substring(0, maxChars);
+                    body = body.Substring(0, maxChars);
 
                 return new Dictionary<string, object>
                 {
@@ -329,8 +379,11 @@ namespace FrostyMcpPlugin.Bridge
                     ["guid"] = entry.Guid.ToString(),
                     ["format"] = xml ? "xml" : "yaml",
                     ["truncated"] = truncated,
-                    ["length"] = text.Length,
-                    ["content"] = text
+                    ["char_offset"] = charOffset,
+                    ["next_offset"] = truncated ? charOffset + maxChars : -1,
+                    ["total_length"] = text.Length,
+                    ["length"] = body.Length,
+                    ["content"] = body
                 };
             }
             catch (Exception ex)
@@ -352,7 +405,11 @@ namespace FrostyMcpPlugin.Bridge
 
             if (kind == "all" || kind == "ebx")
             {
-                foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx(modifiedOnly: true, includeLinked: true))
+                // Only directly modified assets are written to a .fbmod; a linked-only
+                // change exports through the RES instead. Pass include_linked=true to
+                // see the indirect ones anyway.
+                bool includeLinked = p.Value<bool?>("include_linked") ?? false;
+                foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx(modifiedOnly: true, includeLinked: includeLinked))
                     all.Add(SerializeEbxEntry(e));
             }
             if (kind == "all" || kind == "res")
@@ -556,6 +613,12 @@ namespace FrostyMcpPlugin.Bridge
                 .Where(e => e.EnumerateBundles().Contains(bundleId))
                 .Select(SerializeChunkEntry).Cast<object>().ToList();
 
+            int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
+            int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
+            List<object> ebxPage = ebx.Skip(offset).Take(limit).ToList();
+            List<object> resPage = res.Skip(offset).Take(limit).ToList();
+            List<object> chunkPage = chunks.Skip(offset).Take(limit).ToList();
+
             return new Dictionary<string, object>
             {
                 ["success"] = true,
@@ -565,9 +628,17 @@ namespace FrostyMcpPlugin.Bridge
                 ["ebx_count"] = ebx.Count,
                 ["res_count"] = res.Count,
                 ["chunk_count"] = chunks.Count,
-                ["ebx"] = ebx.Take(DefaultLimit).ToList(),
-                ["res"] = res.Take(DefaultLimit).ToList(),
-                ["chunks"] = chunks.Take(DefaultLimit).ToList()
+                ["offset"] = offset,
+                ["limit"] = limit,
+                ["ebx_returned"] = ebxPage.Count,
+                ["res_returned"] = resPage.Count,
+                ["chunks_returned"] = chunkPage.Count,
+                ["truncated"] = ebx.Count > offset + ebxPage.Count
+                    || res.Count > offset + resPage.Count
+                    || chunks.Count > offset + chunkPage.Count,
+                ["ebx"] = ebxPage,
+                ["res"] = resPage,
+                ["chunks"] = chunkPage
             };
         }
 
@@ -586,44 +657,68 @@ namespace FrostyMcpPlugin.Bridge
                 if (asset == null)
                     return Error("Failed to load EBX data", "LOAD_FAILED");
 
+                bool recursive = p.Value<bool?>("recursive") ?? false;
+                int maxNodes = p.Value<int?>("max_nodes") ?? 2000;
+                if (maxNodes < 1) maxNodes = 1;
+
                 List<object> deps = new List<object>();
 
                 foreach (AssetEntry linked in entry.LinkedAssets)
                     deps.Add(SerializeAssetEntry(linked));
 
-                HashSet<Guid> seen = new HashSet<Guid>();
-                foreach (Guid fileGuid in entry.EnumerateDependencies())
+                HashSet<Guid> seen = new HashSet<Guid> { entry.Guid };
+                int depth = 1;
+                List<Guid> frontier = new List<Guid>();
+                frontier.AddRange(entry.EnumerateDependencies());
+                frontier.AddRange(asset.Dependencies);
+
+                bool truncated = false;
+                while (frontier.Count > 0)
                 {
-                    if (!seen.Add(fileGuid))
-                        continue;
+                    List<Guid> next = new List<Guid>();
+                    foreach (Guid fileGuid in frontier)
+                    {
+                        if (!seen.Add(fileGuid))
+                            continue;
 
-                    EbxAssetEntry dep = App.AssetManager.GetEbxEntry(fileGuid);
-                    if (dep != null)
-                        deps.Add(SerializeEbxEntry(dep));
-                    else
-                        deps.Add(new Dictionary<string, object>
+                        if (deps.Count >= maxNodes)
                         {
-                            ["asset_type"] = "ebx",
-                            ["guid"] = fileGuid.ToString(),
-                            ["missing"] = true
-                        });
-                }
+                            truncated = true;
+                            break;
+                        }
 
-                foreach (Guid fileGuid in asset.Dependencies)
-                {
-                    if (!seen.Add(fileGuid))
-                        continue;
-
-                    EbxAssetEntry dep = App.AssetManager.GetEbxEntry(fileGuid);
-                    if (dep != null)
-                        deps.Add(SerializeEbxEntry(dep));
-                    else
-                        deps.Add(new Dictionary<string, object>
+                        EbxAssetEntry dep = App.AssetManager.GetEbxEntry(fileGuid);
+                        if (dep != null)
                         {
-                            ["asset_type"] = "ebx",
-                            ["guid"] = fileGuid.ToString(),
-                            ["missing"] = true
-                        });
+                            Dictionary<string, object> row = SerializeEbxEntry(dep);
+                            row["depth"] = depth;
+                            deps.Add(row);
+
+                            if (recursive)
+                            {
+                                next.AddRange(dep.EnumerateDependencies());
+                                EbxAsset depAsset;
+                                try { depAsset = App.AssetManager.GetEbx(dep); }
+                                catch { depAsset = null; }
+                                if (depAsset != null)
+                                    next.AddRange(depAsset.Dependencies);
+                            }
+                        }
+                        else
+                        {
+                            deps.Add(new Dictionary<string, object>
+                            {
+                                ["asset_type"] = "ebx",
+                                ["guid"] = fileGuid.ToString(),
+                                ["missing"] = true,
+                                ["depth"] = depth
+                            });
+                        }
+                    }
+                    if (truncated || !recursive)
+                        break;
+                    frontier = next;
+                    depth++;
                 }
 
                 return new Dictionary<string, object>
@@ -631,7 +726,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["success"] = true,
                     ["name"] = entry.Name,
                     ["guid"] = entry.Guid.ToString(),
+                    ["recursive"] = recursive,
                     ["count"] = deps.Count,
+                    ["truncated"] = truncated,
                     ["dependencies"] = deps
                 };
             }
@@ -639,87 +736,6 @@ namespace FrostyMcpPlugin.Bridge
             {
                 return Error(ex.Message, "DEPS_FAILED");
             }
-        }
-
-        public static object GetTypeInfo(JObject p)
-        {
-            string typeName = p.Value<string>("name");
-            if (string.IsNullOrEmpty(typeName))
-                return Error("name is required", "INVALID_PARAMS");
-
-            Type type = TypeLibrary.GetType(typeName);
-            if (type == null)
-                return Error("Type not found", "NOT_FOUND");
-
-            List<object> props = new List<object>();
-            foreach (var pi in type.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
-            {
-                props.Add(new Dictionary<string, object>
-                {
-                    ["name"] = pi.Name,
-                    ["type"] = pi.PropertyType.Name
-                });
-            }
-
-            return new Dictionary<string, object>
-            {
-                ["success"] = true,
-                ["name"] = type.Name,
-                ["fullname"] = type.Namespace ?? "",
-                ["full_name"] = type.FullName,
-                ["base_type"] = type.BaseType?.Name,
-                ["property_count"] = props.Count,
-                ["properties"] = props
-            };
-        }
-
-        public static object SearchTypes(JObject p)
-        {
-            string query = (p.Value<string>("query") ?? "").Trim();
-            string baseType = (p.Value<string>("base_type") ?? "").Trim();
-            int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
-            int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
-
-            Type[] types;
-            try
-            {
-                types = string.IsNullOrEmpty(baseType)
-                    ? TypeLibrary.GetConcreteTypes()
-                    : TypeLibrary.GetTypes(baseType);
-            }
-            catch
-            {
-                types = TypeLibrary.GetConcreteTypes() ?? Array.Empty<Type>();
-            }
-
-            if (types == null)
-                types = Array.Empty<Type>();
-
-            IEnumerable<Type> filtered = types;
-            if (!string.IsNullOrEmpty(query))
-            {
-                filtered = filtered.Where(t =>
-                    t.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
-            }
-
-            List<Type> all = filtered.OrderBy(t => t.Name).ToList();
-            List<object> page = all.Skip(offset).Take(limit)
-                .Select(t => (object)new Dictionary<string, object>
-                {
-                    ["name"] = t.Name,
-                    ["full_name"] = t.FullName,
-                    ["base_type"] = t.BaseType?.Name
-                }).ToList();
-
-            return new Dictionary<string, object>
-            {
-                ["success"] = true,
-                ["total"] = all.Count,
-                ["offset"] = offset,
-                ["limit"] = limit,
-                ["returned"] = page.Count,
-                ["types"] = page
-            };
         }
 
         // ---- helpers (shared with edit handlers) ----
@@ -744,6 +760,19 @@ namespace FrostyMcpPlugin.Bridge
             }
 
             return -1;
+        }
+
+        // A membership removed by AdvancedBundleEditorPlugin lands in RemBundles.
+        // AssetEntry.AddToBundle then sees IsInBundle == true and returns false
+        // without clearing the tombstone, so the asset can never come back.
+        internal static bool AddToBundleExportable(AssetEntry entry, int bid)
+        {
+            if (entry.RemBundles.Contains(bid))
+            {
+                entry.RemBundles.Remove(bid);
+                entry.IsDirty = true;
+            }
+            return entry.AddToBundle(bid);
         }
 
         internal static EbxAssetEntry ResolveEbxEntry(string name, string guidStr)
@@ -772,9 +801,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["name"] = entry.Name,
                 ["type"] = entry.Type,
                 ["guid"] = entry.Guid.ToString(),
-                ["filename"] = entry.Filename,
-                ["path"] = entry.Path,
-                ["is_modified"] = entry.IsModified,
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
                 ["size"] = entry.Size
@@ -793,9 +819,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["type"] = entry.Type,
                 ["res_rid"] = entry.ResRid.ToString(),
                 ["res_type"] = entry.ResType,
-                ["filename"] = entry.Filename,
-                ["path"] = entry.Path,
-                ["is_modified"] = entry.IsModified,
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
                 ["size"] = entry.Size
@@ -812,7 +835,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["asset_type"] = "chunk",
                 ["name"] = entry.Name,
                 ["id"] = entry.Id.ToString(),
-                ["filename"] = entry.Filename,
                 ["is_modified"] = entry.IsModified,
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
@@ -856,8 +878,6 @@ namespace FrostyMcpPlugin.Bridge
             result["original_bundles"] = ResolveBundleNames(entry.Bundles);
             result["added_bundles"] = ResolveBundleNames(entry.AddedBundles);
             result["removed_bundles"] = ResolveBundleNames(entry.RemBundles);
-            result["added_bundle_count"] = entry.AddedBundles?.Count ?? 0;
-            result["removed_bundle_count"] = entry.RemBundles?.Count ?? 0;
         }
 
         internal static List<string> ResolveBundleNames(IEnumerable<int> ids)

@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
@@ -38,28 +38,54 @@ namespace FrostyMcpPlugin.Bridge
             if (be == null || !be.Added)
                 return McpHandlers.Error("Bundle is not an added bundle; vanilla bundles cannot be deleted", "INVALID_STATE");
 
-            bool clearMembers = p.Value<bool?>("clear_members") ?? true;
-            int cleared = 0;
-            if (clearMembers)
+            // RevertBundle removes the entry from the bundle list, and bundle ids are
+            // list indices: removing anything but the last entry renumbers every later
+            // bundle and leaves asset references pointing at the wrong ones.
+            int bundleCount = 0;
+            foreach (BundleEntry unused in App.AssetManager.EnumerateBundles())
+                bundleCount++;
+            if (bid != bundleCount - 1)
+                return McpHandlers.Error("Only the most recently created bundle can be deleted; removing this one would renumber later bundles", "NOT_LAST_BUNDLE");
+
+            if (p.Value<bool?>("clear_members") == false)
+                return McpHandlers.Error("clear_members=false is not supported for deletion", "INVALID_PARAMS");
+
+            int memberCount = 0;
+            foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx("", true))
+                if (e.AddedBundles.Contains(bid)) memberCount++;
+            foreach (ResAssetEntry e in App.AssetManager.EnumerateRes(0, true))
+                if (e.AddedBundles.Contains(bid)) memberCount++;
+            foreach (ChunkAssetEntry e in App.AssetManager.EnumerateChunks(true))
+                if (e.AddedBundles.Contains(bid)) memberCount++;
+
+            var plan = new Dictionary<string, object>
             {
+                ["bundle"] = be.Name,
+                ["bundle_id"] = bid,
+                ["type"] = be.Type.ToString(),
+                ["members_to_clear"] = memberCount
+            };
+
+            return McpCommit.Require("delete_bundle", p, plan, () =>
+            {
+                int cleared = 0;
                 foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx("", true))
                     if (e.AddedBundles.Remove(bid)) cleared++;
                 foreach (ResAssetEntry e in App.AssetManager.EnumerateRes(0, true))
                     if (e.AddedBundles.Remove(bid)) cleared++;
                 foreach (ChunkAssetEntry e in App.AssetManager.EnumerateChunks(true))
                     if (e.AddedBundles.Remove(bid)) cleared++;
-            }
 
-            App.AssetManager.RevertBundle(be);
+                App.AssetManager.RevertBundle(be);
 
-            return new Dictionary<string, object>
-            {
-                ["success"] = true,
-                ["bundle"] = name,
-                ["bundle_id"] = bid,
-                ["clear_members"] = clearMembers,
-                ["cleared_members"] = cleared
-            };
+                return new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["bundle"] = name,
+                    ["bundle_id"] = bid,
+                    ["cleared_members"] = cleared
+                };
+            });
         }
 
         public static object ListSuperBundles(JObject p)
@@ -92,6 +118,8 @@ namespace FrostyMcpPlugin.Bridge
             {
                 if (e.IsAdded) addedEbx++; else modifiedEbx++;
             }
+            int modifiedRes = App.AssetManager.EnumerateRes(0, true).Count();
+            int modifiedChunks = App.AssetManager.EnumerateChunks(true).Count();
             int addedBundles = App.AssetManager.EnumerateBundles(BundleType.None, true).Count(b => b.Added);
             int addedRes = App.AssetManager.EnumerateRes(0, true).Count(r => r.IsAdded);
             int addedChunks = App.AssetManager.EnumerateChunks(true).Count(c => c.IsAdded);
@@ -99,7 +127,12 @@ namespace FrostyMcpPlugin.Bridge
             return new Dictionary<string, object>
             {
                 ["success"] = true,
-                ["modified_count"] = App.AssetManager.GetModifiedCount(),
+                // Every figure below is counted from the same enumerations, so the
+                // breakdown always adds up to modified_count.
+                ["modified_count"] = (addedEbx + modifiedEbx) + modifiedRes + modifiedChunks,
+                ["modified_ebx"] = addedEbx + modifiedEbx,
+                ["modified_res"] = modifiedRes,
+                ["modified_chunks"] = modifiedChunks,
                 ["dirty_count"] = App.AssetManager.GetDirtyCount(),
                 ["ebx_total"] = App.AssetManager.GetEbxCount(),
                 ["ebx_added"] = addedEbx,
@@ -153,13 +186,19 @@ namespace FrostyMcpPlugin.Bridge
                 bool success = r is Dictionary<string, object> dict
                     && dict.TryGetValue("success", out object value) && value is bool b && b;
                 if (success) ok++; else failed++;
-                results.Add(new Dictionary<string, object>
+
+                var row = new Dictionary<string, object>
                 {
                     ["name"] = item.Value<string>("name"),
                     ["path"] = item.Value<string>("path"),
-                    ["success"] = success,
-                    ["result"] = r
-                });
+                    ["success"] = success
+                };
+                if (!success && r is Dictionary<string, object> errDict)
+                {
+                    if (errDict.TryGetValue("error", out object msg)) row["error"] = msg;
+                    if (errDict.TryGetValue("error_code", out object code)) row["error_code"] = code;
+                }
+                results.Add(row);
             }
 
             return new Dictionary<string, object>
@@ -183,21 +222,42 @@ namespace FrostyMcpPlugin.Bridge
             if (!entry.IsModified)
                 return new Dictionary<string, object> { ["success"] = true, ["name"] = entry.Name, ["unchanged"] = true };
 
-            EbxAsset modified = App.AssetManager.GetEbx(entry);
-
-            // GetEbx(entry, true) still reads through GetAsset(), which returns the
-            // modified stream whenever ModifiedEntry.Data exists, so the flag alone
-            // never reaches vanilla data. Hide the modification for this one read.
-            ModifiedAssetEntry stash = entry.ModifiedEntry;
-            EbxAsset original;
-            entry.ModifiedEntry = null;
             try
             {
-                original = App.AssetManager.GetEbx(entry);
+                // Reading the vanilla copy temporarily hides ModifiedEntry from every
+                // other thread, so serialize the whole diff with the editor UI thread.
+                return McpHandlers.InvokeOnUi(() => DiffEbxCore(p, entry));
             }
-            finally
+            catch (Exception ex)
             {
-                entry.ModifiedEntry = stash;
+                return McpHandlers.Error(ex.Message, "DIFF_FAILED");
+            }
+        }
+
+        private static object DiffEbxCore(JObject p, EbxAssetEntry entry)
+        {
+            EbxAsset modified = App.AssetManager.GetEbx(entry);
+
+            // getUnmodifiedData only bypasses ModifiedEntry.DataObject; saved edits
+            // live in ModifiedEntry.Data, which GetAsset prefers. Hide the entry for
+            // that single read, and only when the saved bytes would shadow vanilla.
+            EbxAsset original;
+            if (entry.ModifiedEntry?.Data != null)
+            {
+                ModifiedAssetEntry stash = entry.ModifiedEntry;
+                entry.ModifiedEntry = null;
+                try
+                {
+                    original = App.AssetManager.GetEbx(entry);
+                }
+                finally
+                {
+                    entry.ModifiedEntry = stash;
+                }
+            }
+            else
+            {
+                original = App.AssetManager.GetEbx(entry, true);
             }
             if (original == null)
                 return McpHandlers.Error("No unmodified data available for this asset", "NO_VANILLA_DATA");
@@ -275,7 +335,7 @@ namespace FrostyMcpPlugin.Bridge
                 foreach (object obj in asset.Objects)
                 {
                     string typeName = obj.GetType().Name;
-                    WalkRefs(obj, obj.GetType(), "", entry, asset.FileGuid, exported, issues, cap, 0);
+                    WalkRefs(obj, obj.GetType(), "", entry, entry.Guid, exported, issues, cap, 0);
                     if (issues.Count >= cap) { truncatedAssets++; break; }
                 }
                 if (issues.Count >= cap) break;
@@ -287,7 +347,8 @@ namespace FrostyMcpPlugin.Bridge
                 ["scanned_assets"] = scanned,
                 ["issue_count"] = issues.Count,
                 ["issues"] = issues,
-                ["truncated"] = issues.Count >= cap
+                ["truncated"] = issues.Count >= cap,
+                ["truncated_assets"] = truncatedAssets
             };
         }
 
@@ -438,17 +499,41 @@ namespace FrostyMcpPlugin.Bridge
             bool includeOutside = p.Value<bool?>("include_outside") ?? false;
             int cap = p.Value<int?>("limit") ?? 200;
 
-            int assets = 0, depTotal = 0;
+            int assets = 0, depTotal = 0, linkedTotal = 0;
+            int missingTotal = 0, outsideTotal = 0, linkedOutsideTotal = 0;
             List<object> missing = new List<object>();
             List<object> outside = new List<object>();
+            List<object> linkedOutside = new List<object>();
 
-            foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx(be))
+            foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
             {
+                // EnumerateEbx(BundleEntry) ignores RemBundles; the effective list is
+                // what get_bundle and the packer use.
+                if (!entry.EnumerateBundles().Contains(bid)) continue;
                 assets++;
                 EbxAsset asset;
                 try { asset = App.AssetManager.GetEbx(entry); }
                 catch { continue; }
                 if (asset == null) continue;
+
+                // File-level dependencies only cover EBX to EBX. Resources and chunks
+                // hang off LinkedAssets, and a bundle that misses them loads only
+                // partially, so report those too.
+                foreach (AssetEntry linked in entry.LinkedAssets)
+                {
+                    linkedTotal++;
+                    if (!linked.EnumerateBundles().Contains(bid))
+                    {
+                        linkedOutsideTotal++;
+                        if (linkedOutside.Count < cap)
+                            linkedOutside.Add(new Dictionary<string, object>
+                            {
+                                ["asset"] = entry.Name,
+                                ["linked"] = linked.Name,
+                                ["linked_type"] = linked.Type
+                            });
+                    }
+                }
 
                 foreach (Guid dep in asset.Dependencies)
                 {
@@ -456,14 +541,39 @@ namespace FrostyMcpPlugin.Bridge
                     EbxAssetEntry depEntry = App.AssetManager.GetEbxEntry(dep);
                     if (depEntry == null)
                     {
+                        missingTotal++;
                         if (missing.Count < cap)
                             missing.Add(new Dictionary<string, object> { ["asset"] = entry.Name, ["dep_guid"] = dep.ToString() });
                         continue;
                     }
-                    if (!depEntry.IsInBundle(bid))
+                    if (!depEntry.EnumerateBundles().Contains(bid))
                     {
+                        outsideTotal++;
                         if (includeOutside && outside.Count < cap)
                             outside.Add(new Dictionary<string, object> { ["asset"] = entry.Name, ["dep"] = depEntry.Name });
+                    }
+                }
+            }
+
+            // RES and Chunk members carry their own LinkedAssets (a texture RES points
+            // at its chunk), which the EBX loop above never sees.
+            foreach (ResAssetEntry entry in App.AssetManager.EnumerateRes())
+            {
+                if (!entry.EnumerateBundles().Contains(bid)) continue;
+                assets++;
+                foreach (AssetEntry linked in entry.LinkedAssets)
+                {
+                    linkedTotal++;
+                    if (!linked.EnumerateBundles().Contains(bid))
+                    {
+                        linkedOutsideTotal++;
+                        if (linkedOutside.Count < cap)
+                            linkedOutside.Add(new Dictionary<string, object>
+                            {
+                                ["asset"] = entry.Name,
+                                ["linked"] = linked.Name,
+                                ["linked_type"] = linked.Type
+                            });
                     }
                 }
             }
@@ -474,20 +584,20 @@ namespace FrostyMcpPlugin.Bridge
                 ["bundle"] = be.Name,
                 ["assets"] = assets,
                 ["dependency_count"] = depTotal,
-                ["missing_count"] = missing.Count,
+                ["missing_count"] = missingTotal,
+                ["missing_returned"] = missing.Count,
                 ["missing"] = missing,
-                ["outside_count"] = outside.Count,
+                ["outside_count"] = outsideTotal,
+                ["outside_returned"] = outside.Count,
                 ["outside"] = outside,
+                ["linked_count"] = linkedTotal,
+                ["linked_outside_count"] = linkedOutsideTotal,
+                ["linked_outside_returned"] = linkedOutside.Count,
+                ["linked_outside"] = linkedOutside,
                 ["include_outside"] = includeOutside,
-                ["truncated"] = missing.Count >= cap || outside.Count >= cap
+                ["truncated"] = missingTotal > missing.Count || outsideTotal > outside.Count || linkedOutsideTotal > linkedOutside.Count
             };
         }
-
-        private static readonly string[] DefaultRegistries =
-        {
-            "gameplay/kits/bundling/characterssharedbundleasset_networkregistry_Win32",
-            "installchunks/installed_characterssharedbundleasset_networkregistry_Win32"
-        };
 
         public static object RegistryGap(JObject p)
         {
@@ -512,7 +622,17 @@ namespace FrostyMcpPlugin.Bridge
             else if (!string.IsNullOrWhiteSpace(p.Value<string>("registry")))
                 registries.Add(p.Value<string>("registry"));
             else
-                registries.AddRange(DefaultRegistries);
+            {
+                // Discover the profile's own registries instead of assuming the
+                // BF1 character registry names.
+                foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
+                {
+                    if (e.Type != null && e.Type.EndsWith("NetworkRegistryAsset", StringComparison.OrdinalIgnoreCase))
+                        registries.Add(e.Name);
+                }
+                if (registries.Count == 0)
+                    return McpHandlers.Error("No NetworkRegistryAsset found; pass registries explicitly", "NOT_FOUND");
+            }
 
             Dictionary<string, HashSet<string>> regSets = new Dictionary<string, HashSet<string>>();
             foreach (string reg in registries)
@@ -557,12 +677,14 @@ namespace FrostyMcpPlugin.Bridge
                 foreach (KeyValuePair<string, HashSet<string>> kv in regSets)
                 {
                     List<object> missing = new List<object>();
+                    int regMissing = 0;
                     foreach (KeyValuePair<Guid, string> ex in exported)
                     {
                         string key = entry.Guid.ToString() + "/" + ex.Key.ToString();
                         if (kv.Value.Contains(key)) continue;
                         assetMissing++;
                         totalMissing++;
+                        regMissing++;
                         if (missing.Count < cap)
                             missing.Add(new Dictionary<string, object>
                             {
@@ -572,7 +694,8 @@ namespace FrostyMcpPlugin.Bridge
                     }
                     perRegistry[kv.Key] = new Dictionary<string, object>
                     {
-                        ["missing_count"] = missing.Count,
+                        ["missing_count"] = regMissing,
+                        ["missing_returned"] = missing.Count,
                         ["missing"] = missing
                     };
                 }

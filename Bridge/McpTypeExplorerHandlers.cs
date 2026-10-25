@@ -1,4 +1,4 @@
-using FrostySdk;
+﻿using FrostySdk;
 using FrostySdk.Attributes;
 using Newtonsoft.Json.Linq;
 using System;
@@ -102,12 +102,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
-                ["query"] = query,
-                ["base_type"] = baseType,
-                ["namespace"] = nsFilter,
-                ["kind"] = kindFilter,
-                ["hide_empty"] = hideEmpty,
-                ["compact"] = compact,
                 ["types"] = page
             };
         }
@@ -158,7 +152,7 @@ namespace FrostyMcpPlugin.Bridge
                         "NOT_FOUND");
                 }
 
-                lastField = DescribeField(pi, declared: true);
+                lastField = DescribeField(pi, declared: pi.DeclaringType == current);
                 resolved = ResolveFieldBrowseType(pi);
                 if (resolved == null && i < parts.Length - 1)
                 {
@@ -356,8 +350,6 @@ namespace FrostyMcpPlugin.Bridge
 
             result["field_count"] = fields.Count;
             result["fields"] = fields;
-            result["property_count"] = fields.Count;
-            result["properties"] = fields;
             return result;
         }
 

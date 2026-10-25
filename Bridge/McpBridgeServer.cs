@@ -1,4 +1,4 @@
-using FrostySdk;
+﻿using FrostySdk;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
@@ -30,7 +30,7 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        public const string Version = "2.0.3";
+        public const string Version = "2.1.1";
         public const int MaxRequestBytes = 32 * 1024 * 1024;
 
         public static McpBridgeServer Instance { get; } = new McpBridgeServer();
@@ -131,6 +131,8 @@ namespace FrostyMcpPlugin.Bridge
 
         private void HandleClient(NamedPipeServerStream pipe, CancellationToken token)
         {
+            try
+            {
             while (!token.IsCancellationRequested && pipe.IsConnected)
             {
                 byte[] header = ReadExact(pipe, 4, token);
@@ -153,6 +155,11 @@ namespace FrostyMcpPlugin.Bridge
                 pipe.Write(respHeader, 0, 4);
                 pipe.Write(responseBytes, 0, responseBytes.Length);
                 pipe.Flush();
+            }
+            }
+            finally
+            {
+                McpCommit.ClearPending();
             }
         }
 
@@ -216,6 +223,7 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                McpCommit.BeginCall(method);
                 object result = McpCommandRouter.Dispatch(method, paramsObj);
                 return JsonConvert.SerializeObject(new
                 {

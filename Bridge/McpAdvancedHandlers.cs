@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
@@ -31,16 +31,20 @@ namespace FrostyMcpPlugin.Bridge
             {
                 Type editors = GetBundleEditorsType();
                 if (editors == null)
+                {
+                    if (!(p.Value<bool?>("allow_fallback") ?? false))
+                        return McpHandlers.Error("AdvancedBundleEditorPlugin not loaded", "PLUGIN_MISSING");
                     return FallbackSmartAdd(entry, bundle, p);
+                }
 
                 bool added = (bool)InvokeStatic(editors, "AddAssetToBundle", entry, bundle);
-                bool net = p.Value<bool?>("netreg") ?? false;
-                bool mvdb = p.Value<bool?>("mvdb") ?? false;
-                bool unlock = p.Value<bool?>("unlock_table") ?? false;
+                bool netWanted = p.Value<bool?>("netreg") ?? false;
+                bool mvdbWanted = p.Value<bool?>("mvdb") ?? false;
+                bool unlockWanted = p.Value<bool?>("unlock_table") ?? false;
 
-                if (net) InvokeStatic(editors, "AddAssetToNetRegs", entry, bundle);
-                if (mvdb) InvokeStatic(editors, "AddAssetToMvdBs", entry, bundle, null);
-                if (unlock) InvokeStatic(editors, "AddAssetToTables", entry, bundle);
+                bool net = netWanted && (bool)InvokeStatic(editors, "AddAssetToNetRegs", entry, bundle);
+                bool mvdb = mvdbWanted && (bool)InvokeStatic(editors, "AddAssetToMvdBs", entry, bundle, null);
+                bool unlock = unlockWanted && (bool)InvokeStatic(editors, "AddAssetToTables", entry, bundle);
 
                 return new Dictionary<string, object>
                 {
@@ -69,7 +73,11 @@ namespace FrostyMcpPlugin.Bridge
             {
                 Type editors = GetBundleEditorsType();
                 if (editors == null)
+                {
+                    if (!(p.Value<bool?>("allow_fallback") ?? false))
+                        return McpHandlers.Error("AdvancedBundleEditorPlugin not loaded", "PLUGIN_MISSING");
                     return McpMoreHandlers.RemoveFromBundleSmart(p);
+                }
 
                 InvokeStatic(editors, "RemoveAssetFromBundle", entry, bundle);
                 if (p.Value<bool?>("netreg") ?? false)
@@ -134,15 +142,17 @@ namespace FrostyMcpPlugin.Bridge
                 else
                 {
                     bool added = (bool)InvokeStatic(editors, "AddAssetToBundle", entry, bundle);
-                    InvokeStatic(editors, "AddAssetToNetRegs", entry, bundle);
-                    InvokeStatic(editors, "AddAssetToMvdBs", entry, bundle, null);
+                    bool netOk = (bool)InvokeStatic(editors, "AssetAddNetworkValid", entry, bundle);
+                    bool mvOk = (bool)InvokeStatic(editors, "AssetAddMeshVariationValid", entry, bundle);
+                    if (netOk) InvokeStatic(editors, "AddAssetToNetRegs", entry, bundle);
+                    if (mvOk) InvokeStatic(editors, "AddAssetToMvdBs", entry, bundle, null);
                     try { InvokeStatic(editors, "AddAssetToTables", entry, bundle); } catch { }
                     touched.Add(new Dictionary<string, object>
                     {
                         ["name"] = entry.Name,
                         ["added_bundle"] = added,
-                        ["netreg"] = true,
-                        ["mvdb"] = true
+                        ["netreg"] = netOk,
+                        ["mvdb"] = mvOk
                     });
                 }
 
@@ -267,7 +277,7 @@ namespace FrostyMcpPlugin.Bridge
                 MethodInfo add = bunpy.GetMethod("AddBundle", BindingFlags.Public | BindingFlags.Static);
                 add.Invoke(null, new object[] { bundlePath, superBundle, bundleType, generateBlueprints, blueprintType });
 
-                int bid = App.AssetManager.GetBundleId(bundlePath.ToLowerInvariant());
+                int bid = McpHandlers.ResolveBundleId(bundlePath);
                 BundleEntry be = bid >= 0 ? App.AssetManager.GetBundleEntry(bid) : null;
 
                 return new Dictionary<string, object>
@@ -345,9 +355,12 @@ namespace FrostyMcpPlugin.Bridge
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 200);
 
+            // EnumerateEbx(BundleEntry) honours Bundles/AddedBundles but not RemBundles;
+            // filter by the effective list so the four bundle tools agree.
             var all = new List<object>();
-            foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx(be))
+            foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
             {
+                if (!e.EnumerateBundles().Contains(bid)) continue;
                 if (modifiedOnly && !e.IsModified) continue;
                 if (!string.IsNullOrEmpty(typeFilter) &&
                     !string.Equals(e.Type, typeFilter, StringComparison.OrdinalIgnoreCase) &&
@@ -377,7 +390,7 @@ namespace FrostyMcpPlugin.Bridge
         public static object ResolveHash(JObject p)
         {
             string hashStr = (p.Value<string>("hash") ?? p.Value<string>("value") ?? "").Trim();
-            if (string.IsNullOrEmpty(hashStr) && p["hash"] == null)
+            if (hashStr.Length == 0)
                 return McpHandlers.Error("hash is required (int or 0xHEX)", "INVALID_PARAMS");
 
             try
@@ -390,15 +403,21 @@ namespace FrostyMcpPlugin.Bridge
                 else
                     hash = int.Parse(hashStr, System.Globalization.NumberStyles.Integer);
 
+                // Utils.GetString returns "0x" + the raw hash when nothing is registered.
                 string resolved = Utils.GetString(hash);
+                bool known = !string.IsNullOrEmpty(resolved) && resolved != "0x" + hash.ToString("x8");
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["hash"] = hash,
                     ["hash_hex"] = "0x" + unchecked((uint)hash).ToString("X8"),
                     ["string"] = resolved,
-                    ["known"] = !string.IsNullOrEmpty(resolved) && resolved != hash.ToString()
+                    ["known"] = known
                 };
+            }
+            catch (FormatException)
+            {
+                return McpHandlers.Error("hash must be a decimal int or 0x-prefixed hex", "INVALID_PARAMS");
             }
             catch (Exception ex)
             {
@@ -591,7 +610,11 @@ namespace FrostyMcpPlugin.Bridge
             if (!McpBlueprintHandlersTryLoad(p, out EbxAssetEntry entry, out dynamic root, out object err))
                 return err;
 
+            if (!HasConnectionArrays(root))
+                return McpHandlers.Error("Asset root type is not a blueprint (no connection arrays)", "NOT_A_BLUEPRINT");
+
             var issues = new List<object>();
+            var scanErrors = new List<object>();
             int propCount = 0, eventCount = 0, linkCount = 0;
 
             try
@@ -616,9 +639,13 @@ namespace FrostyMcpPlugin.Bridge
                             ["target_field"] = tf
                         });
                     }
+                    CheckFlagBits(c, "property", i, issues);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                scanErrors.Add(new Dictionary<string, object> { ["section"] = "property", ["error"] = Unwrap(ex) });
+            }
 
             try
             {
@@ -630,7 +657,10 @@ namespace FrostyMcpPlugin.Bridge
                     CheckPointer(c.Target, "event", i, "target", issues);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                scanErrors.Add(new Dictionary<string, object> { ["section"] = "event", ["error"] = Unwrap(ex) });
+            }
 
             try
             {
@@ -642,7 +672,10 @@ namespace FrostyMcpPlugin.Bridge
                     CheckPointer(c.Target, "link", i, "target", issues);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                scanErrors.Add(new Dictionary<string, object> { ["section"] = "link", ["error"] = Unwrap(ex) });
+            }
 
             return new Dictionary<string, object>
             {
@@ -652,7 +685,9 @@ namespace FrostyMcpPlugin.Bridge
                 ["event_count"] = eventCount,
                 ["link_count"] = linkCount,
                 ["issue_count"] = issues.Count,
-                ["issues"] = issues
+                ["issues"] = issues,
+                ["scan_error_count"] = scanErrors.Count,
+                ["scan_errors"] = scanErrors
             };
         }
 
@@ -761,6 +796,42 @@ namespace FrostyMcpPlugin.Bridge
             return true;
         }
 
+        private static bool HasConnectionArrays(dynamic root)
+        {
+            Type t = ((object)root).GetType();
+            return t.GetProperty("PropertyConnections") != null
+                && t.GetProperty("EventConnections") != null
+                && t.GetProperty("LinkConnections") != null;
+        }
+
+        private static void CheckFlagBits(dynamic connection, string kind, int index, List<object> issues)
+        {
+            int flags = 0;
+            try { flags = (int)connection.Flags; } catch { return; }
+            int realm = flags & 0xF;
+            int propType = (flags >> 4) & 0x3;
+            if (realm < 0 || realm > 5)
+            {
+                issues.Add(new Dictionary<string, object>
+                {
+                    ["kind"] = kind,
+                    ["index"] = index,
+                    ["issue"] = "invalid_realm",
+                    ["realm_bits"] = realm
+                });
+            }
+            if (propType == 3)
+            {
+                issues.Add(new Dictionary<string, object>
+                {
+                    ["kind"] = kind,
+                    ["index"] = index,
+                    ["issue"] = "invalid_prop_type",
+                    ["prop_type_bits"] = propType
+                });
+            }
+        }
+
         private static void CheckPointer(PointerRef pr, string kind, int index, string side, List<object> issues)
         {
             if (pr.Type == FrostySdk.IO.PointerRefType.Null)
@@ -829,12 +900,13 @@ namespace FrostyMcpPlugin.Bridge
             string r = realm.Replace("Realm_", "");
             switch (r.ToLowerInvariant())
             {
-                case "client": return 1;
-                case "server": return 2;
-                case "clientandserver": return 3;
+                case "clientandserver": return 1;
+                case "client": return 2;
+                case "server": return 3;
                 case "networkedclient": return 4;
                 case "networkedclientandserver": return 5;
-                default: return 3;
+                case "invalid": return 0;
+                default: return 1;
             }
         }
 
@@ -845,9 +917,9 @@ namespace FrostyMcpPlugin.Bridge
             {
                 case "default": return 0;
                 case "interface": return 1;
+                case "exposed":
                 case "dynamic": return 2;
-                case "dynamic_+interface":
-                case "dynamic+interface": return 3;
+                case "invalid": return 3;
                 default: return 0;
             }
         }

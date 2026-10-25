@@ -1,4 +1,5 @@
-using Frosty.Core;
+﻿using Frosty.Core;
+using Frosty.Core.Viewport;
 using FrostySdk;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
@@ -13,6 +14,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Windows;
 
 namespace FrostyMcpPlugin.Bridge
 {
@@ -115,20 +117,27 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrWhiteSpace(path))
                 return McpHandlers.Error("path (output file) is required", "INVALID_PARAMS");
 
+            if (App.PluginManager.GetCustomHandler(entry.Type) != null)
+                return McpHandlers.Error("Asset type uses a custom handler; .bin export is not supported", "UNSUPPORTED_TYPE");
+
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
                 AssetDefinition def = App.PluginManager.GetAssetDefinition(entry.Type) ?? new AssetDefinition();
                 bool ok = def.Export(entry, path, "bin");
                 if (!ok)
-                    return McpHandlers.Error("Export failed (asset may use a custom handler)", "EXPORT_FAILED");
+                    return McpHandlers.Error("Export failed", "EXPORT_FAILED");
+
+                FileInfo fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length == 0)
+                    return McpHandlers.Error("Export produced no data", "EXPORT_EMPTY");
 
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
                     ["path"] = Path.GetFullPath(path),
-                    ["size"] = new FileInfo(path).Length
+                    ["size"] = fi.Length
                 };
             }
             catch (Exception ex)
@@ -152,6 +161,22 @@ namespace FrostyMcpPlugin.Bridge
 
             bool dataOnly = p.Value<bool?>("data_only") ?? true;
 
+            // AssetDefinition.ImportFromBin only logs when the type has a custom
+            // handler, yet Import() still returns true. Refuse up front instead
+            // of reporting a success that changed nothing.
+            if (App.PluginManager.GetCustomHandler(entry.Type) != null)
+                return McpHandlers.Error("Asset type uses a custom handler; .bin import is not supported", "UNSUPPORTED_TYPE");
+
+            var plan = new Dictionary<string, object>
+            {
+                ["name"] = entry.Name,
+                ["type"] = entry.Type,
+                ["path"] = Path.GetFullPath(path),
+                ["data_only"] = dataOnly,
+                ["current_guid"] = entry.Guid.ToString()
+            };
+            Func<object> execute = () =>
+            {
             try
             {
                 AssetDefinition def = App.PluginManager.GetAssetDefinition(entry.Type) ?? new AssetDefinition();
@@ -160,19 +185,49 @@ namespace FrostyMcpPlugin.Bridge
                 if (!ok)
                     return McpHandlers.Error("Import failed (asset may use a custom handler)", "IMPORT_FAILED");
 
+                // data_only=false takes the file's FileGuid, while AssetManager keeps
+                // entry.Guid as it was. The two must stay equal: every tool that
+                // resolves a PointerRef by asset name writes entry data from one of them.
+                EbxAssetEntry refreshed = App.AssetManager.GetEbxEntry(entry.Name);
+                EbxAsset imported = refreshed == null ? null : App.AssetManager.GetEbx(refreshed);
+                if (refreshed == null || imported == null)
+                    return McpHandlers.Error("Imported asset could not be reloaded", "IMPORT_FAILED");
+
+                if (imported.FileGuid != refreshed.Guid)
+                {
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Imported file GUID differs from the asset entry GUID; the asset is now inconsistent",
+                        ["error_code"] = "GUID_MISMATCH",
+                        ["entry_guid"] = refreshed.Guid.ToString(),
+                        ["file_guid"] = imported.FileGuid.ToString(),
+                        ["file_guid_resolves"] = App.AssetManager.GetEbxEntry(imported.FileGuid) != null,
+                        ["data_only"] = dataOnly
+                    };
+                }
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
                     ["path"] = Path.GetFullPath(path),
                     ["data_only"] = dataOnly,
-                    ["asset"] = McpHandlers.SerializeEbxEntry(App.AssetManager.GetEbxEntry(entry.Name))
+                    ["file_guid"] = refreshed.Guid.ToString(),
+                    ["asset"] = McpHandlers.SerializeEbxEntry(refreshed)
                 };
             }
             catch (Exception ex)
             {
                 return McpHandlers.Error(ex.Message, "IMPORT_FAILED");
             }
+            };
+
+            // data_only=true keeps the asset identity; data_only=false adopts the
+            // file's GUID and must be confirmed explicitly.
+            if (dataOnly)
+                return execute();
+            return McpCommit.Require("import_ebx_bin", p, plan, execute);
         }
 
         public static object DuplicateEbx(JObject p)
@@ -204,7 +259,7 @@ namespace FrostyMcpPlugin.Bridge
 
                 newAsset.SetFileGuid(Guid.NewGuid());
                 dynamic obj = newAsset.RootObject;
-                obj.Name = newName;
+                try { obj.Name = newName; } catch { /* some types have no Name */ }
 
                 // Renumber every object, not just the root. Duplicated assets that
                 // share a bundle with their source otherwise keep the source object
@@ -292,6 +347,17 @@ namespace FrostyMcpPlugin.Bridge
             if (type == null)
                 return McpHandlers.Error("Type not found: " + typeName, "TYPE_NOT_FOUND");
 
+            // Resolve the bundle before the asset exists: failing afterwards would
+            // leave a created asset that claims success.
+            int bundleId = -1;
+            string bundleName = p.Value<string>("bundle");
+            if (!string.IsNullOrEmpty(bundleName))
+            {
+                bundleId = McpHandlers.ResolveBundleId(bundleName);
+                if (bundleId < 0)
+                    return McpHandlers.Error("Bundle not found: " + bundleName, "BUNDLE_NOT_FOUND");
+            }
+
             try
             {
                 object root = TypeLibrary.CreateObject(typeName);
@@ -307,13 +373,8 @@ namespace FrostyMcpPlugin.Bridge
 
                 EbxAssetEntry entry = App.AssetManager.AddEbx(name, asset);
 
-                string bundleName = p.Value<string>("bundle");
-                if (!string.IsNullOrEmpty(bundleName))
-                {
-                    int bid = App.AssetManager.GetBundleId(bundleName.ToLowerInvariant());
-                    if (bid >= 0)
-                        entry.AddToBundle(bid);
-                }
+                if (bundleId >= 0)
+                    McpHandlers.AddToBundleExportable(entry, bundleId);
 
                 asset.Update();
                 App.AssetManager.ModifyEbx(entry.Name, asset);
@@ -343,20 +404,31 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("Asset not found", "NOT_FOUND");
 
-            try
+            var plan = new Dictionary<string, object>
             {
-                App.AssetManager.RevertAsset(entry, dataOnly);
-                return new Dictionary<string, object>
+                ["asset"] = entry.Name,
+                ["kind"] = kind,
+                ["data_only"] = dataOnly,
+                ["is_dirty"] = entry.IsDirty
+            };
+
+            return McpCommit.Require("revert_asset", p, plan, () =>
+            {
+                try
                 {
-                    ["success"] = true,
-                    ["asset"] = McpHandlers.SerializeAssetEntry(entry),
-                    ["data_only"] = dataOnly
-                };
-            }
-            catch (Exception ex)
-            {
-                return McpHandlers.Error(ex.Message, "REVERT_FAILED");
-            }
+                    App.AssetManager.RevertAsset(entry, dataOnly);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["asset"] = McpHandlers.SerializeAssetEntry(entry),
+                        ["data_only"] = dataOnly
+                    };
+                }
+                catch (Exception ex)
+                {
+                    return McpHandlers.Error(ex.Message, "REVERT_FAILED");
+                }
+            });
         }
 
         // =====================================================================
@@ -376,20 +448,39 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrWhiteSpace(path))
                 return McpHandlers.Error("path is required", "INVALID_PARAMS");
 
+            string format = (p.Value<string>("format") ?? "frosty_res").Trim().ToLowerInvariant();
+            if (format != "frosty_res" && format != "raw")
+                return McpHandlers.Error("format must be frosty_res or raw", "INVALID_PARAMS");
+            bool withMeta = format == "frosty_res";
+
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
+                byte[] data;
                 using (NativeReader reader = new NativeReader(App.AssetManager.GetRes(entry)))
-                using (NativeWriter writer = new NativeWriter(new FileStream(path, FileMode.Create, FileAccess.Write)))
-                    writer.Write(reader.ReadToEnd());
+                    data = reader.ReadToEnd();
 
-                return new Dictionary<string, object>
+                using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+                {
+                    if (withMeta)
+                        fs.Write(BuildResMeta(entry), 0, 16);
+                    fs.Write(data, 0, data.Length);
+                }
+
+                var result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["asset"] = McpHandlers.SerializeResEntry(entry),
                     ["path"] = Path.GetFullPath(path),
+                    ["format"] = format,
+                    ["meta_included"] = withMeta,
+                    ["meta_size"] = withMeta ? 16 : 0,
+                    ["data_size"] = data.Length,
                     ["size"] = new FileInfo(path).Length
                 };
+                if (!withMeta)
+                    result["warning"] = "Raw format cannot be exchanged with the editor's .res importer";
+                return result;
             }
             catch (Exception ex)
             {
@@ -410,21 +501,74 @@ namespace FrostyMcpPlugin.Bridge
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 return McpHandlers.Error("path (existing file) is required", "INVALID_PARAMS");
 
+            string format = (p.Value<string>("format") ?? "frosty_res").Trim().ToLowerInvariant();
+            if (format != "frosty_res" && format != "raw")
+                return McpHandlers.Error("format must be frosty_res or raw", "INVALID_PARAMS");
+            bool withMeta = format == "frosty_res";
+
             try
             {
-                byte[] data = File.ReadAllBytes(path);
-                App.AssetManager.ModifyRes(entry.Name, data);
-                return new Dictionary<string, object>
+                byte[] file = File.ReadAllBytes(path);
+                if (withMeta && file.Length < 16)
+                    return McpHandlers.Error("frosty_res file is shorter than the 16-byte header", "INVALID_PARAMS");
+
+                byte[] meta = null;
+                byte[] data;
+                if (withMeta)
+                {
+                    meta = new byte[16];
+                    Array.Copy(file, 0, meta, 0, 16);
+                    data = new byte[file.Length - 16];
+                    Array.Copy(file, 16, data, 0, data.Length);
+                }
+                else
+                {
+                    data = file;
+                }
+
+                App.AssetManager.ModifyRes(entry.Name, data, meta);
+
+                // Read back through the same path the editor uses and compare bytes.
+                byte[] roundtrip;
+                using (NativeReader reader = new NativeReader(App.AssetManager.GetRes(entry)))
+                    roundtrip = reader.ReadToEnd();
+                if (!BytesEqual(data, roundtrip))
+                    return McpHandlers.Error("RES round-trip verification failed", "VERIFY_FAILED");
+
+                var result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["asset"] = McpHandlers.SerializeResEntry(App.AssetManager.GetResEntry(entry.Name)),
+                    ["format"] = format,
+                    ["meta_included"] = withMeta,
+                    ["meta_updated"] = withMeta,
                     ["bytes"] = data.Length
                 };
+                if (!withMeta)
+                    result["warning"] = "Raw format leaves ResMeta unchanged";
+                return result;
             }
             catch (Exception ex)
             {
                 return McpHandlers.Error(ex.Message, "IMPORT_FAILED");
             }
+        }
+
+        private static byte[] BuildResMeta(ResAssetEntry entry)
+        {
+            byte[] meta = new byte[16];
+            if (entry.ResMeta != null)
+                Array.Copy(entry.ResMeta, meta, Math.Min(16, entry.ResMeta.Length));
+            return meta;
+        }
+
+        private static bool BytesEqual(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length)
+                return false;
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i]) return false;
+            return true;
         }
 
         public static object ExportChunk(JObject p)
@@ -517,16 +661,30 @@ namespace FrostyMcpPlugin.Bridge
                     }
                 }
 
+                Texture texture = null;
+                string textureResName = (p.Value<string>("texture_res") ?? "").Trim();
+                if (!string.IsNullOrEmpty(textureResName))
+                {
+                    ResAssetEntry textureRes = App.AssetManager.GetResEntry(textureResName);
+                    if (textureRes == null)
+                        return McpHandlers.Error("texture_res not found", "NOT_FOUND");
+                    texture = App.AssetManager.GetResAs<Texture>(textureRes);
+                    if (texture == null)
+                        return McpHandlers.Error("texture_res is not a Texture resource", "TYPE_MISMATCH");
+                }
+
                 Guid newGuid;
                 using (NativeReader reader = new NativeReader(App.AssetManager.GetChunk(entry)))
-                    newGuid = App.AssetManager.AddChunk(reader.ReadToEnd(), new Guid(random), null, entry.EnumerateBundles().ToArray());
+                    newGuid = App.AssetManager.AddChunk(reader.ReadToEnd(), new Guid(random), texture, entry.EnumerateBundles().ToArray());
 
                 ChunkAssetEntry newEntry = App.AssetManager.GetChunkEntry(newGuid);
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["source"] = McpHandlers.SerializeChunkEntry(entry),
-                    ["asset"] = McpHandlers.SerializeChunkEntry(newEntry)
+                    ["asset"] = McpHandlers.SerializeChunkEntry(newEntry),
+                    ["texture_metadata"] = texture != null
                 };
             }
             catch (Exception ex)
@@ -596,13 +754,21 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("Asset not found", "NOT_FOUND");
 
-            bool added = entry.AddToBundle(bid);
+            bool added = McpHandlers.AddToBundleExportable(entry, bid);
+            bool already = !added && entry.IsInBundle(bid);
+            var warnings = new List<string>();
+            if (added && IsResourceBackedType(entry.Type) && !entry.LinkedAssets.Any())
+                warnings.Add("Asset type carries RES/Chunk resources that this raw membership add does not include");
+
             return new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["added"] = added,
+                ["already_in_bundle"] = already,
                 ["bundle"] = bundleName,
                 ["bundle_id"] = bid,
+                ["effective_bundles"] = entry.EnumerateBundles().Count(),
+                ["warnings"] = warnings,
                 ["asset"] = McpHandlers.SerializeAssetEntry(entry)
             };
         }
@@ -625,28 +791,35 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("Asset not found", "NOT_FOUND");
 
-            bool removed = false;
-            if (entry.AddedBundles.Contains(bid))
+            // A .fbmod can only add bundle memberships; dropping a native one
+            // would be recorded in RemBundles and never exported.
+            if (!entry.AddedBundles.Contains(bid) && entry.Bundles.Contains(bid))
+                return McpHandlers.Error("Asset is a native member of this bundle; the removal cannot be expressed in a .fbmod", "NOT_EXPORTABLE");
+
+            if (!entry.AddedBundles.Contains(bid))
+                return McpHandlers.Error("Asset is not an editor-added member of this bundle", "NOT_MEMBER");
+
+            var plan = new Dictionary<string, object>
+            {
+                ["asset"] = entry.Name,
+                ["bundle"] = bundleName,
+                ["bundle_id"] = bid,
+                ["remaining_effective_bundles"] = entry.EnumerateBundles().Count() - 1
+            };
+
+            return McpCommit.Require("remove_from_bundle", p, plan, () =>
             {
                 entry.AddedBundles.Remove(bid);
                 entry.IsDirty = true;
-                removed = true;
-            }
-            else if (entry.Bundles.Contains(bid) && !entry.RemBundles.Contains(bid))
-            {
-                entry.RemBundles.Add(bid);
-                entry.IsDirty = true;
-                removed = true;
-            }
-
-            return new Dictionary<string, object>
-            {
-                ["success"] = true,
-                ["removed"] = removed,
-                ["bundle"] = bundleName,
-                ["bundle_id"] = bid,
-                ["asset"] = McpHandlers.SerializeAssetEntry(entry)
-            };
+                return new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["removed"] = true,
+                    ["bundle"] = bundleName,
+                    ["bundle_id"] = bid,
+                    ["asset"] = McpHandlers.SerializeAssetEntry(entry)
+                };
+            });
         }
 
         public static object CreateBundle(JObject p)
@@ -662,17 +835,18 @@ namespace FrostyMcpPlugin.Bridge
             if (!Enum.TryParse(typeStr, true, out BundleType bundleType))
                 bundleType = BundleType.BlueprintBundle;
 
-            string sbName = (p.Value<string>("super_bundle") ?? "").Trim().ToLowerInvariant();
-            int sbIndex = 0;
-            if (!string.IsNullOrEmpty(sbName))
+            string sbName = (p.Value<string>("super_bundle") ?? "").Trim();
+            if (string.IsNullOrEmpty(sbName))
+                return McpHandlers.Error("super_bundle is required", "INVALID_PARAMS");
+
+            int sbIndex = ResolveSuperBundleId(sbName);
+            if (sbIndex < 0)
             {
-                sbIndex = App.AssetManager.GetSuperBundleId(sbName);
-                if (sbIndex < 0)
-                {
-                    App.AssetManager.AddSuperBundle(sbName);
-                    sbIndex = App.AssetManager.GetSuperBundleId(sbName);
-                }
+                App.AssetManager.AddSuperBundle(sbName);
+                sbIndex = ResolveSuperBundleId(sbName);
             }
+            if (sbIndex < 0)
+                return McpHandlers.Error("SuperBundle not found and could not be created: " + sbName, "NOT_FOUND");
 
             try
             {
@@ -756,13 +930,12 @@ namespace FrostyMcpPlugin.Bridge
             try
             {
                 // Prefer TexturePlugin editor import helpers via reflection (avoids project reference)
-                object result = ImportTextureViaReflection(entry, path);
+                bool rawChunk = p.Value<bool?>("raw_chunk") ?? false;
+                object result = ImportTextureViaReflection(entry, path, rawChunk);
                 if (result != null)
                     return result;
 
-                return McpHandlers.Error(
-                    "Texture import requires TexturePlugin. Load TexturePlugin and retry, or import a pre-converted DDS via import_chunk/import_res.",
-                    "PLUGIN_MISSING");
+                return McpHandlers.Error("TexturePlugin is not loaded", "PLUGIN_MISSING");
             }
             catch (Exception ex)
             {
@@ -789,11 +962,13 @@ namespace FrostyMcpPlugin.Bridge
             string scale = p.Value<string>("scale") ?? Config.Get<string>("MeshSetExportScale", "Centimeters", ConfigScope.Game);
             bool flatten = p.Value<bool?>("flatten_hierarchy") ?? Config.Get<bool>("MeshSetExportFlattenHierarchy", false, ConfigScope.Game);
             bool singleLod = p.Value<bool?>("single_lod") ?? Config.Get<bool>("MeshSetExportExportSingleLod", false, ConfigScope.Game);
+            bool nonRenderable = p.Value<bool?>("export_non_renderable")
+                ?? Config.Get<bool>("MeshSetExportNonRenderable", false, ConfigScope.Game);
 
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
-                ExportMeshViaReflection(entry, path, format, version, scale, flatten, singleLod, skeleton);
+                ExportMeshViaReflection(entry, path, format, version, scale, flatten, singleLod, nonRenderable, skeleton);
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -924,6 +1099,42 @@ namespace FrostyMcpPlugin.Bridge
                 default:
                     return McpHandlers.ResolveEbxEntry(p.Value<string>("name"), p.Value<string>("guid"));
             }
+        }
+
+        // Fork-specific Texture fields (Veilguard metadata) do not all exist in
+        // every Frosty version; copy the ones this build exposes.
+        private static void CopyOptionalMembers(object source, object target, params string[] names)
+        {
+            foreach (string name in names)
+            {
+                PropertyInfo pi = source.GetType().GetProperty(name);
+                if (pi == null || !pi.CanRead || !pi.CanWrite)
+                    continue;
+                try { pi.SetValue(target, pi.GetValue(source)); }
+                catch { }
+            }
+        }
+
+        private static bool IsResourceBackedType(string type)
+        {
+            if (string.IsNullOrEmpty(type))
+                return false;
+            string[] markers =
+            {
+                "Texture", "MeshAsset", "SoundWave", "NewWave", "MovieTexture",
+                "PhysicsAsset", "Cloth", "Enlighten", "SvgImage", "AtlasTexture"
+            };
+            return markers.Any(m => type.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static int ResolveSuperBundleId(string name)
+        {
+            int id = App.AssetManager.GetSuperBundleId(name);
+            if (id >= 0) return id;
+            foreach (SuperBundleEntry sb in App.AssetManager.EnumerateSuperBundles())
+                if (string.Equals(sb.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return App.AssetManager.GetSuperBundleId(sb);
+            return -1;
         }
 
         private static ResAssetEntry ResolveRes(JObject p)
@@ -1081,9 +1292,29 @@ namespace FrostyMcpPlugin.Bridge
             return false;
         }
 
+        // Blueprint roots expose the child list as either Objects or Components;
+        // accept both names in the generic property tools as the field tools do.
+        private static string AliasMemberName(Type type, string name)
+        {
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
+            string alternate = null;
+            if (string.Equals(name, "Components", StringComparison.OrdinalIgnoreCase))
+                alternate = "Objects";
+            else if (string.Equals(name, "Objects", StringComparison.OrdinalIgnoreCase))
+                alternate = "Components";
+            if (alternate == null)
+                return name;
+            if (type.GetProperty(name, flags) != null || type.GetField(name, flags) != null)
+                return name;
+            if (type.GetProperty(alternate, flags) != null || type.GetField(alternate, flags) != null)
+                return alternate;
+            return name;
+        }
+
         private static object GetMember(object obj, string name)
         {
             Type type = obj.GetType();
+            name = AliasMemberName(type, name);
             PropertyInfo pi = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
             if (pi != null)
                 return pi.GetValue(obj);
@@ -1098,6 +1329,7 @@ namespace FrostyMcpPlugin.Bridge
         private static void SetMember(object obj, string name, JToken valueToken)
         {
             Type type = obj.GetType();
+            name = AliasMemberName(type, name);
             PropertyInfo pi = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
             if (pi != null && pi.CanWrite)
             {
@@ -1191,9 +1423,11 @@ namespace FrostyMcpPlugin.Bridge
                     if (e == null)
                         throw new InvalidOperationException("PointerRef asset not found: " + assetName);
                     EbxAsset a = App.AssetManager.GetEbx(e);
+                    if (a.FileGuid != e.Guid)
+                        throw new InvalidOperationException("GUID_INCONSISTENT: entry " + e.Guid + ", file " + a.FileGuid);
                     return new PointerRef(new EbxImportReference
                     {
-                        FileGuid = a.FileGuid,
+                        FileGuid = e.Guid,
                         ClassGuid = a.RootInstanceGuid
                     });
                 }
@@ -1218,9 +1452,11 @@ namespace FrostyMcpPlugin.Bridge
                 if (e != null)
                 {
                     EbxAsset a = App.AssetManager.GetEbx(e);
+                    if (a.FileGuid != e.Guid)
+                        throw new InvalidOperationException("GUID_INCONSISTENT: entry " + e.Guid + ", file " + a.FileGuid);
                     return new PointerRef(new EbxImportReference
                     {
-                        FileGuid = a.FileGuid,
+                        FileGuid = e.Guid,
                         ClassGuid = a.RootInstanceGuid
                     });
                 }
@@ -1353,11 +1589,11 @@ namespace FrostyMcpPlugin.Bridge
             catch { }
         }
 
-        private static object ImportTextureViaReflection(EbxAssetEntry entry, string path)
+        private static object ImportTextureViaReflection(EbxAssetEntry entry, string path, bool rawChunk)
         {
             string ext = Path.GetExtension(path).ToLowerInvariant();
             if (ext == ".dds")
-                return ImportDdsTexture(entry, path);
+                return ImportDdsTexture(entry, path, rawChunk);
 
             Type editorType = FindType("TexturePlugin.FrostyTextureEditor");
             Type optionsType = FindType("TexturePlugin.TextureImportOptions");
@@ -1400,7 +1636,7 @@ namespace FrostyMcpPlugin.Bridge
             File.WriteAllBytes(tmp, dds);
             try
             {
-                return ImportDdsTexture(entry, tmp);
+                return ImportDdsTexture(entry, tmp, rawChunk);
             }
             finally
             {
@@ -1408,41 +1644,186 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        private static object ImportDdsTexture(EbxAssetEntry entry, string ddsPath)
+        // Mirrors TexturePlugin's DDS import: parse the header, reject type/format
+        // mismatches, rebuild the Texture metadata and only then write the chunk.
+        private static object ImportDdsTexture(EbxAssetEntry entry, string ddsPath, bool rawChunk)
         {
-            // Reuse TexturePlugin editor's DDS path by reading TextureAssetDefinition pattern:
-            // Load texture res, replace chunk data. Full mip/header parsing is in FrostyTextureEditor.
-            // Call into editor via reflection on a private method is brittle — instead use AssetDefinition if Import supported.
-            Type editorType = FindType("TexturePlugin.FrostyTextureEditor");
-            if (editorType == null)
-                return null;
-
-            // Fallback: write DDS bytes into linked chunk (raw). User should prefer png import when TexturePlugin is present.
             EbxAsset asset = App.AssetManager.GetEbx(entry);
             dynamic textureAsset = asset.RootObject;
-            ResAssetEntry resEntry = App.AssetManager.GetResEntry(textureAsset.Resource);
-            Texture texture = App.AssetManager.GetResAs<Texture>(resEntry);
+            ResAssetEntry resEntry = App.AssetManager.GetResEntry(Convert.ToUInt64(textureAsset.Resource));
+            if (resEntry == null)
+                return McpHandlers.Error("Texture resource not found", "NOT_FOUND");
+
+            Texture oldTexture = App.AssetManager.GetResAs<Texture>(resEntry);
+            if (oldTexture == null)
+                return McpHandlers.Error("Resource is not a Texture", "TYPE_MISMATCH");
+
             byte[] ddsData = File.ReadAllBytes(ddsPath);
 
-            // Skip 128-byte DDS header if present
-            int headerSize = 128;
-            if (ddsData.Length > 4 && ddsData[0] == 0x44 && ddsData[1] == 0x44 && ddsData[2] == 0x53 && ddsData[3] == 0x20)
+            if (rawChunk || FindType("TexturePlugin.FrostyTextureEditor") == null)
             {
-                // DX10 extended header
-                if (ddsData.Length > 84 && BitConverter.ToInt32(ddsData, 84) == 0x30315844)
-                    headerSize = 148;
+                if (oldTexture.Type != TextureType.TT_2d)
+                    return McpHandlers.Error("Raw chunk import is only allowed for 2D textures; use a validated import", "TYPE_MISMATCH");
+
+                int headerSize = 128;
+                if (ddsData.Length > 4 && ddsData[0] == 0x44 && ddsData[1] == 0x44 && ddsData[2] == 0x53 && ddsData[3] == 0x20)
+                {
+                    if (ddsData.Length > 84 && BitConverter.ToInt32(ddsData, 84) == 0x30315844)
+                        headerSize = 148;
+                }
+                else
+                {
+                    headerSize = 0;
+                }
+
+                byte[] rawPixels = new byte[ddsData.Length - headerSize];
+                Buffer.BlockCopy(ddsData, headerSize, rawPixels, 0, rawPixels.Length);
+
+                App.AssetManager.ModifyChunk(oldTexture.ChunkId, rawPixels, oldTexture);
+                entry.LinkAsset(App.AssetManager.GetChunkEntry(oldTexture.ChunkId));
+                App.AssetManager.ModifyRes(resEntry.Name, oldTexture);
+                entry.LinkAsset(resEntry);
+                App.AssetManager.ModifyEbx(entry.Name, asset);
+
+                return new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["name"] = entry.Name,
+                    ["path"] = Path.GetFullPath(ddsPath),
+                    ["chunk_id"] = oldTexture.ChunkId.ToString(),
+                    ["bytes"] = rawPixels.Length,
+                    ["metadata_changed"] = false,
+                    ["warning"] = "Raw chunk import wrote pixel data without touching the Texture metadata",
+                    ["asset"] = McpHandlers.SerializeEbxEntry(entry)
+                };
+            }
+
+            TextureUtils.DDSHeader header = new TextureUtils.DDSHeader();
+            byte[] buffer;
+            using (NativeReader reader = new NativeReader(new MemoryStream(ddsData)))
+            {
+                if (!header.Read(reader))
+                    return McpHandlers.Error("Invalid DDS header", "INVALID_DDS");
+                buffer = reader.ReadToEnd();
+            }
+
+            TextureType type = TextureType.TT_2d;
+            if (header.HasExtendedHeader)
+            {
+                if (header.ExtendedHeader.resourceDimension == SharpDX.Direct3D11.ResourceDimension.Texture2D)
+                {
+                    if ((header.ExtendedHeader.miscFlag & 4) != 0)
+                        type = TextureType.TT_Cube;
+                    else if (header.ExtendedHeader.arraySize > 1)
+                        type = TextureType.TT_2dArray;
+                }
+                else if (header.ExtendedHeader.resourceDimension == SharpDX.Direct3D11.ResourceDimension.Texture3D)
+                    type = TextureType.TT_3d;
             }
             else
             {
-                headerSize = 0;
+                if ((header.dwCaps2 & TextureUtils.DDSCaps2.CubeMap) != 0)
+                    type = TextureType.TT_Cube;
+                else if ((header.dwCaps2 & TextureUtils.DDSCaps2.Volume) != 0)
+                    type = TextureType.TT_3d;
             }
 
-            byte[] pixelData = new byte[ddsData.Length - headerSize];
-            Buffer.BlockCopy(ddsData, headerSize, pixelData, 0, pixelData.Length);
+            if (type != oldTexture.Type)
+                return McpHandlers.Error(
+                    "Imported texture type " + type + " does not match the asset type " + oldTexture.Type,
+                    "TYPE_MISMATCH");
 
-            App.AssetManager.ModifyChunk(texture.ChunkId, pixelData, texture);
-            entry.LinkAsset(App.AssetManager.GetChunkEntry(texture.ChunkId));
-            App.AssetManager.ModifyRes(resEntry.Name, texture);
+            bool oldSrgb = (oldTexture.Flags & TextureFlags.SrgbGamma) != 0;
+            if (oldSrgb && (!header.HasExtendedHeader ||
+                !header.ExtendedHeader.dxgiFormat.ToString().ToLowerInvariant().Contains("srgb")))
+                return McpHandlers.Error("Imported format must be an SRGB variant", "FORMAT_MISMATCH");
+
+            GetTexturePixelFormat(header, oldTexture, out string pixelFormat, out TextureFlags baseFlags);
+            if (pixelFormat == "Unknown")
+                return McpHandlers.Error("Unsupported DDS pixel format", "UNSUPPORTED_FORMAT");
+
+            if (TextureUtils.IsCompressedFormat(pixelFormat) && oldTexture.MipCount > 1 &&
+                (header.dwWidth % 4 != 0 || header.dwHeight % 4 != 0))
+                return McpHandlers.Error("Width/height must be divisible by 4 for compressed formats with mipmaps", "FORMAT_MISMATCH");
+
+            ushort depth = (header.HasExtendedHeader &&
+                header.ExtendedHeader.resourceDimension == SharpDX.Direct3D11.ResourceDimension.Texture2D)
+                ? (ushort)header.ExtendedHeader.arraySize
+                : (ushort)1;
+            if ((header.dwCaps2 & TextureUtils.DDSCaps2.CubeMap) != 0)
+                depth = 6;
+            if ((header.dwCaps2 & TextureUtils.DDSCaps2.Volume) != 0)
+                depth = (ushort)header.dwDepth;
+
+            Texture newTexture = new Texture(oldTexture.Type, pixelFormat, (ushort)header.dwWidth,
+                (ushort)header.dwHeight, depth)
+            {
+                FirstMip = oldTexture.FirstMip
+            };
+            if (header.dwMipMapCount <= oldTexture.FirstMip)
+                newTexture.FirstMip = 0;
+
+            newTexture.TextureGroup = oldTexture.TextureGroup;
+            newTexture.CalculateMipData((byte)header.dwMipMapCount, TextureUtils.GetFormatBlockSize(pixelFormat),
+                TextureUtils.IsCompressedFormat(pixelFormat), (uint)buffer.Length);
+            newTexture.Flags = baseFlags | (oldTexture.Flags & ~TextureFlags.SrgbGamma);
+
+            CopyOptionalMembers(oldTexture, newTexture,
+                "Unknown4", "Unknown5", "b3", "b4", "flag", "Unknown9");
+
+            // DDS stores cube/array data mip-major; Frosty chunks are slice-major.
+            if (newTexture.Type == TextureType.TT_Cube || newTexture.Type == TextureType.TT_2dArray)
+            {
+                using (MemoryStream srcStream = new MemoryStream(buffer))
+                using (MemoryStream dstStream = new MemoryStream())
+                {
+                    int sliceCount = newTexture.Type == TextureType.TT_2dArray ? newTexture.Depth : 6;
+                    uint[] mipOffsets = new uint[newTexture.MipCount];
+                    for (int i = 0; i < newTexture.MipCount - 1; i++)
+                        mipOffsets[i + 1] = mipOffsets[i] + (uint)(newTexture.MipSizes[i] * sliceCount);
+
+                    byte[] tmpBuf = new byte[newTexture.MipSizes[0]];
+                    for (int slice = 0; slice < sliceCount; slice++)
+                    {
+                        for (int mip = 0; mip < newTexture.MipCount; mip++)
+                        {
+                            int mipSize = (int)newTexture.MipSizes[mip];
+                            srcStream.Read(tmpBuf, 0, mipSize);
+                            dstStream.Position = mipOffsets[mip] + (mipSize * slice);
+                            dstStream.Write(tmpBuf, 0, mipSize);
+                        }
+                    }
+                    buffer = dstStream.ToArray();
+                }
+            }
+
+            ChunkAssetEntry chunkEntry = App.AssetManager.GetChunkEntry(oldTexture.ChunkId);
+            Guid chunkId = oldTexture.ChunkId;
+            Texture chunkTexture = ((newTexture.Flags & TextureFlags.OnDemandLoaded) != 0 ||
+                newTexture.Type != TextureType.TT_2d) ? null : newTexture;
+
+            if (ProfilesLibrary.MustAddChunks && chunkEntry != null && chunkEntry.Bundles.Count == 0 && !chunkEntry.IsAdded)
+            {
+                // Chunk super-bundle bookkeeping exists only in the fork; the official
+                // SDK re-creates the chunk and lets the asset link carry the rest.
+                chunkId = App.AssetManager.AddChunk(buffer, null, chunkTexture);
+                chunkEntry = App.AssetManager.GetChunkEntry(chunkId);
+            }
+            else
+            {
+                App.AssetManager.ModifyChunk(chunkId, buffer, chunkTexture);
+            }
+
+            for (int i = 0; i < 4; i++)
+                newTexture.Unknown3[i] = oldTexture.Unknown3[i];
+
+            newTexture.SetData(chunkId, App.AssetManager);
+            newTexture.AssetNameHash = unchecked((uint)Utils.HashString(resEntry.Name));
+            oldTexture.Dispose();
+
+            App.AssetManager.ModifyRes(resEntry.ResRid, newTexture);
+            if (chunkEntry != null)
+                resEntry.LinkAsset(chunkEntry);
             entry.LinkAsset(resEntry);
             App.AssetManager.ModifyEbx(entry.Name, asset);
 
@@ -1451,13 +1832,143 @@ namespace FrostyMcpPlugin.Bridge
                 ["success"] = true,
                 ["name"] = entry.Name,
                 ["path"] = Path.GetFullPath(ddsPath),
-                ["note"] = "DDS pixel data written to texture chunk",
-                ["bytes"] = pixelData.Length,
+                ["texture_type"] = newTexture.Type.ToString(),
+                ["width"] = newTexture.Width,
+                ["height"] = newTexture.Height,
+                ["format"] = newTexture.PixelFormat,
+                ["mip_count"] = newTexture.MipCount,
+                ["chunk_id"] = chunkId.ToString(),
+                ["bytes"] = buffer.Length,
+                ["metadata_changed"] = true,
                 ["asset"] = McpHandlers.SerializeEbxEntry(entry)
             };
         }
 
-        private static void ExportMeshViaReflection(EbxAssetEntry entry, string path, string format, string version, string scale, bool flatten, bool singleLod, string skeleton)
+        // Same mapping as TexturePlugin's FrostyTextureEditor.GetPixelFormat.
+        private static void GetTexturePixelFormat(TextureUtils.DDSHeader header, Texture oldTexture,
+            out string pixelFormat, out TextureFlags flags)
+        {
+            pixelFormat = "Unknown";
+            flags = 0;
+
+            if (ProfilesLibrary.IsLoaded(ProfileVersion.DragonAgeInquisition, ProfileVersion.Battlefield4,
+                ProfileVersion.PlantsVsZombiesGardenWarfare, ProfileVersion.NeedForSpeedRivals))
+            {
+                if (header.ddspf.dwFourCC == 0x31545844)
+                {
+                    pixelFormat = "BC1_UNORM";
+                    if (oldTexture.PixelFormat.Contains("Normal"))
+                        pixelFormat = oldTexture.PixelFormat;
+                    else if (oldTexture.PixelFormat.StartsWith("BC1A"))
+                        pixelFormat = oldTexture.PixelFormat;
+                }
+                else if (header.ddspf.dwFourCC == 0x32495441 || header.ddspf.dwFourCC == 0x55354342)
+                    pixelFormat = "NormalDXN";
+                else if (header.ddspf.dwFourCC == 0x33545844)
+                    pixelFormat = "BC2_UNORM";
+                else if (header.ddspf.dwFourCC == 0x35545844)
+                    pixelFormat = "BC3_UNORM";
+                else if (header.ddspf.dwFourCC == 0x31495441)
+                    pixelFormat = "BC3A_UNORM";
+                else if (header.HasExtendedHeader)
+                {
+                    switch (header.ExtendedHeader.dxgiFormat)
+                    {
+                        case SharpDX.DXGI.Format.R32G32B32A32_Float: pixelFormat = "ARGB32F"; break;
+                        case SharpDX.DXGI.Format.R9G9B9E5_Sharedexp: pixelFormat = "R9G9B9E5F"; break;
+                        case SharpDX.DXGI.Format.R8_UNorm: pixelFormat = "L8"; break;
+                        case SharpDX.DXGI.Format.R16_UNorm: pixelFormat = "L16"; break;
+                        case SharpDX.DXGI.Format.R8G8B8A8_UNorm: pixelFormat = "ARGB8888"; break;
+                        case SharpDX.DXGI.Format.BC1_UNorm:
+                            pixelFormat = "BC1_UNORM";
+                            if (oldTexture.PixelFormat.Contains("Normal") || oldTexture.PixelFormat.StartsWith("BC1A"))
+                                pixelFormat = oldTexture.PixelFormat;
+                            break;
+                        case SharpDX.DXGI.Format.BC2_UNorm: pixelFormat = "BC2_UNORM"; break;
+                        case SharpDX.DXGI.Format.BC3_UNorm: pixelFormat = "BC3_UNORM"; break;
+                        case SharpDX.DXGI.Format.BC5_UNorm: pixelFormat = "NormalDXN"; break;
+                        case SharpDX.DXGI.Format.BC7_UNorm: pixelFormat = "BC7_UNORM"; break;
+                        case SharpDX.DXGI.Format.BC1_UNorm_SRgb: pixelFormat = "BC1_UNORM"; flags = TextureFlags.SrgbGamma; break;
+                        case SharpDX.DXGI.Format.BC2_UNorm_SRgb: pixelFormat = "BC2_UNORM"; flags = TextureFlags.SrgbGamma; break;
+                        case SharpDX.DXGI.Format.BC3_UNorm_SRgb:
+                            pixelFormat = oldTexture.PixelFormat == "BC3A_UNORM" ? oldTexture.PixelFormat : "BC3_UNORM";
+                            flags = TextureFlags.SrgbGamma;
+                            break;
+                        case SharpDX.DXGI.Format.BC7_UNorm_SRgb: pixelFormat = "BC7_UNORM"; flags = TextureFlags.SrgbGamma; break;
+                    }
+                }
+            }
+            else
+            {
+                if (header.ddspf.dwFourCC == 0)
+                {
+                    if (header.ddspf.dwRBitMask == 0x000000FF && header.ddspf.dwGBitMask == 0x0000FF00 &&
+                        header.ddspf.dwBBitMask == 0x00FF0000 && header.ddspf.dwABitMask == 0xFF000000)
+                        pixelFormat = "R8G8B8A8_UNORM";
+                }
+                else if (header.ddspf.dwFourCC == 0x31545844)
+                {
+                    pixelFormat = "BC1_UNORM";
+                    if (oldTexture.PixelFormat == "BC1A_UNORM")
+                        pixelFormat = "BC1A_UNORM";
+                }
+                else if (header.ddspf.dwFourCC == 0x35545844)
+                    pixelFormat = "BC3_UNORM";
+                else if (header.ddspf.dwFourCC == 0x31495441)
+                    pixelFormat = "BC4_UNORM";
+                else if (header.ddspf.dwFourCC == 0x32495441 || header.ddspf.dwFourCC == 0x55354342)
+                    pixelFormat = "BC5_UNORM";
+                else if (header.HasExtendedHeader)
+                {
+                    if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC1_UNorm)
+                    {
+                        pixelFormat = "BC1_UNORM";
+                        if (oldTexture.PixelFormat == "BC1A_UNORM")
+                            pixelFormat = "BC1A_UNORM";
+                    }
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC3_UNorm)
+                        pixelFormat = "BC3_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC4_UNorm)
+                        pixelFormat = "BC4_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC5_UNorm)
+                        pixelFormat = "BC5_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC1_UNorm_SRgb && oldTexture.PixelFormat == "BC1A_SRGB")
+                        pixelFormat = "BC1A_SRGB";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC1_UNorm_SRgb)
+                        pixelFormat = "BC1_SRGB";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC3_UNorm_SRgb)
+                        pixelFormat = "BC3_SRGB";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC6H_Uf16)
+                        pixelFormat = "BC6U_FLOAT";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC7_UNorm)
+                        pixelFormat = "BC7_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.BC7_UNorm_SRgb)
+                        pixelFormat = "BC7_SRGB";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R8_UNorm)
+                        pixelFormat = "R8_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R16G16B16A16_Float)
+                        pixelFormat = "R16G16B16A16_FLOAT";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R32G32B32A32_Float)
+                        pixelFormat = "R32G32B32A32_FLOAT";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R9G9B9E5_Sharedexp)
+                        pixelFormat = "R9G9B9E5_FLOAT";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R8G8B8A8_UNorm)
+                        pixelFormat = "R8G8B8A8_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R8G8B8A8_UNorm_SRgb)
+                        pixelFormat = "R8G8B8A8_SRGB";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R10G10B10A2_UNorm)
+                        pixelFormat = "R10G10B10A2_UNORM";
+                    else if (header.ExtendedHeader.dxgiFormat == SharpDX.DXGI.Format.R16_UNorm)
+                    {
+                        pixelFormat = "R16_UNORM";
+                        if (oldTexture.PixelFormat == "D16_UNORM")
+                            pixelFormat = "D16_UNORM";
+                    }
+                }
+            }
+        }
+
+        private static void ExportMeshViaReflection(EbxAssetEntry entry, string path, string format, string version, string scale, bool flatten, bool singleLod, bool nonRenderable, string skeleton)
         {
             Type exporterType = FindType("MeshSetPlugin.FBXExporter");
             Type meshSetType = FindType("MeshSetPlugin.Resources.MeshSet");
@@ -1486,7 +1997,7 @@ namespace FrostyMcpPlugin.Bridge
 
             export.Invoke(exporter, new object[]
             {
-                meshAsset, path, fbxVer, scale, flatten, singleLod, skeleton,
+                meshAsset, path, fbxVer, scale, flatten, singleLod, nonRenderable, skeleton,
                 format == "obj" ? "obj" : "binary", meshSetArray
             });
         }
@@ -1514,7 +2025,42 @@ namespace FrostyMcpPlugin.Bridge
 
             object importer = Activator.CreateInstance(importerType, new object[] { App.Logger });
             MethodInfo import = importerType.GetMethod("ImportFBX");
-            import.Invoke(importer, new object[] { path, meshSet, asset, entry, settings });
+            if (import == null)
+                throw new InvalidOperationException("ImportFBX not found in MeshSetPlugin");
+
+            object task = McpHandlers.InvokeOnUi(() => CreateTaskWindow());
+            if (task == null)
+                throw new InvalidOperationException("FrostyTaskWindow type is not available");
+
+            McpHandlers.InvokeOnUi(() =>
+                import.Invoke(importer, new object[] { path, meshSet, asset, entry, settings, task }));
+        }
+
+        private static object CreateTaskWindow()
+        {
+            Type taskType = FindType("Frosty.Core.Windows.FrostyTaskWindow");
+            if (taskType == null)
+                return null;
+            ConstructorInfo ctor = taskType
+                .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)
+                .FirstOrDefault(c =>
+                {
+                    ParameterInfo[] ps = c.GetParameters();
+                    return ps.Length == 6
+                        && ps[0].ParameterType == typeof(Window)
+                        && ps[1].ParameterType == typeof(string)
+                        && ps[4].ParameterType == typeof(bool);
+                });
+            if (ctor == null)
+                return null;
+            try
+            {
+                return ctor.Invoke(new object[] { null, "Mesh import", "", null, false, null });
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static Type FindType(string fullName)

@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
@@ -42,35 +42,93 @@ namespace FrostyMcpPlugin.Bridge
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
 
-            var unlinked = new List<string>();
+            if (!entry.AddedBundles.Contains(bid) && entry.Bundles.Contains(bid))
+                return McpHandlers.Error("Asset is a native member of this bundle; the removal cannot be expressed in a .fbmod", "NOT_EXPORTABLE");
+
+            var targets = new List<AssetEntry>();
+            var labels = new List<string>();
+            var nativeSkipped = new List<string>();
+            var errors = new List<object>();
+
+            Action<AssetEntry, string> gather = (assetEntry, label) =>
+            {
+                if (assetEntry == null)
+                    return;
+                if (assetEntry.AddedBundles.Contains(bid))
+                {
+                    targets.Add(assetEntry);
+                    labels.Add(label);
+                }
+                else if (assetEntry.Bundles.Contains(bid))
+                {
+                    nativeSkipped.Add(label);
+                }
+            };
+
             try
             {
-                RemoveEntryFromBundle(entry, bid);
-                unlinked.Add("ebx:" + entry.Name);
+                gather(entry, "ebx:" + entry.Name);
 
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
                 dynamic root = asset.RootObject;
                 string type = entry.Type ?? "";
 
-                if (TypeLibrary.IsSubClassOf(type, "TextureBaseAsset") || type.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (type.IndexOf("MovieTexture", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    try
+                    {
+                        Type rootType = ((object)root).GetType();
+                        foreach (string chunkPropName in new[] { "ChunkGuid", "SubtitleChunkGuid" })
+                        {
+                            PropertyInfo chunkProp = rootType.GetProperty(chunkPropName);
+                            if (chunkProp == null) continue;
+                            object raw = chunkProp.GetValue(root);
+                            Guid cid = raw is Guid g ? g : Guid.Empty;
+                            if (cid == Guid.Empty) continue;
+                            ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(cid);
+                            if (chunk != null)
+                                gather(chunk, "chunk:" + cid);
+                        }
+                    }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "movie", ["error"] = ex.Message }); }
+                }
+                else if (type.IndexOf("NewWave", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    try
+                    {
+                        ResAssetEntry resEntry = App.AssetManager.GetResEntry(entry.Name.ToLowerInvariant());
+                        gather(resEntry, resEntry == null ? "res:" : "res:" + resEntry.Name);
+                        if (((object)root).GetType().GetProperty("Chunks")?.GetValue(root) is IList chunks)
+                        {
+                            foreach (object item in chunks)
+                            {
+                                Guid cid = Guid.Empty;
+                                if (item is Guid g) cid = g;
+                                else { try { cid = (Guid)item.GetType().GetProperty("ChunkId").GetValue(item); } catch { } }
+                                if (cid == Guid.Empty) continue;
+                                ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(cid);
+                                if (chunk != null)
+                                    gather(chunk, "chunk:" + cid);
+                            }
+                        }
+                    }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "newwave", ["error"] = ex.Message }); }
+                }
+                else if (TypeLibrary.IsSubClassOf(type, "TextureBaseAsset") || type.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     try
                     {
                         ResAssetEntry resEntry = App.AssetManager.GetResEntry((ulong)root.Resource);
                         if (resEntry != null)
                         {
-                            RemoveEntryFromBundle(resEntry, bid);
-                            unlinked.Add("res:" + resEntry.Name);
+                            gather(resEntry, "res:" + resEntry.Name);
                             Texture texture = App.AssetManager.GetResAs<Texture>(resEntry);
                             ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(texture.ChunkId);
                             if (chunk != null)
-                            {
-                                RemoveEntryFromBundle(chunk, bid);
-                                unlinked.Add("chunk:" + chunk.Id);
-                            }
+                                gather(chunk, "chunk:" + chunk.Id);
                         }
                     }
-                    catch (Exception ex) { unlinked.Add("texture_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "texture", ["error"] = ex.Message }); }
                 }
                 else if (TypeLibrary.IsSubClassOf(type, "MeshAsset") || type.EndsWith("MeshAsset", StringComparison.OrdinalIgnoreCase))
                 {
@@ -79,8 +137,7 @@ namespace FrostyMcpPlugin.Bridge
                         ResAssetEntry resEntry = App.AssetManager.GetResEntry((ulong)root.MeshSetResource);
                         if (resEntry != null)
                         {
-                            RemoveEntryFromBundle(resEntry, bid);
-                            unlinked.Add("res:" + resEntry.Name);
+                            gather(resEntry, "res:" + resEntry.Name);
                             Type meshSetType = FindType("MeshSetPlugin.Resources.MeshSet");
                             if (meshSetType != null)
                             {
@@ -91,14 +148,13 @@ namespace FrostyMcpPlugin.Bridge
                                     Guid chunkId = (Guid)lod.GetType().GetProperty("ChunkId").GetValue(lod);
                                     if (chunkId == Guid.Empty) continue;
                                     ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(chunkId);
-                                    if (chunk == null) continue;
-                                    RemoveEntryFromBundle(chunk, bid);
-                                    unlinked.Add("chunk:" + chunkId);
+                                    if (chunk != null)
+                                        gather(chunk, "chunk:" + chunkId);
                                 }
                             }
                         }
                     }
-                    catch (Exception ex) { unlinked.Add("mesh_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "mesh", ["error"] = ex.Message }); }
                 }
                 else if (type.IndexOf("SoundWave", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
@@ -112,47 +168,87 @@ namespace FrostyMcpPlugin.Bridge
                                 try { cid = (Guid)item.GetType().GetProperty("ChunkId").GetValue(item); } catch { }
                                 if (cid == Guid.Empty) continue;
                                 ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(cid);
-                                if (chunk == null) continue;
-                                RemoveEntryFromBundle(chunk, bid);
-                                unlinked.Add("chunk:" + cid);
+                                if (chunk != null)
+                                    gather(chunk, "chunk:" + cid);
                             }
                         }
                     }
-                    catch (Exception ex) { unlinked.Add("sound_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "sound", ["error"] = ex.Message }); }
                 }
                 else
                 {
                     try
                     {
-                        PropertyInfo resProp = ((object)root).GetType().GetProperty("Resource")
+                        string resProperty = "Resource";
+                        if (type.IndexOf("ClothWrapping", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "ClothWrappingAssetResource";
+                        else if (type.IndexOf("ClothColliderSet", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "ClothColliderSetAssetResource";
+                        else if (type.IndexOf("Cloth", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "ClothAssetResource";
+                        else if (type.IndexOf("Enlighten", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "DatabaseResource";
+
+                        PropertyInfo resProp = ((object)root).GetType().GetProperty(resProperty)
                             ?? ((object)root).GetType().GetProperty("CompiledLuaResource");
                         if (resProp != null)
                         {
                             ulong rid = Convert.ToUInt64(resProp.GetValue(root));
                             ResAssetEntry resEntry = App.AssetManager.GetResEntry(rid);
                             if (resEntry != null)
-                            {
-                                RemoveEntryFromBundle(resEntry, bid);
-                                unlinked.Add("res:" + resEntry.Name);
-                            }
+                                gather(resEntry, "res:" + resEntry.Name);
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "resource", ["error"] = ex.Message }); }
                 }
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
+            }
 
+            if (targets.Count == 0)
+                return new Dictionary<string, object>
+                {
+                    ["success"] = false,
+                    ["error"] = "No editor-added memberships to remove",
+                    ["error_code"] = "NOT_MEMBER",
+                    ["native_skipped"] = nativeSkipped,
+                    ["errors"] = errors
+                };
+
+            var plan = new Dictionary<string, object>
+            {
+                ["name"] = entry.Name,
+                ["bundle"] = bundleName,
+                ["bundle_id"] = bid,
+                ["unlinked"] = labels,
+                ["unlinked_count"] = labels.Count,
+                ["native_skipped"] = nativeSkipped,
+                ["errors"] = errors
+            };
+
+            return McpCommit.Require("remove_from_bundle_smart", p, plan, () =>
+            {
+                var unlinked = new List<string>();
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    if (RemoveEntryFromBundle(targets[i], bid))
+                        unlinked.Add(labels[i]);
+                }
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
                     ["bundle"] = bundleName,
                     ["bundle_id"] = bid,
-                    ["unlinked"] = unlinked
+                    ["unlinked"] = unlinked,
+                    ["unlinked_count"] = unlinked.Count,
+                    ["native_skipped"] = nativeSkipped,
+                    ["native_skipped_count"] = nativeSkipped.Count,
+                    ["scan_errors"] = errors
                 };
-            }
-            catch (Exception ex)
-            {
-                return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
-            }
+            });
         }
 
         public static object BatchAddToBundle(JObject p)
@@ -184,19 +280,37 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("names[] or name is required", "INVALID_PARAMS");
 
             var results = new List<object>();
+            int okCount = 0;
             foreach (string n in names.Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 var args = new JObject { ["name"] = n, ["bundle"] = bundleName };
                 object r = smart ? McpExtraHandlers.AddToBundleSmart(args) : McpEditHandlers.AddToBundle(args);
-                results.Add(new Dictionary<string, object> { ["name"] = n, ["result"] = r });
+
+                bool ok = false;
+                var row = new Dictionary<string, object> { ["name"] = n };
+                if (r is Dictionary<string, object> dict)
+                {
+                    ok = dict.TryGetValue("success", out object sv) && sv is bool sb && sb;
+                    if (dict.TryGetValue("added", out object av)) row["added"] = av;
+                    if (!ok)
+                    {
+                        if (dict.TryGetValue("error", out object msg)) row["error"] = msg;
+                        if (dict.TryGetValue("error_code", out object code)) row["error_code"] = code;
+                    }
+                }
+                row["success"] = ok;
+                if (ok) okCount++;
+                results.Add(row);
             }
 
             return new Dictionary<string, object>
             {
-                ["success"] = true,
+                ["success"] = okCount == results.Count,
                 ["bundle"] = bundleName,
                 ["smart"] = smart,
                 ["count"] = results.Count,
+                ["ok_count"] = okCount,
+                ["failed_count"] = results.Count - okCount,
                 ["results"] = results
             };
         }
@@ -211,6 +325,8 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("EBX not found", "NOT_FOUND");
 
             bool listObjects = p.Value<bool?>("list_objects") ?? false;
+            int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
+            int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 500);
             EbxAsset asset = App.AssetManager.GetEbx(entry);
 
             var result = new Dictionary<string, object>
@@ -233,17 +349,24 @@ namespace FrostyMcpPlugin.Bridge
                 int i = 0;
                 foreach (object obj in asset.Objects)
                 {
-                    Guid cg = Guid.Empty;
-                    try { cg = ((dynamic)obj).GetInstanceGuid().ExportedGuid; } catch { }
-                    objs.Add(new Dictionary<string, object>
+                    if (i >= offset && objs.Count < limit)
                     {
-                        ["index"] = i++,
-                        ["type"] = obj.GetType().Name,
-                        ["class_guid"] = cg.ToString()
-                    });
+                        Guid cg = Guid.Empty;
+                        try { cg = ((dynamic)obj).GetInstanceGuid().ExportedGuid; } catch { }
+                        objs.Add(new Dictionary<string, object>
+                        {
+                            ["index"] = i,
+                            ["type"] = obj.GetType().Name,
+                            ["class_guid"] = cg.ToString()
+                        });
+                    }
+                    i++;
                 }
                 result["objects"] = objs;
-                result["object_count"] = objs.Count;
+                result["object_count"] = i;
+                result["offset"] = offset;
+                result["limit"] = limit;
+                result["returned"] = objs.Count;
             }
 
             return result;
@@ -645,18 +768,26 @@ namespace FrostyMcpPlugin.Bridge
         // Helpers
         // =====================================================================
 
-        private static void RemoveEntryFromBundle(AssetEntry entry, int bid)
+        // Linked resources keep native bundle membership; only entries this session
+        // added can be taken back out (a .fbmod has no way to remove a bundle).
+        private static void UnlinkOne(AssetEntry entry, int bid, string label,
+            List<string> unlinked, List<string> nativeSkipped)
+        {
+            if (RemoveEntryFromBundle(entry, bid))
+                unlinked.Add(label);
+            else if (entry.Bundles.Contains(bid))
+                nativeSkipped.Add(label);
+        }
+
+        private static bool RemoveEntryFromBundle(AssetEntry entry, int bid)
         {
             if (entry.AddedBundles.Contains(bid))
             {
                 entry.AddedBundles.Remove(bid);
                 entry.IsDirty = true;
+                return true;
             }
-            else if (entry.Bundles.Contains(bid) && !entry.RemBundles.Contains(bid))
-            {
-                entry.RemBundles.Add(bid);
-                entry.IsDirty = true;
-            }
+            return false;
         }
 
         private static short[] DecodePcm16Big(byte[] soundBuffer, out int channels, out int sampleRate)

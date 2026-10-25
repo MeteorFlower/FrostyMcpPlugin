@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using Frosty.Core.Viewport;
 using FrostySdk;
 using FrostySdk.Ebx;
@@ -13,6 +13,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml;
 
 namespace FrostyMcpPlugin.Bridge
@@ -479,15 +480,35 @@ namespace FrostyMcpPlugin.Bridge
                     return importResult;
             }
 
-            return new Dictionary<string, object>
+            // Summarize rather than nesting three full handler responses.
+            var result = new Dictionary<string, object>
             {
                 ["success"] = true,
-                ["lua_asset"] = createDict,
-                ["component"] = compDict,
-                ["compile"] = importResult,
+                ["lua_asset"] = new Dictionary<string, object>
+                {
+                    ["name"] = createDict.TryGetValue("name", out object ln) ? ln : newLuaName,
+                    ["guid"] = createDict.TryGetValue("guid", out object lg) ? lg : null
+                },
                 ["guid_name"] = guidName,
                 ["entrypoint"] = "CompiledLua_" + guidName
             };
+            if (compDict != null)
+            {
+                result["component"] = new Dictionary<string, object>
+                {
+                    ["class_guid"] = compDict.TryGetValue("class_guid", out object cg) ? cg : null,
+                    ["added_to_array"] = compDict.TryGetValue("added_to_array", out object aa) ? aa : null
+                };
+            }
+            if (importResult is Dictionary<string, object> importDict)
+            {
+                result["compile"] = new Dictionary<string, object>
+                {
+                    ["success"] = importDict.TryGetValue("success", out object cs) ? cs : null,
+                    ["bytes"] = importDict.TryGetValue("bytes", out object cb) ? cb : null
+                };
+            }
+            return result;
         }
 
         public static object GetLuaGuidName(JObject p)
@@ -784,6 +805,368 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // =====================================================================
+        // SVG import (mirrors SvgImagePlugin's path parser)
+        // =====================================================================
+
+        public static object ImportSvg(JObject p)
+        {
+            if (App.AssetManager == null)
+                return McpHandlers.Error("AssetManager not ready", "NOT_READY");
+
+            EbxAssetEntry entry = McpHandlers.ResolveEbxEntry(p.Value<string>("name"), p.Value<string>("guid"));
+            if (entry == null)
+                return McpHandlers.Error("SvgImage EBX not found", "NOT_FOUND");
+
+            string path = p.Value<string>("path");
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return McpHandlers.Error("path (.svg) is required", "INVALID_PARAMS");
+
+            Type svgType = FindType("SvgImagePlugin.SvgImage");
+            Type shapeType = FindType("SvgImagePlugin.SvgShape");
+            Type pathType = FindType("SvgImagePlugin.SvgPath");
+            if (svgType == null || shapeType == null || pathType == null)
+                return McpHandlers.Error("SvgImagePlugin not loaded", "PLUGIN_MISSING");
+
+            XmlDocument xmlDoc = new XmlDocument();
+            try
+            {
+                xmlDoc.Load(path);
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error("SVG is not valid XML: " + ex.Message, "INVALID_PARAMS");
+            }
+
+            XmlElement root = xmlDoc["svg"];
+            if (root == null)
+                return McpHandlers.Error("SVG has no svg element", "INVALID_PARAMS");
+
+            float width, height;
+            if (root.HasAttribute("viewBox"))
+            {
+                string[] values = root.Attributes["viewBox"].Value.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (values.Length < 4 ||
+                    !float.TryParse(values[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out width) ||
+                    !float.TryParse(values[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out height))
+                    return McpHandlers.Error("viewBox must contain four numbers", "INVALID_PARAMS");
+            }
+            else
+            {
+                if (!root.HasAttribute("width") || !root.HasAttribute("height"))
+                    return McpHandlers.Error("SVG needs a viewBox or width and height", "INVALID_PARAMS");
+                if (!float.TryParse(root.Attributes["width"].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out width) ||
+                    !float.TryParse(root.Attributes["height"].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out height))
+                    return McpHandlers.Error("width/height must be numbers", "INVALID_PARAMS");
+            }
+
+            object image = Activator.CreateInstance(svgType, new object[] { width, height });
+            ConstructorInfo shapeConstructor = shapeType.GetConstructor(Type.EmptyTypes);
+            ConstructorInfo pathConstructor = pathType.GetConstructor(Type.EmptyTypes);
+            MethodInfo addPoint = pathType.GetMethod("AddPoint");
+            MethodInfo addPaths = shapeType.GetMethod("AddPaths");
+            MethodInfo addShape = svgType.GetMethod("AddShape");
+            if (shapeConstructor == null || pathConstructor == null || addPoint == null || addPaths == null || addShape == null)
+                return McpHandlers.Error("SvgImagePlugin API changed", "PLUGIN_MISSING");
+
+            var warnings = new List<string>();
+            try
+            {
+                CollectSvgShapes(root, image, shapeConstructor, pathType, pathConstructor,
+                    addPoint, addPaths, addShape, warnings);
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error("SVG could not be parsed: " + Unwrap(ex), "IMPORT_FAILED");
+            }
+
+            try
+            {
+                dynamic rootObject = App.AssetManager.GetEbx(entry).RootObject;
+                ulong resRid = Convert.ToUInt64(rootObject.Resource);
+                ResAssetEntry resEntry = App.AssetManager.GetResEntry(resRid);
+                if (resEntry == null)
+                    return McpHandlers.Error("SvgImage resource not found", "NOT_FOUND");
+
+                App.AssetManager.ModifyRes(resRid, (FrostySdk.Resources.Resource)image);
+                entry.LinkAsset(resEntry);
+
+                return new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["name"] = entry.Name,
+                    ["res"] = resEntry.Name,
+                    ["path"] = Path.GetFullPath(path),
+                    ["width"] = width,
+                    ["height"] = height,
+                    ["shape_count"] = ((IEnumerable)GetProp(image, "Shapes")).Cast<object>().Count(),
+                    ["warnings"] = warnings,
+                    ["warning_count"] = warnings.Count
+                };
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error(Unwrap(ex), "IMPORT_FAILED");
+            }
+        }
+
+        private static void CollectSvgShapes(XmlNode parentNode, object image, ConstructorInfo shapeConstructor,
+            Type pathType, ConstructorInfo pathConstructor, MethodInfo addPoint, MethodInfo addPaths,
+            MethodInfo addShape, List<string> warnings)
+        {
+            foreach (XmlNode node in parentNode)
+            {
+                if (!(node is XmlElement subElem))
+                    continue;
+
+                if (subElem.Name == "g")
+                {
+                    CollectSvgShapes(subElem, image, shapeConstructor, pathType, pathConstructor,
+                        addPoint, addPaths, addShape, warnings);
+                    continue;
+                }
+
+                if (subElem.Name != "path")
+                {
+                    warnings.Add("Unsupported element: " + subElem.Name);
+                    continue;
+                }
+
+                float thickness = 1.0f;
+                uint fillColor = 0;
+                uint strokeColor = 0;
+                if (subElem.HasAttribute("stroke-width"))
+                    float.TryParse(subElem.Attributes["stroke-width"].Value,
+                        System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out thickness);
+                if (subElem.HasAttribute("fill") && subElem.Attributes["fill"].Value != "none")
+                    fillColor = SvgColor(subElem.Attributes["fill"].Value);
+                if (subElem.HasAttribute("stroke") && subElem.Attributes["stroke"].Value != "none")
+                    strokeColor = SvgColor(subElem.Attributes["stroke"].Value);
+
+                string dataText = subElem.HasAttribute("d") ? subElem.Attributes["d"].Value : "";
+                List<object> paths = ParseSvgPathData(dataText, pathType, pathConstructor, addPoint, warnings);
+                if (paths.Count == 0)
+                    continue;
+
+                object shape = shapeConstructor.Invoke(null);
+                SetIfWritable(shape, "Fill", fillColor != 0);
+                SetIfWritable(shape, "FillColor", fillColor);
+                SetIfWritable(shape, "Stroke", strokeColor != 0);
+                SetIfWritable(shape, "StrokeColor", strokeColor);
+                SetIfWritable(shape, "Thickness", thickness);
+
+                Type listType = typeof(List<>).MakeGenericType(pathType);
+                IList typedPaths = (IList)Activator.CreateInstance(listType);
+                foreach (object item in paths)
+                    typedPaths.Add(item);
+                addPaths.Invoke(shape, new object[] { typedPaths });
+
+                addShape.Invoke(image, new[] { shape });
+            }
+        }
+
+        private static void SetIfWritable(object target, string property, object value)
+        {
+            PropertyInfo pi = target.GetType().GetProperty(property);
+            if (pi != null && pi.CanWrite)
+                pi.SetValue(target, value);
+        }
+
+        private static uint SvgColor(string colorString)
+        {
+            if (string.IsNullOrEmpty(colorString) || colorString[0] != '#')
+                return 0;
+
+            string hex = colorString.Substring(1);
+            int r, g, b, a = 0xFF;
+            try
+            {
+                if (hex.Length <= 4)
+                {
+                    r = Convert.ToInt32("0" + hex.Substring(0, 1), 16) * 17;
+                    g = Convert.ToInt32("0" + hex.Substring(1, 1), 16) * 17;
+                    b = Convert.ToInt32("0" + hex.Substring(2, 1), 16) * 17;
+                    if (hex.Length == 4)
+                        a = Convert.ToInt32("0" + hex.Substring(3, 1), 16) * 17;
+                }
+                else
+                {
+                    r = Convert.ToInt32(hex.Substring(0, 2), 16);
+                    g = Convert.ToInt32(hex.Substring(2, 2), 16);
+                    b = Convert.ToInt32(hex.Substring(4, 2), 16);
+                    if (hex.Length == 8)
+                        a = Convert.ToInt32(hex.Substring(6, 2), 16);
+                }
+            }
+            catch
+            {
+                return 0;
+            }
+            return (uint)((a << 24) | (b << 16) | (g << 8) | r);
+        }
+
+        private static readonly Regex s_svgNumber = new Regex(
+            "-*[0-9]+(([e]{1}[-]*([0-9]{0,12}))|([.]*(([0-9]{0,12}[ ,]{1})|([0-9]{0,3}))))",
+            RegexOptions.Compiled);
+
+        private static float SvgFloat(string text)
+        {
+            return float.TryParse(text, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float value) ? value : 0f;
+        }
+
+        private static List<object> ParseSvgPathData(string dataText, Type pathType,
+            ConstructorInfo pathConstructor, MethodInfo addPoint, List<string> warnings)
+        {
+            var result = new List<object>();
+            if (string.IsNullOrWhiteSpace(dataText))
+                return result;
+
+            const string supported = "MCZmcZLlVvHhSsAa";
+            var tokens = new List<char>();
+            var bodies = new List<string>();
+            foreach (char c in dataText)
+            {
+                if (supported.IndexOf(c) >= 0)
+                {
+                    tokens.Add(c);
+                    bodies.Add("");
+                    continue;
+                }
+                if (bodies.Count == 0)
+                    continue;
+                bodies[bodies.Count - 1] += c;
+            }
+
+            object currentPath = pathConstructor.Invoke(null);
+            bool hasPoints = false;
+            SharpDX.Vector2 relPos = new SharpDX.Vector2();
+
+            Action<float, float> setAbsolute = (x, y) => relPos = new SharpDX.Vector2(x, y);
+            Action closePath = null;
+            Action add = null;
+            closePath = () =>
+            {
+                if (hasPoints)
+                    result.Add(currentPath);
+                currentPath = pathConstructor.Invoke(null);
+                hasPoints = false;
+            };
+            add = () =>
+            {
+                addPoint.Invoke(currentPath, new object[] { relPos });
+                hasPoints = true;
+            };
+
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                char token = tokens[i];
+                var data = new List<float>();
+                foreach (Match m in s_svgNumber.Matches(bodies[i] + " "))
+                {
+                    string text = m.Value.Trim(' ', ',');
+                    if (text.Length > 0)
+                        data.Add(SvgFloat(text));
+                }
+
+                if (token == 'M' || token == 'm')
+                {
+                    closePath();
+                    if (data.Count < 2) continue;
+                    float x = token == 'm' ? relPos.X + data[0] : data[0];
+                    float y = token == 'm' ? relPos.Y + data[1] : data[1];
+                    setAbsolute(x, y);
+                    add();
+                }
+                else if (token == 'C' || token == 'c')
+                {
+                    for (int j = 0; j + 5 < data.Count; j += 6)
+                    {
+                        for (int k = 0; k < 3; k++)
+                        {
+                            float x = data[j + k * 2];
+                            float y = data[j + k * 2 + 1];
+                            if (token == 'c')
+                            {
+                                x += relPos.X;
+                                y += relPos.Y;
+                            }
+                            setAbsolute(x, y);
+                            add();
+                        }
+                    }
+                }
+                else if (token == 'L' || token == 'l')
+                {
+                    for (int j = 0; j + 1 < data.Count; j += 2)
+                    {
+                        float x = data[j], y = data[j + 1];
+                        if (token == 'l')
+                        {
+                            x += relPos.X;
+                            y += relPos.Y;
+                        }
+                        setAbsolute(x, y);
+                        add();
+                    }
+                }
+                else if (token == 'V' || token == 'v')
+                {
+                    foreach (float y in data)
+                    {
+                        setAbsolute(relPos.X, token == 'v' ? relPos.Y + y : y);
+                        add();
+                    }
+                }
+                else if (token == 'H' || token == 'h')
+                {
+                    foreach (float x in data)
+                    {
+                        setAbsolute(token == 'h' ? relPos.X + x : x, relPos.Y);
+                        add();
+                    }
+                }
+                else if (token == 'S' || token == 's')
+                {
+                    for (int j = 0; j + 3 < data.Count; j += 4)
+                    {
+                        float cx = data[j], cy = data[j + 1];
+                        if (token == 's')
+                        {
+                            cx += relPos.X;
+                            cy += relPos.Y;
+                        }
+                        setAbsolute(cx, cy);
+                        add();
+                        float ex = data[j + 2], ey = data[j + 3];
+                        if (token == 's')
+                        {
+                            ex += relPos.X;
+                            ey += relPos.Y;
+                        }
+                        setAbsolute(ex, ey);
+                        add();
+                    }
+                }
+                else if (token == 'Z' || token == 'z')
+                {
+                    if (hasPoints)
+                        pathType.GetProperty("Closed")?.SetValue(currentPath, true);
+                }
+                else if (token == 'A' || token == 'a')
+                {
+                    warnings.Add("ArcTo (A/a) is not supported");
+                }
+                else
+                {
+                    warnings.Add("Unsupported token: " + token);
+                }
+            }
+
+            closePath();
+            return result;
+        }
+
+        // =====================================================================
         // Sound info
         // =====================================================================
 
@@ -801,6 +1184,14 @@ namespace FrostyMcpPlugin.Bridge
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
                 dynamic root = asset.RootObject;
 
+                Type rootType = ((object)root).GetType();
+                bool hasChunks = rootType.GetProperty("Chunks") != null;
+                bool hasVariations = rootType.GetProperty("RuntimeVariations") != null;
+                bool hasSegments = rootType.GetProperty("Segments") != null;
+                if (!hasChunks && !hasVariations && !hasSegments)
+                    return McpHandlers.Error("Asset is not a SoundWave (no Chunks/RuntimeVariations/Segments)", "NOT_A_SOUND");
+
+                var scanErrors = new List<object>();
                 var chunks = new List<object>();
                 try
                 {
@@ -818,7 +1209,7 @@ namespace FrostyMcpPlugin.Bridge
                         });
                     }
                 }
-                catch { }
+                catch (Exception ex) { scanErrors.Add(new Dictionary<string, object> { ["section"] = "chunks", ["error"] = Unwrap(ex) }); }
 
                 var variations = new List<object>();
                 try
@@ -835,7 +1226,7 @@ namespace FrostyMcpPlugin.Bridge
                         });
                     }
                 }
-                catch { }
+                catch (Exception ex) { scanErrors.Add(new Dictionary<string, object> { ["section"] = "runtime_variations", ["error"] = Unwrap(ex) }); }
 
                 var segments = new List<object>();
                 try
@@ -852,7 +1243,7 @@ namespace FrostyMcpPlugin.Bridge
                         });
                     }
                 }
-                catch { }
+                catch (Exception ex) { scanErrors.Add(new Dictionary<string, object> { ["section"] = "segments", ["error"] = Unwrap(ex) }); }
 
                 return new Dictionary<string, object>
                 {
@@ -865,6 +1256,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["chunks"] = chunks,
                     ["runtime_variations"] = variations,
                     ["segments"] = segments,
+                    ["scan_error_count"] = scanErrors.Count,
+                    ["scan_errors"] = scanErrors,
                     ["bundles"] = entry.EnumerateBundles()
                         .Select(id => App.AssetManager.GetBundleEntry(id)?.Name)
                         .Where(n => n != null).ToList()
@@ -889,15 +1282,15 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("EBX not found", "NOT_FOUND");
 
-            string newName = (p.Value<string>("new_name") ?? "").Trim().Trim('/');
+            string newName = (p.Value<string>("new_name") ?? "").Trim().Trim('/').ToLowerInvariant();
             if (string.IsNullOrEmpty(newName))
                 return McpHandlers.Error("new_name is required", "INVALID_PARAMS");
 
             if (App.AssetManager.GetEbxEntry(newName) != null)
                 return McpHandlers.Error("Target already exists: " + newName, "EXISTS");
 
-            Type toolType = FindType("DuplicationPlugin.DuplicationTool");
-            if (toolType == null)
+            Type extensionBase = FindType("DuplicationPlugin.DuplicateAssetExtension");
+            if (extensionBase == null)
                 return McpHandlers.Error("DuplicationPlugin not loaded", "PLUGIN_MISSING");
 
             try
@@ -917,30 +1310,65 @@ namespace FrostyMcpPlugin.Bridge
                     }
                 }
 
+                // The extension classes are top-level types in DuplicationPlugin
+                // (TextureBaseExtension, MeshExtension, ...); there is no
+                // "DuplicationTool" container type.
                 object extension = null;
                 string matchedKey = "null";
                 object nullExt = null;
+                var subclasses = new List<Type>();
 
-                foreach (Type nested in toolType.GetNestedTypes(BindingFlags.Public))
+                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    if (!nested.Name.EndsWith("Extension", StringComparison.Ordinal))
+                    if (asm != extensionBase.Assembly)
                         continue;
+                    Type[] types;
+                    try { types = asm.GetTypes(); }
+                    catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(x => x != null).ToArray(); }
+                    foreach (Type t in types)
+                    {
+                        if (t == null || t.IsAbstract || !extensionBase.IsAssignableFrom(t))
+                            continue;
+                        subclasses.Add(t);
+                    }
+                }
+
+                foreach (Type t in subclasses)
+                {
                     object inst;
-                    try { inst = Activator.CreateInstance(nested); }
+                    try { inst = Activator.CreateInstance(t); }
                     catch { continue; }
 
-                    PropertyInfo atProp = nested.GetProperty("AssetType");
+                    PropertyInfo atProp = t.GetProperty("AssetType");
                     string at = atProp?.GetValue(inst) as string;
-                    if (string.IsNullOrEmpty(at) || nested.Name == "DuplicateAssetExtension")
+                    if (string.IsNullOrEmpty(at))
                     {
                         nullExt = inst;
                         continue;
                     }
-                    if (TypeLibrary.IsSubClassOf(entry.Type, at))
+                    if (string.Equals(entry.Type, at, StringComparison.OrdinalIgnoreCase))
                     {
                         extension = inst;
                         matchedKey = at;
                         break;
+                    }
+                }
+                if (extension == null)
+                {
+                    foreach (Type t in subclasses)
+                    {
+                        object inst;
+                        try { inst = Activator.CreateInstance(t); }
+                        catch { continue; }
+                        string at = t.GetProperty("AssetType")?.GetValue(inst) as string;
+                        if (string.IsNullOrEmpty(at))
+                            continue;
+                        if (TypeLibrary.IsSubClassOf(entry.Type, at))
+                        {
+                            extension = inst;
+                            matchedKey = at;
+                            break;
+                        }
                     }
                 }
                 if (extension == null)
@@ -958,6 +1386,8 @@ namespace FrostyMcpPlugin.Bridge
                         return McpHandlers.Error("new_type not found: " + newTypeName, "TYPE_NOT_FOUND");
                     createNew = true;
                 }
+                if (newType == null)
+                    newType = TypeLibrary.GetType(entry.Type);
 
                 EbxAssetEntry newEntry = (EbxAssetEntry)InvokeCompat(
                     extension, "DuplicateAsset", entry, newName, createNew, newType);
