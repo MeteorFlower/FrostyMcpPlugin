@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using Frosty.Core.Controls;
 using FrostySdk;
 using FrostySdk.Attributes;
@@ -334,24 +334,35 @@ namespace FrostyMcpPlugin.Bridge
                 if (index >= list.Count)
                     return McpHandlers.Error("Index out of range", "INVALID_PARAMS");
 
-                object removed = list[index];
-                list.RemoveAt(index);
-                try
+                var plan = new Dictionary<string, object>
                 {
-                    SaveAsset(entry, asset);
-                }
-                catch (Exception ex)
-                {
-                    list.Insert(index, removed);
-                    return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
-                }
-                return new Dictionary<string, object>
-                {
-                    ["success"] = true,
+                    ["name"] = entry.Name,
                     ["kind"] = kind,
-                    ["removed_index"] = index,
-                    ["remaining"] = list.Count
+                    ["index"] = index,
+                    ["remaining_after"] = list.Count - 1
                 };
+
+                return McpCommit.Require("remove_connection", p, plan, () =>
+                {
+                    object removed = list[index];
+                    list.RemoveAt(index);
+                    try
+                    {
+                        SaveAsset(entry, asset);
+                    }
+                    catch (Exception ex)
+                    {
+                        list.Insert(index, removed);
+                        return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                    }
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["kind"] = kind,
+                        ["removed_index"] = index,
+                        ["remaining"] = list.Count
+                    };
+                });
             }
             catch (Exception ex)
             {
@@ -364,11 +375,17 @@ namespace FrostyMcpPlugin.Bridge
             uint flags = 0;
             if (p["flags"] != null)
             {
-                string s = p["flags"].ToString();
-                if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                    flags = Convert.ToUInt32(s, 16);
-                else
-                    flags = Convert.ToUInt32(s);
+                string s = p["flags"].ToString().Trim();
+                try
+                {
+                    flags = s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                        ? Convert.ToUInt32(s.Substring(2), 16)
+                        : Convert.ToUInt32(s);
+                }
+                catch
+                {
+                    return McpHandlers.Error("flags must be a decimal or 0x-prefixed 32-bit integer", "INVALID_PARAMS");
+                }
             }
 
             DecodePropertyConnectionFlags(flags, out string realm, out string propType, out bool sourceCantBeStatic);
@@ -412,7 +429,7 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 if (!string.IsNullOrEmpty(query) &&
                     typeName.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0 &&
-                    !GetObjectName(obj).ToString().Contains(query))
+                    (GetObjectName(obj) ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0)
                 {
                     i++;
                     continue;
@@ -444,9 +461,11 @@ namespace FrostyMcpPlugin.Bridge
             if (comp == null)
                 return McpHandlers.Error("Component not found (provide class_guid or index)", "NOT_FOUND");
 
+            bool includeProperties = p.Value<bool?>("include_properties") ?? true;
             Dictionary<string, object> result = SerializeComponent(comp, index, asset);
             result["success"] = true;
-            result["properties"] = DumpPublicProperties(comp);
+            if (includeProperties)
+                result["properties"] = DumpPublicProperties(comp);
             return result;
         }
 
@@ -507,13 +526,30 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 string arrayName = p.Value<string>("array") ?? "Objects";
-                string usedArray = TryAddPointerToArrays(
-                    arrayHost, pref, arrayName, explicitName: p["array"] != null);
+                bool explicitName = !string.IsNullOrEmpty(p.Value<string>("array"));
+                int atIndex = p.Value<int?>("at_index") ?? -1;
+                string usedArray = atIndex >= 0
+                    ? (TryInsertPointerToArray(arrayHost, arrayName, pref, atIndex) ? arrayName : null)
+                    : TryAddPointerToArrays(arrayHost, pref, arrayName, explicitName: explicitName);
+
+                if (usedArray == null)
+                {
+                    // Nothing points at the new object; drop it instead of leaving an
+                    // unreachable orphan that would still be written to the asset.
+                    asset.RemoveObject(newObject);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Array not found: " + arrayName,
+                        ["error_code"] = "ARRAY_NOT_FOUND",
+                        ["available_arrays"] = ListPointerArrayNames(arrayHost)
+                    };
+                }
 
                 SaveAsset(entry, asset);
 
                 int index = IndexOfObject(asset, newObject);
-                var result = new Dictionary<string, object>
+                return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["added_to_array"] = usedArray,
@@ -521,14 +557,6 @@ namespace FrostyMcpPlugin.Bridge
                     ["component"] = SerializeComponent(newObject, index, asset),
                     ["pointer"] = SerializePointerRef(pref)
                 };
-                if (usedArray == null)
-                {
-                    result["array_warning"] =
-                        "Component was created but not appended to '" + arrayName +
-                        "'. Pass a name from available_arrays (and array_host_guid for a nested host).";
-                    result["available_arrays"] = ListPointerArrayNames(arrayHost);
-                }
-                return result;
             }
             catch (Exception ex)
             {
@@ -567,8 +595,28 @@ namespace FrostyMcpPlugin.Bridge
 
                 PointerRef pref = new PointerRef(copy);
                 string arrayName = p.Value<string>("array") ?? "Objects";
-                string usedArray = TryAddPointerToArrays(
-                    asset.RootObject, pref, arrayName, explicitName: p["array"] != null);
+                bool explicitName = !string.IsNullOrEmpty(p.Value<string>("array"));
+                int atIndex = p.Value<int?>("at_index") ?? -1;
+                string usedArray = atIndex >= 0
+                    ? (TryInsertPointerToArray(asset.RootObject, arrayName, pref, atIndex) ? arrayName : null)
+                    : TryAddPointerToArrays(asset.RootObject, pref, arrayName, explicitName: explicitName);
+
+                if (usedArray == null)
+                {
+                    // Roll back every object this duplicate introduced.
+                    foreach (object addedObj in asset.Objects.ToList())
+                    {
+                        if (!preexisting.Contains(addedObj))
+                            asset.RemoveObject(addedObj);
+                    }
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Array not found: " + arrayName,
+                        ["error_code"] = "ARRAY_NOT_FOUND",
+                        ["available_arrays"] = ListPointerArrayNames(asset.RootObject)
+                    };
+                }
 
                 if (p["properties"] is JObject props)
                 {
@@ -579,7 +627,7 @@ namespace FrostyMcpPlugin.Bridge
                 SaveAsset(entry, asset);
 
                 int index = IndexOfObject(asset, copy);
-                var result = new Dictionary<string, object>
+                return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["source_index"] = srcIndex,
@@ -587,9 +635,6 @@ namespace FrostyMcpPlugin.Bridge
                     ["component"] = SerializeComponent(copy, index, asset),
                     ["pointer"] = SerializePointerRef(pref)
                 };
-                if (usedArray == null)
-                    result["available_arrays"] = ListPointerArrayNames(asset.RootObject);
-                return result;
             }
             catch (Exception ex)
             {
@@ -714,37 +759,49 @@ namespace FrostyMcpPlugin.Bridge
                     "class_guid matches multiple components; pass index to select one",
                     "AMBIGUOUS_COMPONENT");
 
-            try
+            bool removeObject = p.Value<bool?>("remove_object") ?? true;
+            var plan = new Dictionary<string, object>
             {
-                dynamic root = asset.RootObject;
-                bool guidUnique = IsClassGuidUnique(asset, classGuid);
+                ["name"] = entry.Name,
+                ["index"] = index,
+                ["class_guid"] = classGuid.ToString(),
+                ["remove_object"] = removeObject
+            };
 
-                // Remove only the connections/pointers that belong to this instance.
-                // A class-guid sweep would also hit another object that happens to
-                // share the same guid.
-                RemoveConnectionsTouchingObject(root, comp, guidUnique);
-
-                // Remove from Components / Objects arrays
-                RemovePointerFromArray(root, "Components", comp, guidUnique);
-                RemovePointerFromArray(root, "Objects", comp, guidUnique);
-
-                bool removeObject = p.Value<bool?>("remove_object") ?? true;
-                if (removeObject)
-                    asset.RemoveObject(comp);
-
-                SaveAsset(entry, asset);
-                return new Dictionary<string, object>
+            return McpCommit.Require("remove_component", p, plan, () =>
+            {
+                try
                 {
-                    ["success"] = true,
-                    ["removed_index"] = index,
-                    ["class_guid"] = classGuid.ToString(),
-                    ["removed_from_objects"] = removeObject
-                };
-            }
-            catch (Exception ex)
-            {
-                return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
-            }
+                    dynamic root = asset.RootObject;
+                    bool guidUnique = IsClassGuidUnique(asset, classGuid);
+
+                    // Remove only the connections/pointers that belong to this instance.
+                    // A class-guid sweep would also hit another object that happens to
+                    // share the same guid.
+                    RemoveConnectionsTouchingObject(root, comp, guidUnique);
+
+                    // Remove from Components / Objects arrays
+                    RemovePointerFromArray(root, "Components", comp, guidUnique);
+                    RemovePointerFromArray(root, "Objects", comp, guidUnique);
+                    RemoveReferencesToObject(asset, comp, guidUnique);
+
+                    if (removeObject)
+                        asset.RemoveObject(comp);
+
+                    SaveAsset(entry, asset);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["removed_index"] = index,
+                        ["class_guid"] = classGuid.ToString(),
+                        ["removed_from_objects"] = removeObject
+                    };
+                }
+                catch (Exception ex)
+                {
+                    return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
+                }
+            });
         }
 
         /// <summary>
@@ -819,19 +876,43 @@ namespace FrostyMcpPlugin.Bridge
                     toRemove.Add(parsedIndex);
                 }
 
-                List<object> removed = new List<object>();
+                var previewItems = new List<object>();
                 foreach (int idx in toRemove)
                 {
                     if (idx < 0 || idx >= list.Count)
                         return McpHandlers.Error("Index out of range: " + idx + " (count=" + list.Count + ")", "INVALID_PARAMS");
 
+                    object previewItem = list[idx];
+                    object previewUnwrapped = UnwrapPointer(previewItem);
+                    if (previewUnwrapped != null && ReferenceEquals(previewUnwrapped, asset.RootObject))
+                        return McpHandlers.Error("Cannot remove root object", "FORBIDDEN");
+                    previewItems.Add(new Dictionary<string, object>
+                    {
+                        ["index"] = idx,
+                        ["type"] = previewUnwrapped?.GetType().Name ?? previewItem?.GetType().Name ?? "null",
+                        ["class_guid"] = TryGetClassGuid(previewUnwrapped) is Guid pg && pg != Guid.Empty ? pg.ToString() : null
+                    });
+                }
+
+                var plan = new Dictionary<string, object>
+                {
+                    ["name"] = entry.Name,
+                    ["path"] = arrayPath,
+                    ["remove_object"] = removeObject,
+                    ["cleanup_connections"] = cleanupConnections,
+                    ["count"] = toRemove.Count,
+                    ["items"] = previewItems
+                };
+
+                return McpCommit.Require("remove_ebx_item", p, plan, () =>
+                {
+                List<object> removed = new List<object>();
+                foreach (int idx in toRemove)
+                {
                     object item = list[idx];
                     object unwrapped = UnwrapPointer(item);
                     Guid itemGuid = TryGetClassGuid(unwrapped);
                     string itemType = unwrapped?.GetType().Name ?? item?.GetType().Name ?? "null";
-
-                    if (unwrapped != null && ReferenceEquals(unwrapped, asset.RootObject))
-                        return McpHandlers.Error("Cannot remove root object", "FORBIDDEN");
 
                     list.RemoveAt(idx);
 
@@ -850,6 +931,9 @@ namespace FrostyMcpPlugin.Bridge
                                 (beforeE - CountList(asset.RootObject, "EventConnections")) +
                                 (beforeL - CountList(asset.RootObject, "LinkConnections"));
                         }
+                        if (cleanupConnections)
+                            RemoveReferencesToObject(asset, unwrapped, IsClassGuidUnique(asset, itemGuid));
+
                         if (removeObject && asset.Objects != null && asset.Objects.Cast<object>().Any(o => ReferenceEquals(o, unwrapped)))
                         {
                             asset.RemoveObject(unwrapped);
@@ -878,6 +962,7 @@ namespace FrostyMcpPlugin.Bridge
                     ["removed_count"] = removed.Count,
                     ["removed"] = removed
                 };
+                });
             }
             catch (Exception ex)
             {
@@ -935,12 +1020,29 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                dynamic existing = TryGetInterfaceInternal(asset, createIfMissing: false);
+                if (existing != null)
+                {
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["created"] = false,
+                        ["class_guid"] = GetClassGuid((object)existing).ToString(),
+                        ["object_type"] = ((object)existing).GetType().Name,
+                        ["fields_count"] = (int)existing.Fields.Count,
+                        ["input_events_count"] = (int)existing.InputEvents.Count,
+                        ["output_events_count"] = (int)existing.OutputEvents.Count
+                    };
+                }
+
                 dynamic iface = TryGetInterfaceInternal(asset, createIfMissing: true);
                 SaveAsset(entry, asset);
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
+                    ["created"] = true,
                     ["class_guid"] = GetClassGuid((object)iface).ToString(),
                     ["object_type"] = ((object)iface).GetType().Name,
                     ["fields_count"] = (int)iface.Fields.Count,
@@ -1046,24 +1148,34 @@ namespace FrostyMcpPlugin.Bridge
                 if (index < 0)
                     return McpHandlers.Error("Field not found", "NOT_FOUND");
 
-                object removed = iface.Fields[index];
-                iface.Fields.RemoveAt(index);
-                try
+                var plan = new Dictionary<string, object>
                 {
-                    SaveAsset(entry, asset);
-                }
-                catch (Exception ex)
-                {
-                    iface.Fields.Insert(index, removed);
-                    return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
-                }
-                return new Dictionary<string, object>
-                {
-                    ["success"] = true,
                     ["name"] = entry.Name,
-                    ["removed_index"] = index,
-                    ["remaining"] = (int)iface.Fields.Count
+                    ["index"] = index,
+                    ["remaining_after"] = (int)iface.Fields.Count - 1
                 };
+
+                return McpCommit.Require("remove_interface_field", p, plan, () =>
+                {
+                    object removed = iface.Fields[index];
+                    iface.Fields.RemoveAt(index);
+                    try
+                    {
+                        SaveAsset(entry, asset);
+                    }
+                    catch (Exception ex)
+                    {
+                        iface.Fields.Insert(index, removed);
+                        return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                    }
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["removed_index"] = index,
+                        ["remaining"] = (int)iface.Fields.Count
+                    };
+                });
             }
             catch (Exception ex)
             {
@@ -1145,25 +1257,36 @@ namespace FrostyMcpPlugin.Bridge
                 if (index < 0 || index >= list.Count)
                     return McpHandlers.Error("Event not found", "NOT_FOUND");
 
-                object removed = list[index];
-                list.RemoveAt(index);
-                try
+                var plan = new Dictionary<string, object>
                 {
-                    SaveAsset(entry, asset);
-                }
-                catch (Exception ex)
-                {
-                    list.Insert(index, removed);
-                    return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
-                }
-                return new Dictionary<string, object>
-                {
-                    ["success"] = true,
                     ["name"] = entry.Name,
                     ["kind"] = kind,
-                    ["removed_index"] = index,
-                    ["remaining"] = list.Count
+                    ["index"] = index,
+                    ["remaining_after"] = list.Count - 1
                 };
+
+                return McpCommit.Require("remove_interface_event", p, plan, () =>
+                {
+                    object removed = list[index];
+                    list.RemoveAt(index);
+                    try
+                    {
+                        SaveAsset(entry, asset);
+                    }
+                    catch (Exception ex)
+                    {
+                        list.Insert(index, removed);
+                        return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                    }
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["kind"] = kind,
+                        ["removed_index"] = index,
+                        ["remaining"] = list.Count
+                    };
+                });
             }
             catch (Exception ex)
             {
@@ -1181,43 +1304,71 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("class_guid is required", "INVALID_PARAMS");
 
             string kind = (p.Value<string>("kind") ?? "all").Trim().ToLowerInvariant();
+            if (kind != "all" && kind != "property" && kind != "event" && kind != "link")
+                return McpHandlers.Error("kind must be all|property|event|link", "INVALID_PARAMS");
+
+            int estimated;
             try
             {
                 dynamic root = asset.RootObject;
-                int removed = 0;
-                if (kind == "all" || kind == "property")
-                {
-                    int before = root.PropertyConnections.Count;
-                    RemoveConnectionsTouchingKind(root, classGuid, "property");
-                    removed += before - root.PropertyConnections.Count;
-                }
-                if (kind == "all" || kind == "event")
-                {
-                    int before = root.EventConnections.Count;
-                    RemoveConnectionsTouchingKind(root, classGuid, "event");
-                    removed += before - root.EventConnections.Count;
-                }
-                if (kind == "all" || kind == "link")
-                {
-                    int before = root.LinkConnections.Count;
-                    RemoveConnectionsTouchingKind(root, classGuid, "link");
-                    removed += before - root.LinkConnections.Count;
-                }
-
-                SaveAsset(entry, asset);
-                return new Dictionary<string, object>
-                {
-                    ["success"] = true,
-                    ["name"] = entry.Name,
-                    ["class_guid"] = classGuid.ToString(),
-                    ["kind"] = kind,
-                    ["removed"] = removed
-                };
+                estimated = CountConnectionsTouchingKind(root, classGuid, kind);
             }
             catch (Exception ex)
             {
                 return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
             }
+
+            if (estimated == 0)
+                return McpHandlers.Error("No connections touch this class_guid", "NOT_FOUND");
+
+            var plan = new Dictionary<string, object>
+            {
+                ["name"] = entry.Name,
+                ["class_guid"] = classGuid.ToString(),
+                ["kind"] = kind,
+                ["connections"] = estimated
+            };
+
+            return McpCommit.Require("remove_connections_by_guid", p, plan, () =>
+            {
+                try
+                {
+                    dynamic root = asset.RootObject;
+                    int removed = 0;
+                    if (kind == "all" || kind == "property")
+                    {
+                        int before = root.PropertyConnections.Count;
+                        RemoveConnectionsTouchingKind(root, classGuid, "property");
+                        removed += before - root.PropertyConnections.Count;
+                    }
+                    if (kind == "all" || kind == "event")
+                    {
+                        int before = root.EventConnections.Count;
+                        RemoveConnectionsTouchingKind(root, classGuid, "event");
+                        removed += before - root.EventConnections.Count;
+                    }
+                    if (kind == "all" || kind == "link")
+                    {
+                        int before = root.LinkConnections.Count;
+                        RemoveConnectionsTouchingKind(root, classGuid, "link");
+                        removed += before - root.LinkConnections.Count;
+                    }
+
+                    SaveAsset(entry, asset);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["class_guid"] = classGuid.ToString(),
+                        ["kind"] = kind,
+                        ["removed"] = removed
+                    };
+                }
+                catch (Exception ex)
+                {
+                    return McpHandlers.Error(ex.Message, "REMOVE_FAILED");
+                }
+            });
         }
 
         // =====================================================================
@@ -1926,13 +2077,12 @@ namespace FrostyMcpPlugin.Bridge
                 ["target"] = compact ? SerializePointerRefShort(conn.Target) : SerializePointerRef(conn.Target),
                 ["source_field"] = (string)(CString)conn.SourceField,
                 ["target_field"] = (string)(CString)conn.TargetField,
-                ["flags_hex"] = "0x" + flags.ToString("X8"),
                 ["realm"] = realm,
                 ["prop_type"] = propType
             };
             if (!compact)
             {
-                d["flags"] = flags;
+                d["flags_hex"] = "0x" + flags.ToString("X8");
                 d["source_cant_be_static"] = sourceCantBeStatic;
             }
             return d;
@@ -2108,12 +2258,14 @@ namespace FrostyMcpPlugin.Bridge
                 if (e == null)
                     throw new InvalidOperationException("External asset not found: " + assetName);
                 EbxAsset a = App.AssetManager.GetEbx(e);
+                if (a.FileGuid != e.Guid)
+                    throw new InvalidOperationException("GUID_INCONSISTENT: entry " + e.Guid + ", file " + a.FileGuid);
                 Guid cg = Guid.Empty;
                 if (!string.IsNullOrEmpty(classGuidStr))
                     cg = Guid.Parse(classGuidStr);
                 else
                     cg = a.RootInstanceGuid;
-                return new PointerRef(new EbxImportReference { FileGuid = a.FileGuid, ClassGuid = cg });
+                return new PointerRef(new EbxImportReference { FileGuid = e.Guid, ClassGuid = cg });
             }
 
             // External by file_guid
@@ -2441,19 +2593,31 @@ namespace FrostyMcpPlugin.Bridge
                 return Convert.ToUInt32(s);
             }
 
-            string realmStr = p.Value<string>("realm") ?? "ClientAndServer";
-            string propTypeStr = p.Value<string>("prop_type") ?? "Default";
-            bool sourceCantBeStatic = p.Value<bool?>("source_cant_be_static") ?? false;
+            // Partial update: start from the connection's current flags and replace
+            // only the fields the caller supplied.
+            uint flags = existing;
 
-            int realm = ParseRealm(realmStr);
-            int propType = ParsePropType(propTypeStr);
+            if (p["realm"] != null)
+            {
+                int realm = ParseRealm(p.Value<string>("realm"));
+                if (realm >= 0)
+                    flags = (flags & ~0x7u) | (uint)realm;
+            }
 
-            uint flags = 0;
-            if (realm >= 0)
-                flags |= (uint)realm;
-            flags |= ((uint)propType) << 4;
-            if (sourceCantBeStatic)
-                flags |= 8;
+            if (p["prop_type"] != null)
+            {
+                int propType = ParsePropType(p.Value<string>("prop_type"));
+                if (propType >= 0)
+                    flags = (flags & ~0x30u) | ((uint)propType << 4);
+            }
+
+            if (p["source_cant_be_static"] != null)
+            {
+                if (p.Value<bool>("source_cant_be_static"))
+                    flags |= 8;
+                else
+                    flags &= ~8u;
+            }
             return flags;
         }
 
@@ -2565,6 +2729,17 @@ namespace FrostyMcpPlugin.Bridge
         /// blueprint containers when the caller did not name one explicitly.
         /// Returns the array actually used, or null when nothing accepted it.
         /// </summary>
+        private static bool TryInsertPointerToArray(object host, string arrayName, PointerRef pref, int atIndex)
+        {
+            object listObj = GetListMember(host, string.IsNullOrEmpty(arrayName) ? "Objects" : arrayName);
+            if (!(listObj is IList list))
+                return false;
+            if (atIndex < 0) atIndex = 0;
+            if (atIndex > list.Count) atIndex = list.Count;
+            list.Insert(atIndex, pref);
+            return true;
+        }
+
         private static string TryAddPointerToArrays(object host, PointerRef pref, string arrayName, bool explicitName)
         {
             if (TryAddPointerToRootArray(host, arrayName, pref))
@@ -2754,6 +2929,61 @@ namespace FrostyMcpPlugin.Bridge
                    GetClassGuid(candidate) == GetClassGuid(target);
         }
 
+        // Arrays other than the root Components/Objects can still point at the
+        // removed object (children lists, nested member arrays). Clear those too.
+        private static void RemoveReferencesToObject(EbxAsset asset, object target, bool guidUnique)
+        {
+            PointerRef probe = new PointerRef(target);
+            foreach (object host in asset.Objects.ToList())
+            {
+                if (host == null || ReferenceEquals(host, target))
+                    continue;
+                foreach (PropertyInfo pi in host.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (!pi.CanRead || pi.GetIndexParameters().Length != 0)
+                        continue;
+                    object value;
+                    try { value = pi.GetValue(host); }
+                    catch { continue; }
+                    if (value == null)
+                        continue;
+
+                    if (value is PointerRef pr)
+                    {
+                        if (PointerRefersTo(pr, target, guidUnique))
+                        {
+                            try { if (pi.CanWrite) pi.SetValue(host, new PointerRef()); } catch { }
+                        }
+                        continue;
+                    }
+
+                    if (value is IList list && !(value is string))
+                    {
+                        for (int i = list.Count - 1; i >= 0; i--)
+                        {
+                            if (list[i] is PointerRef itemRef && PointerRefersTo(itemRef, target, guidUnique))
+                            {
+                                try { list.RemoveAt(i); } catch { }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static bool PointerRefersTo(PointerRef pr, object target, bool guidUnique)
+        {
+            if (pr.Type == PointerRefType.Null)
+                return false;
+            if (pr.Type == PointerRefType.Internal)
+            {
+                if (ReferenceEquals(pr.Internal, target))
+                    return true;
+                return guidUnique && pr.Internal != null && GetClassGuid(pr.Internal) == GetClassGuid(target);
+            }
+            return guidUnique && pr.External.ClassGuid != Guid.Empty && pr.External.ClassGuid == GetClassGuid(target);
+        }
+
         private static void RemoveConnectionsTouchingObject(dynamic root, object target, bool guidUnique)
         {
             RemoveConnectionsTouchingKindObject(root, target, guidUnique, "property");
@@ -2794,6 +3024,33 @@ namespace FrostyMcpPlugin.Bridge
                 }
             }
             catch { }
+        }
+
+        private static int CountConnectionsTouchingKind(dynamic root, Guid classGuid, string kind)
+        {
+            int count = 0;
+            if (kind == "all" || kind == "property")
+                for (int i = 0; i < root.PropertyConnections.Count; i++)
+                {
+                    dynamic c = root.PropertyConnections[i];
+                    if (PointerTouches(c.Source, classGuid) || PointerTouches(c.Target, classGuid))
+                        count++;
+                }
+            if (kind == "all" || kind == "event")
+                for (int i = 0; i < root.EventConnections.Count; i++)
+                {
+                    dynamic c = root.EventConnections[i];
+                    if (PointerTouches(c.Source, classGuid) || PointerTouches(c.Target, classGuid))
+                        count++;
+                }
+            if (kind == "all" || kind == "link")
+                for (int i = 0; i < root.LinkConnections.Count; i++)
+                {
+                    dynamic c = root.LinkConnections[i];
+                    if (PointerTouches(c.Source, classGuid) || PointerTouches(c.Target, classGuid))
+                        count++;
+                }
+            return count;
         }
 
         private static void RemoveConnectionsTouchingKind(dynamic root, Guid classGuid, string kind)
@@ -3263,6 +3520,7 @@ namespace FrostyMcpPlugin.Bridge
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 200);
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             bool includeConnections = p.Value<bool?>("include_connections") ?? true;
+            bool compact = p.Value<bool?>("compact") ?? true;
 
             StringComparison cmp = caseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
             var matches = new List<object>();
@@ -3291,14 +3549,26 @@ namespace FrostyMcpPlugin.Bridge
                 var visited = new HashSet<object>(ReferenceEqualityComparer.Instance);
                 WalkSearch(obj, "", objIndex, cg, typeName, query, scope, cmp, maxDepth, 0, visited, matches, ref total, limit + offset);
                 objIndex++;
-                if (total >= limit + offset)
-                    break;
             }
 
-            if (includeConnections && total < limit + offset)
+            // total counts every match; matches only keeps the first limit+offset for paging.
+            if (includeConnections)
                 SearchConnections(asset, query, scope, cmp, matches, ref total, limit + offset);
 
             List<object> page = matches.Skip(offset).Take(limit).ToList();
+            if (compact)
+            {
+                // object_type and class_guid repeat for every hit in the same object;
+                // object_index is enough to look the component up again.
+                foreach (object item in page)
+                {
+                    if (item is Dictionary<string, object> row)
+                    {
+                        row.Remove("object_type");
+                        row.Remove("class_guid");
+                    }
+                }
+            }
             return new Dictionary<string, object>
             {
                 ["success"] = true,
@@ -3309,6 +3579,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
+                ["compact"] = compact,
                 ["matches"] = page
             };
         }
@@ -3403,7 +3674,7 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 object comp = ResolveComponent(asset, p, out int index);
-                if (comp == null && p["index"] == null && string.IsNullOrEmpty(p.Value<string>("class_guid")))
+                if (comp == null && p["index"] == null && string.IsNullOrEmpty(p.Value<string>("class_guid")) && string.IsNullOrEmpty(p.Value<string>("component_type")))
                 {
                     comp = asset.RootObject;
                     index = 0;
@@ -3464,7 +3735,7 @@ namespace FrostyMcpPlugin.Bridge
             ref int total,
             int maxCollect)
         {
-            if (obj == null || depth > maxDepth || total >= maxCollect)
+            if (obj == null || depth > maxDepth)
                 return;
 
             Type t = obj.GetType();
@@ -3493,7 +3764,7 @@ namespace FrostyMcpPlugin.Bridge
 
             if (obj is IList list && !(obj is string))
             {
-                for (int i = 0; i < list.Count && total < maxCollect; i++)
+                for (int i = 0; i < list.Count; i++)
                 {
                     object item = list[i];
                     string itemPath = string.IsNullOrEmpty(path) ? "[" + i + "]" : path + "[" + i + "]";
@@ -3565,7 +3836,7 @@ namespace FrostyMcpPlugin.Bridge
             dynamic root = asset.RootObject;
             try
             {
-                for (int i = 0; i < root.PropertyConnections.Count && total < maxCollect; i++)
+                for (int i = 0; i < root.PropertyConnections.Count; i++)
                 {
                     dynamic c = root.PropertyConnections[i];
                     CheckConnField("$PropertyConnections[" + i + "].SourceField", (string)(CString)c.SourceField, query, scope, cmp, matches, ref total, maxCollect);
@@ -3576,7 +3847,7 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
-                for (int i = 0; i < root.EventConnections.Count && total < maxCollect; i++)
+                for (int i = 0; i < root.EventConnections.Count; i++)
                 {
                     dynamic c = root.EventConnections[i];
                     string se = "";
@@ -3591,7 +3862,7 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
-                for (int i = 0; i < root.LinkConnections.Count && total < maxCollect; i++)
+                for (int i = 0; i < root.LinkConnections.Count; i++)
                 {
                     dynamic c = root.LinkConnections[i];
                     CheckConnField("$LinkConnections[" + i + "].SourceField", (string)(CString)c.SourceField, query, scope, cmp, matches, ref total, maxCollect);

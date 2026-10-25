@@ -1,4 +1,4 @@
-<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+﻿<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Developer - Debug</Configuration>
@@ -62,6 +62,22 @@
       <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\Newtonsoft.Json.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="SharpDX">
+      <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\SharpDX.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SharpDX.DXGI">
+      <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\SharpDX.DXGI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SharpDX.Direct3D11">
+      <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\SharpDX.Direct3D11.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SharpDX.Mathematics">
+      <HintPath>$(FrostyRoot)FrostyEditor\ThirdParty\SharpDX.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Bridge\McpAdvancedHandlers.cs" />
@@ -69,6 +85,7 @@
     <Compile Include="Bridge\McpBlueprintHandlers.cs" />
     <Compile Include="Bridge\McpBridgeServer.cs" />
     <Compile Include="Bridge\McpCommandRouter.cs" />
+    <Compile Include="Bridge\McpCommit.cs" />
     <Compile Include="Bridge\McpEditHandlers.cs" />
     <Compile Include="Bridge\EbxYamlWriter.cs" />
     <Compile Include="Bridge\McpExtraHandlers.cs" />
@@ -76,6 +93,11 @@
     <Compile Include="Bridge\McpMediaHandlers.cs" />
     <Compile Include="Bridge\McpMoreHandlers.cs" />
     <Compile Include="Bridge\McpProjectTools.cs" />
+    <Compile Include="Bridge\McpProjectLifecycleHandlers.cs" />
+    <Compile Include="Bridge\McpBulkHandlers.cs" />
+    <Compile Include="Bridge\McpMergeHandlers.cs" />
+    <Compile Include="Bridge\McpSoundHandlers.cs" />
+    <Compile Include="Bridge\McpAssetCreateHandlers.cs" />
     <Compile Include="Bridge\McpTypeExplorerHandlers.cs" />
     <Compile Include="Bridge\PipeProfiles.g.cs" />
     <Compile Include="Extensions\McpStartupAction.cs" />

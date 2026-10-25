@@ -89,6 +89,7 @@ if sys.platform == "win32":
 _mcp_stdout = sys.stdout
 sys.stdout = sys.stderr
 
+import asyncio
 import json
 import struct
 import time
@@ -194,13 +195,13 @@ MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
 
 def _parse_timeout_seconds(raw_value):
     if raw_value is None:
-        return 30.0
+        return 120.0
     try:
         timeout = float(raw_value)
     except (TypeError, ValueError):
-        return 30.0
+        return 120.0
     if not math.isfinite(timeout):
-        return 30.0
+        return 120.0
     if timeout <= 0:
         return None
     return timeout
@@ -217,6 +218,9 @@ class FrostyNamedPipeBridgeClient:
     def __init__(self):
         self.handle = None
         self.timeout_seconds = FROSTY_MCP_TIMEOUT_SECONDS
+        # Tools now run in worker threads; two of them must not interleave
+        # writes/reads on the same pipe handle.
+        self._lock = threading.RLock()
         if win32file is None or pywintypes is None:
             raise RuntimeError(
                 "Named pipe transport requires Windows and pywin32. "
@@ -275,6 +279,10 @@ class FrostyNamedPipeBridgeClient:
             raise ConnectionError("Invalid JSON received from Frosty") from exc
 
     def _exchange_with_timeout(self, req_json, method):
+        with self._lock:
+            return self._exchange_with_timeout_locked(req_json, method)
+
+    def _exchange_with_timeout_locked(self, req_json, method):
         timeout = self.timeout_seconds
         if timeout is None:
             return self._exchange_once(req_json)
@@ -304,44 +312,43 @@ class FrostyNamedPipeBridgeClient:
         return result_holder["response"]
 
     def send_command(self, method, params=None):
-        max_retries = 2
-        last_error = None
+        # No automatic retry. A timeout or a broken connection does not prove
+        # the editor did not run the command, so resending could duplicate a
+        # create/duplicate/add. Reconnect happens on the next explicit call.
+        if not self.connected:
+            if not self.connect():
+                raise ConnectionError(
+                    "Frosty MCP Bridge is not reachable at %s. "
+                    "Start Frosty Editor with FrostyMcpPlugin loaded first."
+                    % PIPE_NAME
+                )
 
-        for attempt in range(max_retries):
-            if not self.connected:
-                if not self.connect():
-                    raise ConnectionError(
-                        "Frosty MCP Bridge is not reachable at %s. "
-                        "Start Frosty Editor with FrostyMcpPlugin loaded first."
-                        % PIPE_NAME
-                    )
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or {},
+            "id": int(time.time() * 1000),
+        }
 
-            request = {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params or {},
-                "id": int(time.time() * 1000),
-            }
+        try:
+            req_json = json.dumps(request).encode("utf-8")
+            response = self._exchange_with_timeout(req_json, method)
+        except (OSError, ConnectionError, TimeoutError):
+            self.close()
+            raise
 
-            try:
-                req_json = json.dumps(request).encode("utf-8")
-                response = self._exchange_with_timeout(req_json, method)
-
-                if "error" in response:
-                    return {"success": False, "error": str(response["error"])}
-                if "result" in response:
-                    return response["result"]
-                return response
-
-            except (OSError, ConnectionError, TimeoutError) as e:
-                self.close()
-                last_error = e
-                if attempt < max_retries - 1:
-                    continue
-
-        if last_error:
-            raise last_error
-        raise ConnectionError("Unknown communication error")
+        error = response.get("error") if isinstance(response, dict) else None
+        if error is not None:
+            if isinstance(error, dict):
+                return {
+                    "success": False,
+                    "error": error.get("message", str(error)),
+                    "error_code": error.get("code"),
+                }
+            return {"success": False, "error": str(error)}
+        if "result" in response:
+            return response["result"]
+        return response
 
     def close(self):
         if self.handle:
@@ -362,30 +369,30 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "2.0.3")
-        + ". Includes Type Explorer (search_types, get_type_info, get_type_field, "
-        "list_type_namespaces) and BF1 helpers: set_root_flags, add_to_network_registry, "
-        "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles."
+        + os.environ.get("FROSTY_MCP_VERSION", "2.1.1")
+        + ". Destructive tools are two-phase: call once to get would_change + plan, then "
+        "repeat the identical call with commit=true to execute. Run capabilities() first to "
+        "see which optional plugins are loaded."
     ),
 )
 
 
 @mcp.tool()
-def ping() -> str:
+async def ping() -> str:
     """Check connectivity with the Frosty Editor MCP bridge. Call this first."""
-    return format_result(frosty_client.send_command("ping"))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "ping"))
 
 
 @mcp.tool()
-def get_editor_info() -> str:
+async def get_editor_info() -> str:
     """Get Frosty Editor profile, EBX count, dirty count, SDK version and selected asset."""
-    return format_result(frosty_client.send_command("get_editor_info"))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_editor_info"))
 
 
 @mcp.tool()
-def get_selected_asset() -> str:
+async def get_selected_asset() -> str:
     """Get the currently selected asset in Data Explorer and the opened editor asset."""
-    return format_result(frosty_client.send_command("get_selected_asset"))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_selected_asset"))
 
 
 # ---------------------------------------------------------------------------
@@ -393,32 +400,34 @@ def get_selected_asset() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def set_root_flags(name: str = "", guid: str = "", flags: int = 15) -> str:
+async def set_root_flags(name: str = "", guid: str = "", flags: int = 15) -> str:
     """Set EBX root object Flags. BF1 SpatialPrefabBlueprint root must be 15."""
-    return format_result(frosty_client.send_command("set_root_flags", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_root_flags", {
         "name": name, "guid": guid, "flags": flags,
     }))
 
 
 @mcp.tool()
-def get_internal_pointer_ref(
+async def get_internal_pointer_ref(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
     root: bool = False,
+    component_guid: str = "",
 ) -> str:
     """Build External PointerRef (file_guid+class_guid) for NetworkRegistry.
 
     Pass root=True for asset root, or class_guid of an exported component.
     Never register MpSoldierAI (Giant's Shadow crash).
     """
-    return format_result(frosty_client.send_command("get_internal_pointer_ref", {
+    class_guid = class_guid or component_guid
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_internal_pointer_ref", {
         "name": name, "guid": guid, "class_guid": class_guid, "root": root or not class_guid,
     }))
 
 
 @mcp.tool()
-def list_network_registry(
+async def list_network_registry(
     registry: str = "",
     name: str = "",
     query: str = "",
@@ -426,14 +435,14 @@ def list_network_registry(
     limit: int = 200,
 ) -> str:
     """List Objects in a NetworkRegistryAsset (*_networkregistry_Win32)."""
-    return format_result(frosty_client.send_command("list_network_registry", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_network_registry", {
         "registry": registry or name, "name": name, "query": query,
         "offset": offset, "limit": limit,
     }))
 
 
 @mcp.tool()
-def add_to_network_registry(
+async def add_to_network_registry(
     registry: str = "",
     asset: str = "",
     asset_guid: str = "",
@@ -455,71 +464,81 @@ def add_to_network_registry(
     }
     try:
         params["refs"] = _json.loads(refs_json) if refs_json else []
-    except Exception:
-        params["refs"] = []
-    return format_result(frosty_client.send_command("add_to_network_registry", params))
+    except Exception as exc:
+        return format_result({"success": False, "error": "refs_json is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_to_network_registry", params))
 
 
 @mcp.tool()
-def remove_from_network_registry(
+async def remove_from_network_registry(
     registry: str = "",
     index: int = -1,
     file_guid: str = "",
     class_guid: str = "",
     refs_json: str = "[]",
+    commit: bool = False,
 ) -> str:
-    """Remove PointerRefs from NetworkRegistry by index or file_guid+class_guid / refs_json."""
+    """Remove PointerRefs from NetworkRegistry by index or file_guid+class_guid / refs_json.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
     import json as _json
     params = {"registry": registry, "file_guid": file_guid, "class_guid": class_guid}
     if index >= 0:
         params["index"] = index
     try:
         params["refs"] = _json.loads(refs_json) if refs_json else []
-    except Exception:
-        params["refs"] = []
-    return format_result(frosty_client.send_command("remove_from_network_registry", params))
+    except Exception as exc:
+        return format_result({"success": False, "error": "refs_json is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_from_network_registry", params))
 
 
 @mcp.tool()
-def safe_add_to_bundle(name: str = "", guid: str = "", bundle: str = "") -> str:
+async def safe_add_to_bundle(name: str = "", guid: str = "", bundle: str = "") -> str:
     """Add EBX to bundle only if not already present; ModifyEbx so export is non-empty (BF1 tip)."""
-    return format_result(frosty_client.send_command("safe_add_to_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "safe_add_to_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
     }))
 
 
 @mcp.tool()
-def add_to_bf1_map_bundles(name: str = "", guid: str = "", modify_ebx: bool = True) -> str:
+async def add_to_bf1_map_bundles(name: str = "", guid: str = "", modify_ebx: bool = True) -> str:
     """Add asset to all BF1 MpSoldier-aligned map bundles (Core2 list, including */content paths)."""
-    return format_result(frosty_client.send_command("add_to_bf1_map_bundles", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_to_bf1_map_bundles", {
         "name": name, "guid": guid, "modify_ebx": modify_ebx,
     }))
 
 
 @mcp.tool()
-def list_bf1_map_bundles() -> str:
+async def list_bf1_map_bundles() -> str:
     """List the 32+ BF1 map bundle names used by BF1DevPlugin Core2 (with resolve status)."""
-    return format_result(frosty_client.send_command("list_bf1_map_bundles", {}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_bf1_map_bundles", {}))
 
 
 @mcp.tool()
-def open_asset(name: str = "", guid: str = "", create_default_editor: bool = True) -> str:
-    """Open an EBX asset in Frosty Editor.
+async def open_asset(name: str = "", guid: str = "", create_default_editor: bool = True,
+                     kind: str = "ebx") -> str:
+    """Open an asset in Frosty Editor.
 
     Args:
-        name: EBX asset path/name (e.g. "levels/mp/mp_amiens/mp_amiens").
-        guid: EBX file GUID (optional alternative to name).
+        name: asset path/name (e.g. "levels/mp/mp_amiens/mp_amiens").
+        guid: EBX file GUID, or RES rid / chunk id for those kinds.
         create_default_editor: Whether to open the default asset editor tab.
+        kind: "ebx", "res" or "chunk".
     """
-    return format_result(frosty_client.send_command("open_asset", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "open_asset", {
         "name": name,
         "guid": guid,
         "create_default_editor": create_default_editor,
+        "kind": kind,
     }))
 
 
 @mcp.tool()
-def search_ebx(
+async def search_ebx(
     query: str = "",
     type: str = "",
     modified_only: bool = False,
@@ -538,7 +557,7 @@ def search_ebx(
 
     Returns JSON with: success, total, offset, limit, returned, assets.
     """
-    return format_result(frosty_client.send_command("search_ebx", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "search_ebx", {
         "query": query or name,
         "type": type,
         "modified_only": modified_only,
@@ -548,81 +567,89 @@ def search_ebx(
 
 
 @mcp.tool()
-def get_ebx_entry(name: str = "", guid: str = "") -> str:
+async def get_ebx_entry(name: str = "", guid: str = "", linked_limit: int = 200) -> str:
     """Get EBX metadata, linked assets, and bundle membership.
 
     `bundles` is the effective list (vanilla minus removed, plus editor-added),
     matching the Frosty Bundles tab. Also returns original_bundles, added_bundles
     (new memberships like a duplicated MpSoldier2), and removed_bundles.
     """
-    return format_result(frosty_client.send_command("get_ebx_entry", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_entry", {
         "name": name,
         "guid": guid,
+        "linked_limit": linked_limit,
     }))
 
 
 @mcp.tool()
-def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 200000,
-                summary: bool = False, filter: str = "") -> str:
+async def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 60000,
+                summary: bool = False, filter: str = "", char_offset: int = 0) -> str:
     """Export an EBX asset as XML text (truncated if larger than max_chars).
 
     Args:
         name: EBX asset name/path.
         guid: EBX file GUID.
-        max_chars: Maximum characters to return (default 200000).
+        max_chars: Maximum characters to return (default 60000).
         summary: return tag counts instead of the full text.
         filter: return only lines containing this text.
+        char_offset: start reading at this character when continuing a truncated export.
     """
-    return format_result(frosty_client.send_command("get_ebx_xml", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_xml", {
         "name": name,
         "guid": guid,
         "max_chars": max_chars,
         "summary": summary,
         "filter": filter,
+        "char_offset": char_offset,
     }))
 
 
 @mcp.tool()
-def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 200000,
-                 summary: bool = False, filter: str = "") -> str:
+async def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 60000,
+                 summary: bool = False, filter: str = "", char_offset: int = 0) -> str:
     """Export an EBX asset as YAML text (truncated if larger than max_chars).
 
     Args:
         name: EBX asset name/path.
         guid: EBX file GUID.
-        max_chars: Maximum characters to return (default 200000).
-        summary: return tag counts instead of the full text.
+        max_chars: Maximum characters to return (default 60000).
+        summary: return type counts instead of the full text.
         filter: return only lines containing this text.
+        char_offset: start reading at this character when continuing a truncated export.
     """
-    return format_result(frosty_client.send_command("get_ebx_yaml", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_yaml", {
         "name": name,
         "guid": guid,
         "max_chars": max_chars,
         "summary": summary,
         "filter": filter,
+        "char_offset": char_offset,
     }))
 
 
 @mcp.tool()
-def list_modified_assets(kind: str = "all", offset: int = 0, limit: int = 100) -> str:
+async def list_modified_assets(kind: str = "all", offset: int = 0, limit: int = 100,
+                               include_linked: bool = False) -> str:
     """List modified assets in the current Frosty project.
 
     Args:
         kind: One of "all", "ebx", "res", "chunk".
         offset: Pagination start index.
         limit: Max results.
+        include_linked: Also list EBX that are only indirectly modified through a linked RES/chunk.
     """
-    return format_result(frosty_client.send_command("list_modified_assets", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_modified_assets", {
         "kind": kind,
         "offset": offset,
         "limit": limit,
+        "include_linked": include_linked,
     }))
 
 
 @mcp.tool()
-def search_res(query: str = "", modified_only: bool = False, offset: int = 0, limit: int = 100) -> str:
+async def search_res(query: str = "", modified_only: bool = False, offset: int = 0, limit: int = 100) -> str:
     """Search RES assets by name substring."""
-    return format_result(frosty_client.send_command("search_res", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "search_res", {
         "query": query,
         "modified_only": modified_only,
         "offset": offset,
@@ -631,18 +658,18 @@ def search_res(query: str = "", modified_only: bool = False, offset: int = 0, li
 
 
 @mcp.tool()
-def get_res_entry(name: str = "", res_rid: str = "") -> str:
+async def get_res_entry(name: str = "", res_rid: str = "") -> str:
     """Get RES asset metadata by name or resource RID."""
     params = {"name": name}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("get_res_entry", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_res_entry", params))
 
 
 @mcp.tool()
-def search_chunks(query: str = "", modified_only: bool = False, offset: int = 0, limit: int = 100) -> str:
+async def search_chunks(query: str = "", modified_only: bool = False, offset: int = 0, limit: int = 100) -> str:
     """Search chunk assets by GUID/name substring."""
-    return format_result(frosty_client.send_command("search_chunks", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "search_chunks", {
         "query": query,
         "modified_only": modified_only,
         "offset": offset,
@@ -651,18 +678,18 @@ def search_chunks(query: str = "", modified_only: bool = False, offset: int = 0,
 
 
 @mcp.tool()
-def get_chunk_entry(id: str = "", guid: str = "") -> str:
+async def get_chunk_entry(id: str = "", guid: str = "") -> str:
     """Get chunk asset metadata by chunk GUID/id."""
-    return format_result(frosty_client.send_command("get_chunk_entry", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_chunk_entry", {
         "id": id or guid,
         "guid": guid or id,
     }))
 
 
 @mcp.tool()
-def list_bundles(query: str = "", offset: int = 0, limit: int = 100) -> str:
+async def list_bundles(query: str = "", offset: int = 0, limit: int = 100) -> str:
     """List bundles, optionally filtered by name substring."""
-    return format_result(frosty_client.send_command("list_bundles", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_bundles", {
         "query": query,
         "offset": offset,
         "limit": limit,
@@ -670,22 +697,30 @@ def list_bundles(query: str = "", offset: int = 0, limit: int = 100) -> str:
 
 
 @mcp.tool()
-def get_bundle(name: str) -> str:
-    """Get a bundle and its contained EBX/RES/chunk assets (first page of each)."""
-    return format_result(frosty_client.send_command("get_bundle", {"name": name}))
-
-
-@mcp.tool()
-def get_asset_dependencies(name: str = "", guid: str = "") -> str:
-    """List EBX dependencies / linked assets for an EBX asset."""
-    return format_result(frosty_client.send_command("get_asset_dependencies", {
-        "name": name,
-        "guid": guid,
+async def get_bundle(name: str, offset: int = 0, limit: int = 100) -> str:
+    """Get a bundle and its contained EBX/RES/chunk assets (same page window for each list)."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_bundle", {
+        "name": name, "offset": offset, "limit": limit,
     }))
 
 
 @mcp.tool()
-def get_type_info(
+async def get_asset_dependencies(name: str = "", guid: str = "", recursive: bool = False,
+                                max_nodes: int = 2000) -> str:
+    """List EBX dependencies / linked assets for an EBX asset.
+
+    recursive=True walks the transitive dependency graph up to max_nodes.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_asset_dependencies", {
+        "name": name,
+        "guid": guid,
+        "recursive": recursive,
+        "max_nodes": max_nodes,
+    }))
+
+
+@mcp.tool()
+async def get_type_info(
     name: str,
     declared_only: bool = True,
     include_inherited: bool = False,
@@ -699,7 +734,7 @@ def get_type_info(
     to inline nested SDK struct/class/enum definitions. include_inherited=True lists
     base-class fields as well (Type Explorer default is declared-only).
     """
-    return format_result(frosty_client.send_command("get_type_info", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_type_info", {
         "name": name,
         "declared_only": declared_only,
         "include_inherited": include_inherited,
@@ -708,7 +743,7 @@ def get_type_info(
 
 
 @mcp.tool()
-def search_types(
+async def search_types(
     query: str = "",
     base_type: str = "",
     namespace: str = "",
@@ -726,7 +761,7 @@ def search_types(
     kind is 'all' | 'class' | 'struct' | 'enum'. hide_empty hides types with no fields.
     compact (default true) returns name/kind/namespace only; set false for full details.
     """
-    return format_result(frosty_client.send_command("search_types", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "search_types", {
         "query": query,
         "base_type": base_type,
         "namespace": namespace,
@@ -740,13 +775,13 @@ def search_types(
 
 
 @mcp.tool()
-def get_type_field(name: str, field: str, expand_nested: int = 1) -> str:
+async def get_type_field(name: str, field: str, expand_nested: int = 1) -> str:
     """Type Explorer: open a field's nested type (click-through on PointerRef/List/struct).
 
     field is a property name or dotted path (e.g. 'Soldier', 'Transform.trans').
     Returns the field meta plus the resolved SDK type's full definition.
     """
-    return format_result(frosty_client.send_command("get_type_field", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_type_field", {
         "name": name,
         "field": field,
         "expand_nested": expand_nested,
@@ -754,9 +789,9 @@ def get_type_field(name: str, field: str, expand_nested: int = 1) -> str:
 
 
 @mcp.tool()
-def list_type_namespaces(query: str = "", offset: int = 0, limit: int = 100) -> str:
+async def list_type_namespaces(query: str = "", offset: int = 0, limit: int = 100) -> str:
     """Type Explorer: list EBX modules/namespaces with type counts (class/struct/enum)."""
-    return format_result(frosty_client.send_command("list_type_namespaces", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_type_namespaces", {
         "query": query,
         "offset": offset,
         "limit": limit,
@@ -764,9 +799,9 @@ def list_type_namespaces(query: str = "", offset: int = 0, limit: int = 100) -> 
 
 
 @mcp.tool()
-def find_references(name: str = "", guid: str = "", offset: int = 0, limit: int = 100) -> str:
+async def find_references(name: str = "", guid: str = "", offset: int = 0, limit: int = 100) -> str:
     """Find EBX assets that reference the given asset GUID."""
-    return format_result(frosty_client.send_command("find_references", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "find_references", {
         "name": name,
         "guid": guid,
         "offset": offset,
@@ -775,9 +810,9 @@ def find_references(name: str = "", guid: str = "", offset: int = 0, limit: int 
 
 
 @mcp.tool()
-def get_ebx_property(name: str = "", guid: str = "", path: str = "") -> str:
+async def get_ebx_property(name: str = "", guid: str = "", path: str = "") -> str:
     """Read an EBX root-object property by dotted path (e.g. 'Name', 'Transform.trans.x', 'Items[0]')."""
-    return format_result(frosty_client.send_command("get_ebx_property", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_property", {
         "name": name,
         "guid": guid,
         "path": path,
@@ -785,7 +820,7 @@ def get_ebx_property(name: str = "", guid: str = "", path: str = "") -> str:
 
 
 @mcp.tool()
-def set_ebx_property(name: str = "", guid: str = "", path: str = "", value: str = "") -> str:
+async def set_ebx_property(name: str = "", guid: str = "", path: str = "", value: str = "") -> str:
     """Set an EBX root-object property by dotted path.
 
     Args:
@@ -801,7 +836,7 @@ def set_ebx_property(name: str = "", guid: str = "", path: str = "", value: str 
         parsed = _json.loads(value)
     except Exception:
         parsed = value
-    return format_result(frosty_client.send_command("set_ebx_property", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_ebx_property", {
         "name": name,
         "guid": guid,
         "path": path,
@@ -810,152 +845,190 @@ def set_ebx_property(name: str = "", guid: str = "", path: str = "", value: str 
 
 
 @mcp.tool()
-def export_ebx_bin(name: str = "", guid: str = "", path: str = "") -> str:
+async def export_ebx_bin(name: str = "", guid: str = "", path: str = "") -> str:
     """Export EBX asset to a .bin file on disk."""
-    return format_result(frosty_client.send_command("export_ebx_bin", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_ebx_bin", {
         "name": name, "guid": guid, "path": path,
     }))
 
 
 @mcp.tool()
-def import_ebx_bin(name: str = "", guid: str = "", path: str = "", data_only: bool = True) -> str:
-    """Import a .bin file into an existing EBX asset (keeps GUIDs when data_only=True)."""
-    return format_result(frosty_client.send_command("import_ebx_bin", {
-        "name": name, "guid": guid, "path": path, "data_only": data_only,
+async def import_ebx_bin(name: str = "", guid: str = "", path: str = "", data_only: bool = True,
+                        commit: bool = False) -> str:
+    """Import a .bin file into an existing EBX asset.
+
+    data_only=True keeps the asset's file GUID and root class GUID; internal object
+    GUIDs come from the file. data_only=False adopts the file's GUID and requires a
+    preview call first, then the same call with commit=True.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_ebx_bin", {
+        "name": name, "guid": guid, "path": path, "data_only": data_only, "commit": commit,
     }))
 
 
 @mcp.tool()
-def export_asset(name: str = "", guid: str = "", path: str = "", format: str = "xml") -> str:
+async def export_asset(name: str = "", guid: str = "", path: str = "", format: str = "xml") -> str:
     """Export EBX via AssetDefinition (xml/yaml/bin/png/dds/fbx depending on asset type & plugins)."""
-    return format_result(frosty_client.send_command("export_asset", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_asset", {
         "name": name, "guid": guid, "path": path, "format": format,
     }))
 
 
 @mcp.tool()
-def duplicate_ebx(name: str = "", guid: str = "", new_name: str = "", copy_linked: bool = False) -> str:
-    """Duplicate an EBX asset to a new name (optionally duplicate linked texture res/chunk)."""
-    return format_result(frosty_client.send_command("duplicate_ebx", {
-        "name": name, "guid": guid, "new_name": new_name, "copy_linked": copy_linked,
+async def duplicate_ebx(name: str = "", guid: str = "", new_name: str = "",
+                        copy_linked: bool = False, copy_bundles: bool = False) -> str:
+    """Duplicate an EBX asset to a new name.
+
+    copy_bundles=True also copies the source's bundle memberships; leave it off
+    when the duplicate gets its own bundle.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_ebx", {
+        "name": name, "guid": guid, "new_name": new_name,
+        "copy_linked": copy_linked, "copy_bundles": copy_bundles,
     }))
 
 
 @mcp.tool()
-def create_ebx(name: str = "", type: str = "", bundle: str = "") -> str:
+async def create_ebx(name: str = "", type: str = "", bundle: str = "") -> str:
     """Create a new EBX asset of the given Frostbite type name, optionally adding to a bundle."""
-    return format_result(frosty_client.send_command("create_ebx", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_ebx", {
         "name": name, "type": type, "bundle": bundle,
     }))
 
 
 @mcp.tool()
-def revert_asset(kind: str = "ebx", name: str = "", guid: str = "", id: str = "",
-                 res_rid: str = "", data_only: bool = False) -> str:
-    """Revert modifications on an ebx/res/chunk asset."""
+async def revert_asset(kind: str = "ebx", name: str = "", guid: str = "", id: str = "",
+                 res_rid: str = "", data_only: bool = False, commit: bool = False) -> str:
+    """Revert modifications on an ebx/res/chunk asset.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
     params = {"kind": kind, "name": name, "guid": guid or id, "id": id, "data_only": data_only}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("revert_asset", params))
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "revert_asset", params))
 
 
 @mcp.tool()
-def export_res(name: str = "", res_rid: str = "", path: str = "") -> str:
-    """Export raw RES bytes to a file."""
-    params = {"name": name, "path": path}
+async def export_res(name: str = "", res_rid: str = "", path: str = "",
+                     format: str = "frosty_res") -> str:
+    """Export a RES asset to a file.
+
+    format="frosty_res" (default) writes the editor's [16-byte ResMeta][data] layout.
+    format="raw" writes data only and cannot be exchanged with the editor's importer.
+    """
+    params = {"name": name, "path": path, "format": format}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("export_res", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_res", params))
 
 
 @mcp.tool()
-def import_res(name: str = "", res_rid: str = "", path: str = "") -> str:
-    """Import raw bytes into an existing RES asset."""
-    params = {"name": name, "path": path}
+async def import_res(name: str = "", res_rid: str = "", path: str = "",
+                     format: str = "frosty_res") -> str:
+    """Import a RES file into an existing RES asset.
+
+    format="frosty_res" (default) reads the editor's [16-byte ResMeta][data] layout
+    and updates ResMeta. format="raw" treats the whole file as data and leaves the
+    existing ResMeta untouched.
+    """
+    params = {"name": name, "path": path, "format": format}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("import_res", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_res", params))
 
 
 @mcp.tool()
-def export_chunk(id: str = "", guid: str = "", path: str = "") -> str:
+async def export_chunk(id: str = "", guid: str = "", path: str = "") -> str:
     """Export raw chunk bytes to a file."""
-    return format_result(frosty_client.send_command("export_chunk", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_chunk", {
         "id": id or guid, "guid": guid or id, "path": path,
     }))
 
 
 @mcp.tool()
-def import_chunk(id: str = "", guid: str = "", path: str = "") -> str:
+async def import_chunk(id: str = "", guid: str = "", path: str = "") -> str:
     """Import raw bytes into an existing chunk."""
-    return format_result(frosty_client.send_command("import_chunk", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_chunk", {
         "id": id or guid, "guid": guid or id, "path": path,
     }))
 
 
 @mcp.tool()
-def duplicate_res(name: str = "", res_rid: str = "", new_name: str = "", res_type: str = "") -> str:
+async def duplicate_res(name: str = "", res_rid: str = "", new_name: str = "", res_type: str = "") -> str:
     """Duplicate a RES asset to a new name."""
     params = {"name": name, "new_name": new_name, "res_type": res_type}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("duplicate_res", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_res", params))
 
 
 @mcp.tool()
-def duplicate_chunk(id: str = "", guid: str = "") -> str:
+async def duplicate_chunk(id: str = "", guid: str = "") -> str:
     """Duplicate a chunk to a new GUID (keeps original bundle membership)."""
-    return format_result(frosty_client.send_command("duplicate_chunk", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_chunk", {
         "id": id or guid, "guid": guid or id,
     }))
 
 
 @mcp.tool()
-def add_to_bundle(bundle: str, kind: str = "ebx", name: str = "", guid: str = "",
+async def add_to_bundle(bundle: str, kind: str = "ebx", name: str = "", guid: str = "",
                   id: str = "", res_rid: str = "") -> str:
     """Add an ebx/res/chunk asset to a bundle."""
     params = {"bundle": bundle, "kind": kind, "name": name, "guid": guid, "id": id}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("add_to_bundle", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_to_bundle", params))
 
 
 @mcp.tool()
-def remove_from_bundle(bundle: str, kind: str = "ebx", name: str = "", guid: str = "",
-                       id: str = "", res_rid: str = "") -> str:
-    """Remove an ebx/res/chunk asset from a bundle."""
+async def remove_from_bundle(bundle: str, kind: str = "ebx", name: str = "", guid: str = "",
+                       id: str = "", res_rid: str = "", commit: bool = False) -> str:
+    """Remove an editor-added membership from a bundle.
+
+    Native memberships cannot be removed in a .fbmod. First call returns
+    would_change; call again with commit=True to execute.
+    """
     params = {"bundle": bundle, "kind": kind, "name": name, "guid": guid, "id": id}
     if res_rid:
         params["res_rid"] = res_rid
-    return format_result(frosty_client.send_command("remove_from_bundle", params))
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_from_bundle", params))
 
 
 @mcp.tool()
-def create_bundle(name: str, type: str = "BlueprintBundle", super_bundle: str = "") -> str:
+async def create_bundle(name: str, type: str = "BlueprintBundle", super_bundle: str = "") -> str:
     """Create a new bundle (and optionally a super bundle)."""
-    return format_result(frosty_client.send_command("create_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_bundle", {
         "name": name, "type": type, "super_bundle": super_bundle,
     }))
 
 
 @mcp.tool()
-def export_texture(name: str = "", guid: str = "", path: str = "", format: str = "dds") -> str:
+async def export_texture(name: str = "", guid: str = "", path: str = "", format: str = "dds") -> str:
     """Export a TextureAsset to png/tga/hdr/dds (requires TexturePlugin)."""
-    return format_result(frosty_client.send_command("export_texture", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_texture", {
         "name": name, "guid": guid, "path": path, "format": format,
     }))
 
 
 @mcp.tool()
-def import_texture(name: str = "", guid: str = "", path: str = "") -> str:
-    """Import png/tga/hdr/dds into a TextureAsset (requires TexturePlugin for non-DDS)."""
-    return format_result(frosty_client.send_command("import_texture", {
-        "name": name, "guid": guid, "path": path,
+async def import_texture(name: str = "", guid: str = "", path: str = "",
+                         raw_chunk: bool = False) -> str:
+    """Import png/tga/hdr/dds into a TextureAsset.
+
+    The default path validates the DDS type/format/size against the existing texture
+    and rebuilds the Texture metadata. raw_chunk=true writes pixel data only and is
+    refused for non-2D textures.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_texture", {
+        "name": name, "guid": guid, "path": path, "raw_chunk": raw_chunk,
     }))
 
 
 @mcp.tool()
-def export_mesh(
+async def export_mesh(
     name: str = "",
     guid: str = "",
     path: str = "",
@@ -965,9 +1038,10 @@ def export_mesh(
     scale: str = "Centimeters",
     flatten_hierarchy: bool = False,
     single_lod: bool = False,
+    export_non_renderable: bool = False,
 ) -> str:
     """Export a mesh asset to FBX/OBJ (requires MeshSetPlugin). No UI dialog."""
-    return format_result(frosty_client.send_command("export_mesh", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_mesh", {
         "name": name,
         "guid": guid,
         "path": path,
@@ -977,13 +1051,14 @@ def export_mesh(
         "scale": scale,
         "flatten_hierarchy": flatten_hierarchy,
         "single_lod": single_lod,
+        "export_non_renderable": export_non_renderable,
     }))
 
 
 @mcp.tool()
-def import_mesh(name: str = "", guid: str = "", path: str = "", skeleton: str = "") -> str:
+async def import_mesh(name: str = "", guid: str = "", path: str = "", skeleton: str = "") -> str:
     """Import an FBX into a mesh asset (requires MeshSetPlugin)."""
-    return format_result(frosty_client.send_command("import_mesh", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_mesh", {
         "name": name, "guid": guid, "path": path, "skeleton": skeleton,
     }))
 
@@ -993,7 +1068,7 @@ def import_mesh(name: str = "", guid: str = "", path: str = "", skeleton: str = 
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_connections(name: str = "", guid: str = "", kind: str = "all",
+async def list_connections(name: str = "", guid: str = "", kind: str = "all",
                      offset: int = 0, limit: int = 200,
                      compact: bool = True, component_guid: str = "",
                      filter: str = "") -> str:
@@ -1005,14 +1080,14 @@ def list_connections(name: str = "", guid: str = "", kind: str = "all",
         component_guid: only connections touching this component GUID
         filter: only connections whose serialized fields contain this text
     """
-    return format_result(frosty_client.send_command("list_connections", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_connections", {
         "name": name, "guid": guid, "kind": kind, "offset": offset, "limit": limit,
         "compact": compact, "component_guid": component_guid, "filter": filter,
     }))
 
 
 @mcp.tool()
-def add_property_connection(
+async def add_property_connection(
     name: str = "",
     guid: str = "",
     source_guid: str = "",
@@ -1042,11 +1117,11 @@ def add_property_connection(
         params["target_asset"] = target_asset
     if flags:
         params["flags"] = flags
-    return format_result(frosty_client.send_command("add_property_connection", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_property_connection", params))
 
 
 @mcp.tool()
-def add_event_connection(
+async def add_event_connection(
     name: str = "",
     guid: str = "",
     source_guid: str = "",
@@ -1068,11 +1143,11 @@ def add_event_connection(
         params["source_asset"] = source_asset
     if target_asset:
         params["target_asset"] = target_asset
-    return format_result(frosty_client.send_command("add_event_connection", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_event_connection", params))
 
 
 @mcp.tool()
-def add_link_connection(
+async def add_link_connection(
     name: str = "",
     guid: str = "",
     source_guid: str = "",
@@ -1092,11 +1167,11 @@ def add_link_connection(
         params["source_asset"] = source_asset
     if target_asset:
         params["target_asset"] = target_asset
-    return format_result(frosty_client.send_command("add_link_connection", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_link_connection", params))
 
 
 @mcp.tool()
-def update_property_connection(
+async def update_property_connection(
     name: str = "",
     guid: str = "",
     index: int = -1,
@@ -1126,11 +1201,11 @@ def update_property_connection(
     if flags:
         params["flags"] = flags
     params["source_cant_be_static"] = source_cant_be_static
-    return format_result(frosty_client.send_command("update_property_connection", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "update_property_connection", params))
 
 
 @mcp.tool()
-def update_event_connection(
+async def update_event_connection(
     name: str = "",
     guid: str = "",
     index: int = -1,
@@ -1152,11 +1227,11 @@ def update_event_connection(
         params["target_event"] = target_event
     if target_type:
         params["target_type"] = target_type
-    return format_result(frosty_client.send_command("update_event_connection", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "update_event_connection", params))
 
 
 @mcp.tool()
-def update_link_connection(
+async def update_link_connection(
     name: str = "",
     guid: str = "",
     index: int = -1,
@@ -1175,34 +1250,42 @@ def update_link_connection(
         params["source_field"] = source_field
     if target_field:
         params["target_field"] = target_field
-    return format_result(frosty_client.send_command("update_link_connection", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "update_link_connection", params))
 
 
 @mcp.tool()
-def remove_connection(name: str = "", guid: str = "", kind: str = "property", index: int = -1) -> str:
-    """Remove a connection by kind (property|event|link) and index."""
-    return format_result(frosty_client.send_command("remove_connection", {
-        "name": name, "guid": guid, "kind": kind, "index": index,
+async def remove_connection(name: str = "", guid: str = "", kind: str = "property",
+                            index: int = -1, commit: bool = False) -> str:
+    """Remove a connection by kind (property|event|link) and index.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_connection", {
+        "name": name, "guid": guid, "kind": kind, "index": index, "commit": commit,
     }))
 
 
 @mcp.tool()
-def remove_connections_by_guid(
+async def remove_connections_by_guid(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
     kind: str = "all",
+    commit: bool = False,
 ) -> str:
-    """Remove all property/event/link connections touching a component class_guid (kind=all|property|event|link)."""
-    return format_result(frosty_client.send_command("remove_connections_by_guid", {
-        "name": name, "guid": guid, "class_guid": class_guid, "kind": kind,
+    """Remove all property/event/link connections touching a component class_guid (kind=all|property|event|link).
+
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_connections_by_guid", {
+        "name": name, "guid": guid, "class_guid": class_guid, "kind": kind, "commit": commit,
     }))
 
 
 @mcp.tool()
-def decode_connection_flags(flags: str = "0") -> str:
+async def decode_connection_flags(flags: str = "0") -> str:
     """Decode PropertyConnection flags into realm / prop_type / source_cant_be_static."""
-    return format_result(frosty_client.send_command("decode_connection_flags", {"flags": flags}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "decode_connection_flags", {"flags": flags}))
 
 
 # ---------------------------------------------------------------------------
@@ -1210,38 +1293,41 @@ def decode_connection_flags(flags: str = "0") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_components(name: str = "", guid: str = "", query: str = "", type: str = "",
+async def list_components(name: str = "", guid: str = "", query: str = "", type: str = "",
                     offset: int = 0, limit: int = 200, compact: bool = True) -> str:
     """List internal EBX objects/components with class_guid, Flags, Realm.
 
     compact (default true) omits the object_flags breakdown; set false for it.
     """
-    return format_result(frosty_client.send_command("list_components", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_components", {
         "name": name, "guid": guid, "query": query, "type": type,
         "offset": offset, "limit": limit, "compact": compact,
     }))
 
 
 @mcp.tool()
-def get_component(name: str = "", guid: str = "", class_guid: str = "",
-                  index: int = -1, component_type: str = "", type_index: int = 0) -> str:
+async def get_component(name: str = "", guid: str = "", class_guid: str = "",
+                  index: int = -1, component_type: str = "", type_index: int = 0,
+                  include_properties: bool = True) -> str:
     """Get one component (by class_guid / index / component_type+type_index) including property dump."""
     params = {"name": name, "guid": guid, "class_guid": class_guid,
-              "component_type": component_type, "type_index": type_index}
+              "component_type": component_type, "type_index": type_index,
+              "include_properties": include_properties}
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("get_component", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_component", params))
 
 
 @mcp.tool()
-def create_component(
+async def create_component(
     name: str = "",
     guid: str = "",
     type: str = "",
-    array: str = "Objects",
+    array: str = "",
     flag_preset: str = "",
     realm: str = "",
     properties_json: object = "",
+    at_index: int = -1,
 ) -> str:
     """Create a new internal component from Frostbite SDK type (e.g. DelayEntityData).
 
@@ -1252,7 +1338,11 @@ def create_component(
         realm: e.g. ClientAndServer / Client / Server.
         properties_json: JSON object of initial property values (string or object).
     """
-    params = {"name": name, "guid": guid, "type": type, "array": array}
+    params = {"name": name, "guid": guid, "type": type}
+    if array:
+        params["array"] = array
+    if at_index >= 0:
+        params["at_index"] = at_index
     if flag_preset:
         params["flag_preset"] = flag_preset
     if realm:
@@ -1260,30 +1350,40 @@ def create_component(
     props = _json_arg(properties_json, "properties_json")
     if props is not None:
         params["properties"] = props
-    return format_result(frosty_client.send_command("create_component", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_component", params))
 
 
 @mcp.tool()
-def duplicate_component(
+async def duplicate_component(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
     index: int = -1,
-    array: str = "Objects",
+    array: str = "",
     properties_json: object = "",
+    component_type: str = "",
+    type_index: int = 0,
+    at_index: int = -1,
 ) -> str:
     """Duplicate an internal component (new GUIDs via FrostyClipboard DeepCopy)."""
-    params = {"name": name, "guid": guid, "class_guid": class_guid, "array": array}
+    params = {"name": name, "guid": guid, "class_guid": class_guid}
+    if array:
+        params["array"] = array
+    if at_index >= 0:
+        params["at_index"] = at_index
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
     props = _json_arg(properties_json, "properties_json")
     if props is not None:
         params["properties"] = props
-    return format_result(frosty_client.send_command("duplicate_component", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_component", params))
 
 
 @mcp.tool()
-def set_component_flags(
+async def set_component_flags(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
@@ -1313,32 +1413,39 @@ def set_component_flags(
             params.update(_json.loads(flags_json))
         except Exception:
             pass
-    return format_result(frosty_client.send_command("set_component_flags", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_component_flags", params))
 
 
 @mcp.tool()
-def get_component_property(
+async def get_component_property(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
     index: int = -1,
     path: str = "",
+    component_type: str = "",
+    type_index: int = 0,
 ) -> str:
     """Read a property on an internal component by dotted path (SDK fields)."""
     params = {"name": name, "guid": guid, "class_guid": class_guid, "path": path}
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("get_component_property", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_component_property", params))
 
 
 @mcp.tool()
-def set_component_property(
+async def set_component_property(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
     index: int = -1,
     path: str = "",
     value: str = "",
+    component_type: str = "",
+    type_index: int = 0,
 ) -> str:
     """Set a property on an internal component. value is JSON-encoded string.
 
@@ -1350,28 +1457,41 @@ def set_component_property(
     except Exception:
         parsed = value
     params = {"name": name, "guid": guid, "class_guid": class_guid, "path": path, "value": parsed}
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("set_component_property", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_component_property", params))
 
 
 @mcp.tool()
-def remove_component(
+async def remove_component(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
     index: int = -1,
     remove_object: bool = True,
+    component_type: str = "",
+    type_index: int = 0,
+    commit: bool = False,
 ) -> str:
-    """Remove a component: strips touching connections and array refs; optionally RemoveObject."""
+    """Remove a component: strips touching connections and array refs; optionally RemoveObject.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
     params = {"name": name, "guid": guid, "class_guid": class_guid, "remove_object": remove_object}
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("remove_component", params))
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_component", params))
 
 
 @mcp.tool()
-def remove_ebx_item(
+async def remove_ebx_item(
     name: str = "",
     guid: str = "",
     path: str = "",
@@ -1383,8 +1503,11 @@ def remove_ebx_item(
     cleanup_connections: bool = True,
     component_type: str = "",
     type_index: int = 0,
+    commit: bool = False,
 ) -> str:
     """Frosty property-grid 'Remove item': delete an element from any EBX array.
+
+    First call returns would_change; call again with commit=True to execute.
 
     Works anywhere Frosty shows Remove item: Components, Objects, Children,
     MemberDatas, Property/Event/LinkConnections, Interface Fields/Events, nested
@@ -1420,11 +1543,12 @@ def remove_ebx_item(
     raw = (indices or "").strip()
     if raw:
         params["indices"] = json.loads(raw)
-    return format_result(frosty_client.send_command("remove_ebx_item", params))
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_ebx_item", params))
 
 
 @mcp.tool()
-def list_ebx_class_types(
+async def list_ebx_class_types(
     name: str = "",
     guid: str = "",
     path: str = "",
@@ -1447,11 +1571,11 @@ def list_ebx_class_types(
     }
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("list_ebx_class_types", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_ebx_class_types", params))
 
 
 @mcp.tool()
-def create_ebx_class(
+async def create_ebx_class(
     name: str = "",
     guid: str = "",
     type: str = "",
@@ -1494,7 +1618,7 @@ def create_ebx_class(
     props = _json_arg(properties_json, "properties_json")
     if props is not None:
         params["properties"] = props
-    return format_result(frosty_client.send_command("create_ebx_class", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_ebx_class", params))
 
 
 # ---------------------------------------------------------------------------
@@ -1502,19 +1626,19 @@ def create_ebx_class(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_interface(name: str = "", guid: str = "") -> str:
+async def list_interface(name: str = "", guid: str = "") -> str:
     """List Interface Fields / InputEvents / OutputEvents on a blueprint EBX."""
-    return format_result(frosty_client.send_command("list_interface", {"name": name, "guid": guid}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_interface", {"name": name, "guid": guid}))
 
 
 @mcp.tool()
-def ensure_interface(name: str = "", guid: str = "") -> str:
+async def ensure_interface(name: str = "", guid: str = "") -> str:
     """Ensure InterfaceDescriptorData exists (create if missing)."""
-    return format_result(frosty_client.send_command("ensure_interface", {"name": name, "guid": guid}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "ensure_interface", {"name": name, "guid": guid}))
 
 
 @mcp.tool()
-def add_interface_field(
+async def add_interface_field(
     name: str = "",
     guid: str = "",
     field_name: str = "",
@@ -1522,14 +1646,14 @@ def add_interface_field(
     access_type: str = "FieldAccessType_Target",
 ) -> str:
     """Add an Interface DataField (BF1 CreateFields)."""
-    return format_result(frosty_client.send_command("add_interface_field", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_interface_field", {
         "name": name, "guid": guid, "field_name": field_name,
         "value": value, "access_type": access_type,
     }))
 
 
 @mcp.tool()
-def update_interface_field(
+async def update_interface_field(
     name: str = "",
     guid: str = "",
     index: int = -1,
@@ -1548,53 +1672,63 @@ def update_interface_field(
         params["value"] = value
     if access_type:
         params["access_type"] = access_type
-    return format_result(frosty_client.send_command("update_interface_field", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "update_interface_field", params))
 
 
 @mcp.tool()
-def remove_interface_field(
+async def remove_interface_field(
     name: str = "",
     guid: str = "",
     index: int = -1,
     field_name: str = "",
+    commit: bool = False,
 ) -> str:
-    """Remove Interface field by index or field_name."""
+    """Remove Interface field by index or field_name.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
     params = {"name": name, "guid": guid, "field_name": field_name}
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("remove_interface_field", params))
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_interface_field", params))
 
 
 @mcp.tool()
-def add_interface_event(
+async def add_interface_event(
     name: str = "",
     guid: str = "",
     event_name: str = "",
     kind: str = "input",
 ) -> str:
     """Add Interface InputEvent or OutputEvent (kind=input|output)."""
-    return format_result(frosty_client.send_command("add_interface_event", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_interface_event", {
         "name": name, "guid": guid, "event_name": event_name, "kind": kind,
     }))
 
 
 @mcp.tool()
-def remove_interface_event(
+async def remove_interface_event(
     name: str = "",
     guid: str = "",
     kind: str = "input",
     index: int = -1,
     event_name: str = "",
+    commit: bool = False,
 ) -> str:
-    """Remove Interface event by kind + index or event_name."""
+    """Remove Interface event by kind + index or event_name.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
     params = {"name": name, "guid": guid, "kind": kind, "event_name": event_name}
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("remove_interface_event", params))
+    params["commit"] = commit
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_interface_event", params))
 
 
 @mcp.tool()
-def search_ebx_fields(
+async def search_ebx_fields(
     name: str = "",
     guid: str = "",
     query: str = "",
@@ -1606,6 +1740,7 @@ def search_ebx_fields(
     max_depth: int = 8,
     offset: int = 0,
     limit: int = 200,
+    compact: bool = True,
 ) -> str:
     """Search field names and/or values inside all components of an EBX asset (词条搜索).
 
@@ -1619,7 +1754,7 @@ def search_ebx_fields(
     Each match includes object_index, class_guid, path (use with get/set_ebx_field), value, match_in.
     Connection matches use paths like '$PropertyConnections[0].SourceField'.
     """
-    return format_result(frosty_client.send_command("search_ebx_fields", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "search_ebx_fields", {
         "name": name,
         "guid": guid,
         "query": query,
@@ -1631,16 +1766,19 @@ def search_ebx_fields(
         "max_depth": max_depth,
         "offset": offset,
         "limit": limit,
+        "compact": compact,
     }))
 
 
 @mcp.tool()
-def get_ebx_field(
+async def get_ebx_field(
     name: str = "",
     guid: str = "",
     path: str = "",
     class_guid: str = "",
     index: int = -1,
+    component_type: str = "",
+    type_index: int = 0,
 ) -> str:
     """Read one field inside an EBX component (or connection) by path from search_ebx_fields.
 
@@ -1649,19 +1787,24 @@ def get_ebx_field(
         class_guid / index: identify the component (optional if path starts with '$')
     """
     params = {"name": name, "guid": guid, "path": path, "class_guid": class_guid}
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("get_ebx_field", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_field", params))
 
 
 @mcp.tool()
-def set_ebx_field(
+async def set_ebx_field(
     name: str = "",
     guid: str = "",
     path: str = "",
     value: str = "",
     class_guid: str = "",
     index: int = -1,
+    component_type: str = "",
+    type_index: int = 0,
 ) -> str:
     """Edit one field inside an EBX component (or connection). value is JSON-encoded.
 
@@ -1676,13 +1819,16 @@ def set_ebx_field(
     except Exception:
         parsed = value
     params = {"name": name, "guid": guid, "path": path, "class_guid": class_guid, "value": parsed}
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
-    return format_result(frosty_client.send_command("set_ebx_field", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_ebx_field", params))
 
 
 @mcp.tool()
-def research_component_usage(
+async def research_component_usage(
     type: str = "",
     name_query: str = "",
     asset_type: str = "",
@@ -1708,7 +1854,7 @@ def research_component_usage(
         max_scan: Max assets to load (default 150). Raise for broader research.
         max_examples: Max detailed instance examples to return.
     """
-    return format_result(frosty_client.send_command("research_component_usage", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "research_component_usage", {
         "type": type,
         "name_query": name_query,
         "asset_type": asset_type,
@@ -1726,7 +1872,7 @@ def research_component_usage(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def hash_string(text: str = "", lowercase: bool = False, float_value: str = "",
+async def hash_string(text: str = "", lowercase: bool = False, float_value: str = "",
                 value: str = "") -> str:
     """Compute FNV1 / localized hash (and optional float→hex). text may be '0x...' to parse hex.
 
@@ -1737,57 +1883,57 @@ def hash_string(text: str = "", lowercase: bool = False, float_value: str = "",
     params = {"text": text, "lowercase": lowercase}
     if float_value:
         params["float"] = float_value
-    return format_result(frosty_client.send_command("hash_string", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "hash_string", params))
 
 
 @mcp.tool()
-def get_localized_string(id: str = "", hash: str = "") -> str:
+async def get_localized_string(id: str = "", hash: str = "") -> str:
     """Get a localized string by ID_... or hash (uint / 0xHEX)."""
     params = {}
     if id:
         params["id"] = id
     if hash:
         params["hash"] = hash
-    return format_result(frosty_client.send_command("get_localized_string", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_localized_string", params))
 
 
 @mcp.tool()
-def set_localized_string(value: str = "", id: str = "", hash: str = "") -> str:
+async def set_localized_string(value: str = "", id: str = "", hash: str = "") -> str:
     """Set a localized string by ID_... or hash."""
     params = {"value": value}
     if id:
         params["id"] = id
     if hash:
         params["hash"] = hash
-    return format_result(frosty_client.send_command("set_localized_string", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_localized_string", params))
 
 
 @mcp.tool()
-def revert_localized_string(hash: str = "", id: str = "") -> str:
+async def revert_localized_string(hash: str = "", id: str = "") -> str:
     """Revert a localized string hash to original."""
     params = {}
     if hash:
         params["hash"] = hash
     if id:
         params["id"] = id
-    return format_result(frosty_client.send_command("revert_localized_string", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "revert_localized_string", params))
 
 
 @mcp.tool()
-def list_localized_strings(
+async def list_localized_strings(
     query: str = "",
     modified_only: bool = False,
     offset: int = 0,
     limit: int = 100,
 ) -> str:
     """Enumerate / search localized strings (optional modified_only filter)."""
-    return format_result(frosty_client.send_command("list_localized_strings", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_localized_strings", {
         "query": query, "modified_only": modified_only, "offset": offset, "limit": limit,
     }))
 
 
 @mcp.tool()
-def clipboard_paste_object(
+async def clipboard_paste_object(
     name: str = "",
     guid: str = "",
     class_guid: str = "",
@@ -1803,11 +1949,11 @@ def clipboard_paste_object(
     }
     if source_index >= 0:
         params["source_index"] = source_index
-    return format_result(frosty_client.send_command("clipboard_paste_object", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "clipboard_paste_object", params))
 
 
 @mcp.tool()
-def create_struct(
+async def create_struct(
     type: str = "",
     name: str = "",
     guid: str = "",
@@ -1820,54 +1966,100 @@ def create_struct(
     props = _json_arg(properties_json, "properties_json")
     if props is not None:
         params["properties"] = props
-    return format_result(frosty_client.send_command("create_struct", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_struct", params))
 
 
 @mcp.tool()
-def get_texture_info(name: str = "", guid: str = "") -> str:
+async def get_texture_info(name: str = "", guid: str = "") -> str:
     """Inspect texture size/format/mips/chunk/res/bundles."""
-    return format_result(frosty_client.send_command("get_texture_info", {"name": name, "guid": guid}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_texture_info", {"name": name, "guid": guid}))
 
 
 @mcp.tool()
-def get_mesh_info(name: str = "", guid: str = "") -> str:
+async def get_mesh_info(name: str = "", guid: str = "") -> str:
     """Inspect mesh LODs/sections/bones/materials/chunks (requires MeshSetPlugin)."""
-    return format_result(frosty_client.send_command("get_mesh_info", {"name": name, "guid": guid}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_mesh_info", {"name": name, "guid": guid}))
 
 
 @mcp.tool()
-def add_to_bundle_smart(name: str = "", guid: str = "", bundle: str = "") -> str:
+async def add_to_bundle_smart(name: str = "", guid: str = "", bundle: str = "") -> str:
     """Add EBX to bundle and linked RES/Chunk (Texture/Mesh/SoundWave) like BundleEditorPlugin."""
-    return format_result(frosty_client.send_command("add_to_bundle_smart", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "add_to_bundle_smart", {
         "name": name, "guid": guid, "bundle": bundle,
     }))
 
 
 @mcp.tool()
-def remove_from_bundle_smart(name: str = "", guid: str = "", bundle: str = "") -> str:
-    """Remove EBX and linked RES/Chunk from a bundle (inverse of add_to_bundle_smart)."""
-    return format_result(frosty_client.send_command("remove_from_bundle_smart", {
-        "name": name, "guid": guid, "bundle": bundle,
+async def remove_from_bundle_smart(name: str = "", guid: str = "", bundle: str = "",
+                                  commit: bool = False) -> str:
+    """Remove EBX and linked RES/Chunk from a bundle (inverse of add_to_bundle_smart).
+
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "remove_from_bundle_smart", {
+        "name": name, "guid": guid, "bundle": bundle, "commit": commit,
     }))
 
 
 @mcp.tool()
-def batch_add_to_bundle(bundle: str = "", names_json: str = "[]", name: str = "", smart: bool = True) -> str:
+async def batch_add_to_bundle(bundle: str = "", names_json: str = "[]", name: str = "", smart: bool = True) -> str:
     """Add multiple EBX assets to a bundle. names_json is a JSON string array of asset names."""
     import json as _json
     params = {"bundle": bundle, "smart": smart, "name": name}
     try:
         params["names"] = _json.loads(names_json) if names_json else []
-    except Exception:
-        params["names"] = []
-    return format_result(frosty_client.send_command("batch_add_to_bundle", params))
+    except Exception as exc:
+        return format_result({"success": False, "error": "names_json is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "batch_add_to_bundle", params))
 
 
 @mcp.tool()
-def get_ebx_guids(name: str = "", guid: str = "", list_objects: bool = False) -> str:
+async def export_all_ebx(dir: str = "", format: str = "xml", skip_conversations: bool = False,
+                         skip_virtual: bool = False, overwrite: bool = False,
+                         query: str = "", type: str = "", limit: int = 0) -> str:
+    """Export every EBX asset to XML/YAML files under dir, mirroring each asset's path."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_all_ebx", {
+        "dir": dir, "format": format, "skip_conversations": skip_conversations,
+        "skip_virtual": skip_virtual, "overwrite": overwrite, "query": query,
+        "type": type, "limit": limit,
+    }))
+
+
+@mcp.tool()
+async def export_ies(name: str = "", guid: str = "", path: str = "") -> str:
+    """Export an IES profile resource as a DDS (R16_Float) file (requires IesResourcePlugin)."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_ies", {
+        "name": name, "guid": guid, "path": path,
+    }))
+
+
+@mcp.tool()
+async def can_be_loaded_by_bundle(name: str = "", guid: str = "", bundle: str = "") -> str:
+    """Ask PVZBundleManagerPlugin whether a bundle can load this asset (needs the plugin)."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "can_be_loaded_by_bundle", {
+        "name": name, "guid": guid, "bundle": bundle,
+    }))
+
+
+@mcp.tool()
+async def manage_bundles(name: str = "", guid: str = "", commit: bool = False) -> str:
+    """Run PVZBundleManagerPlugin's bundle hygiene pass for one asset.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "manage_bundles", {
+        "name": name, "guid": guid, "commit": commit,
+    }))
+
+
+@mcp.tool()
+async def get_ebx_guids(name: str = "", guid: str = "", list_objects: bool = False,
+                        offset: int = 0, limit: int = 500) -> str:
     """Return file_guid + root_class_guid (for External PointerRef) and optionally all object class_guids."""
-    return format_result(frosty_client.send_command("get_ebx_guids", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_guids", {
         "name": name, "guid": guid, "list_objects": list_objects,
+        "offset": offset, "limit": limit,
     }))
 
 
@@ -1876,19 +2068,19 @@ def get_ebx_guids(name: str = "", guid: str = "", list_objects: bool = False) ->
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_lua_source(name: str = "", guid: str = "") -> str:
+async def get_lua_source(name: str = "", guid: str = "") -> str:
     """Decompile LuaRunnerCompiledLua bytecode to source text (requires LuaPlugin)."""
-    return format_result(frosty_client.send_command("get_lua_source", {"name": name, "guid": guid}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_lua_source", {"name": name, "guid": guid}))
 
 
 @mcp.tool()
-def export_lua(name: str = "", guid: str = "", path: str = "") -> str:
+async def export_lua(name: str = "", guid: str = "", path: str = "") -> str:
     """Export Lua as .lua (decompiled) or .luares (raw SaveBytes)."""
-    return format_result(frosty_client.send_command("export_lua", {"name": name, "guid": guid, "path": path}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_lua", {"name": name, "guid": guid, "path": path}))
 
 
 @mcp.tool()
-def import_lua(
+async def import_lua(
     name: str = "",
     guid: str = "",
     path: str = "",
@@ -1904,14 +2096,14 @@ def import_lua(
     which BF1 requires. Full source= also works; set wrap_entrypoint=False if already wrapped.
     Needs thirdparty/luacmp.dll.
     """
-    return format_result(frosty_client.send_command("import_lua", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_lua", {
         "name": name, "guid": guid, "path": path, "source": source,
         "body": body, "guid_name": guid_name, "wrap_entrypoint": wrap_entrypoint,
     }))
 
 
 @mcp.tool()
-def create_lua_asset(
+async def create_lua_asset(
     new_name: str = "",
     template: str = "",
     body: str = "",
@@ -1932,11 +2124,11 @@ def create_lua_asset(
         params["source"] = source
     if path:
         params["path"] = path
-    return format_result(frosty_client.send_command("create_lua_asset", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_lua_asset", params))
 
 
 @mcp.tool()
-def create_lua_runner_component(
+async def create_lua_runner_component(
     name: str = "",
     guid: str = "",
     compiled_lua_name: str = "",
@@ -1948,8 +2140,17 @@ def create_lua_runner_component(
     output_events_json: str = "[]",
     input_bool_properties_json: str = "[]",
     output_bool_properties_json: str = "[]",
+    input_float_properties_json: str = "[]",
+    output_float_properties_json: str = "[]",
+    input_int_properties_json: str = "[]",
+    output_int_properties_json: str = "[]",
+    input_string_properties_json: str = "[]",
+    output_string_properties_json: str = "[]",
+    input_transform_properties_json: str = "[]",
+    output_transform_properties_json: str = "[]",
     auto_start_per_frame: bool = False,
     auto_start_init: bool = False,
+    run_on_property_change: bool = False,
 ) -> str:
     """Create LuaRunnerScriptEntityData in a blueprint and bind CompiledLua to a LuaRunnerCompiledLua asset."""
     import json as _json
@@ -1959,22 +2160,31 @@ def create_lua_runner_component(
         "realm": realm, "script": script, "array": array,
         "auto_start_per_frame": auto_start_per_frame,
         "auto_start_init": auto_start_init,
+        "run_on_property_change": run_on_property_change,
     }
     for key, raw in (
         ("input_events", input_events_json),
         ("output_events", output_events_json),
         ("input_bool_properties", input_bool_properties_json),
         ("output_bool_properties", output_bool_properties_json),
+        ("input_float_properties", input_float_properties_json),
+        ("output_float_properties", output_float_properties_json),
+        ("input_int_properties", input_int_properties_json),
+        ("output_int_properties", output_int_properties_json),
+        ("input_string_properties", input_string_properties_json),
+        ("output_string_properties", output_string_properties_json),
+        ("input_transform_properties", input_transform_properties_json),
+        ("output_transform_properties", output_transform_properties_json),
     ):
         try:
             params[key] = _json.loads(raw) if raw else []
         except Exception:
             params[key] = []
-    return format_result(frosty_client.send_command("create_lua_runner_component", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_lua_runner_component", params))
 
 
 @mcp.tool()
-def setup_lua(
+async def setup_lua(
     lua_name: str = "",
     blueprint: str = "",
     template: str = "",
@@ -1985,6 +2195,12 @@ def setup_lua(
     input_events_json: str = "[]",
     output_events_json: str = "[]",
     auto_start_init: bool = False,
+    auto_start_per_frame: bool = False,
+    host: str = "",
+    new_name: str = "",
+    template_guid: str = "",
+    script: str = "",
+    array: str = "",
 ) -> str:
     """Full Lua pipeline (BF1DevPlugin style):
     1) duplicate LuaRunnerCompiledLua EBX+RES
@@ -1993,9 +2209,17 @@ def setup_lua(
     """
     import json as _json
     params = {
-        "lua_name": lua_name, "blueprint": blueprint, "template": template,
-        "realm": realm, "auto_start_init": auto_start_init,
+        "lua_name": lua_name or new_name, "blueprint": blueprint or host,
+        "template": template, "realm": realm,
+        "auto_start_init": auto_start_init,
+        "auto_start_per_frame": auto_start_per_frame,
     }
+    if template_guid:
+        params["template_guid"] = template_guid
+    if script:
+        params["script"] = script
+    if array:
+        params["array"] = array
     if body:
         params["body"] = body
     if source:
@@ -2010,63 +2234,71 @@ def setup_lua(
         params["output_events"] = _json.loads(output_events_json) if output_events_json else []
     except Exception:
         params["output_events"] = []
-    return format_result(frosty_client.send_command("setup_lua", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "setup_lua", params))
 
 
 @mcp.tool()
-def get_lua_guid_name(name: str = "", guid: str = "", class_guid: str = "") -> str:
+async def get_lua_guid_name(name: str = "", guid: str = "", class_guid: str = "") -> str:
     """Compute BF1-style guid_name / entrypoint CompiledLua_{GUID_WITH_UNDERSCORES} from Lua asset or class_guid."""
-    return format_result(frosty_client.send_command("get_lua_guid_name", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_lua_guid_name", {
         "name": name, "guid": guid, "class_guid": class_guid,
     }))
 
 
 @mcp.tool()
-def export_atlas_texture(name: str = "", guid: str = "", path: str = "") -> str:
+async def export_atlas_texture(name: str = "", guid: str = "", path: str = "") -> str:
     """Export AtlasTextureAsset to DXT5 DDS (requires AtlasTexturePlugin)."""
-    return format_result(frosty_client.send_command("export_atlas_texture", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_atlas_texture", {
         "name": name, "guid": guid, "path": path,
     }))
 
 
 @mcp.tool()
-def import_atlas_texture(name: str = "", guid: str = "", path: str = "") -> str:
+async def import_atlas_texture(name: str = "", guid: str = "", path: str = "") -> str:
     """Import DXT5/BC3 DDS into AtlasTextureAsset."""
-    return format_result(frosty_client.send_command("import_atlas_texture", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_atlas_texture", {
         "name": name, "guid": guid, "path": path,
     }))
 
 
 @mcp.tool()
-def export_svg(name: str = "", guid: str = "", path: str = "") -> str:
+async def export_svg(name: str = "", guid: str = "", path: str = "") -> str:
     """Export SvgImage asset to .svg (requires SvgImagePlugin)."""
-    return format_result(frosty_client.send_command("export_svg", {"name": name, "guid": guid, "path": path}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_svg", {"name": name, "guid": guid, "path": path}))
 
 
 @mcp.tool()
-def get_sound_info(name: str = "", guid: str = "") -> str:
+async def import_svg(name: str = "", guid: str = "", path: str = "") -> str:
+    """Import an SVG file into an SvgImage asset (requires SvgImagePlugin)."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_svg", {
+        "name": name, "guid": guid, "path": path,
+    }))
+
+
+@mcp.tool()
+async def get_sound_info(name: str = "", guid: str = "") -> str:
     """Inspect SoundWave chunks / RuntimeVariations / Segments."""
-    return format_result(frosty_client.send_command("get_sound_info", {"name": name, "guid": guid}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_sound_info", {"name": name, "guid": guid}))
 
 
 @mcp.tool()
-def export_sound_wav(name: str = "", guid: str = "", path: str = "", variation: int = 0) -> str:
+async def export_sound_wav(name: str = "", guid: str = "", path: str = "", variation: int = 0) -> str:
     """Export SoundWave variation to WAV (Pcm16Big codec only)."""
-    return format_result(frosty_client.send_command("export_sound_wav", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_sound_wav", {
         "name": name, "guid": guid, "path": path, "variation": variation,
     }))
 
 
 @mcp.tool()
-def import_sound_wav(name: str = "", guid: str = "", path: str = "", variation: int = 0) -> str:
+async def import_sound_wav(name: str = "", guid: str = "", path: str = "", variation: int = 0) -> str:
     """Import PCM16 WAV into SoundWave variation as Pcm16Big (mono auto-upmixed to stereo)."""
-    return format_result(frosty_client.send_command("import_sound_wav", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_sound_wav", {
         "name": name, "guid": guid, "path": path, "variation": variation,
     }))
 
 
 @mcp.tool()
-def duplicate_deep(
+async def duplicate_deep(
     name: str = "",
     guid: str = "",
     new_name: str = "",
@@ -2081,11 +2313,11 @@ def duplicate_deep(
     params = {"name": name, "guid": guid, "new_name": new_name}
     if new_type:
         params["new_type"] = new_type
-    return format_result(frosty_client.send_command("duplicate_deep", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_deep", params))
 
 
 @mcp.tool()
-def create_schematic_channel_asset(
+async def create_schematic_channel_asset(
     new_name: str = "",
     template: str = "",
     clear: bool = True,
@@ -2107,11 +2339,11 @@ def create_schematic_channel_asset(
             params[key] = _json.loads(raw) if raw else []
         except Exception:
             params[key] = []
-    return format_result(frosty_client.send_command("create_schematic_channel_asset", params))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_schematic_channel_asset", params))
 
 
 @mcp.tool()
-def create_schematic_channel_entity(
+async def create_schematic_channel_entity(
     name: str = "",
     guid: str = "",
     channel_name: str = "",
@@ -2120,6 +2352,8 @@ def create_schematic_channel_entity(
     array: str = "Objects",
     input_properties_json: str = "[]",
     output_properties_json: str = "[]",
+    input_ref_properties_json: str = "[]",
+    output_ref_properties_json: str = "[]",
 ) -> str:
     """Create SchematicChannelEntityData on a blueprint and bind Channel to a SchematicChannelAsset."""
     import json as _json
@@ -2135,7 +2369,15 @@ def create_schematic_channel_entity(
         params["output_properties"] = _json.loads(output_properties_json) if output_properties_json else []
     except Exception:
         params["output_properties"] = []
-    return format_result(frosty_client.send_command("create_schematic_channel_entity", params))
+    try:
+        params["input_ref_properties"] = _json.loads(input_ref_properties_json) if input_ref_properties_json else []
+    except Exception:
+        params["input_ref_properties"] = []
+    try:
+        params["output_ref_properties"] = _json.loads(output_ref_properties_json) if output_ref_properties_json else []
+    except Exception:
+        params["output_ref_properties"] = []
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_schematic_channel_entity", params))
 
 
 # ---------------------------------------------------------------------------
@@ -2143,7 +2385,7 @@ def create_schematic_channel_entity(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def advanced_add_to_bundle(
+async def advanced_add_to_bundle(
     name: str = "",
     guid: str = "",
     bundle: str = "",
@@ -2156,14 +2398,14 @@ def advanced_add_to_bundle(
     Optional: also add to NetworkRegistry / MeshVariationDb / UnlockIdTable.
     Falls back to add_to_bundle_smart if Advanced Bundle plugin is not loaded.
     """
-    return format_result(frosty_client.send_command("advanced_add_to_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "advanced_add_to_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
         "netreg": netreg, "mvdb": mvdb, "unlock_table": unlock_table,
     }))
 
 
 @mcp.tool()
-def advanced_remove_from_bundle(
+async def advanced_remove_from_bundle(
     name: str = "",
     guid: str = "",
     bundle: str = "",
@@ -2172,14 +2414,14 @@ def advanced_remove_from_bundle(
     unlock_table: bool = False,
 ) -> str:
     """Remove EBX via AdvancedBundleEditorPlugin (optionally NetReg/MVDB/Unlock table)."""
-    return format_result(frosty_client.send_command("advanced_remove_from_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "advanced_remove_from_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
         "netreg": netreg, "mvdb": mvdb, "unlock_table": unlock_table,
     }))
 
 
 @mcp.tool()
-def completely_add_to_bundle(
+async def completely_add_to_bundle(
     name: str = "",
     guid: str = "",
     bundle: str = "",
@@ -2189,34 +2431,34 @@ def completely_add_to_bundle(
 
     Mirrors BunpyApi.CompletelyAddAsset / RecAddToBundle+Reg+Mvdb. Requires AdvancedBundleEditorPlugin.
     """
-    return format_result(frosty_client.send_command("completely_add_to_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "completely_add_to_bundle", {
         "name": name, "guid": guid, "bundle": bundle, "recursive": recursive,
     }))
 
 
 @mcp.tool()
-def completely_remove_from_bundle(
+async def completely_remove_from_bundle(
     name: str = "",
     guid: str = "",
     bundle: str = "",
     recursive: bool = True,
 ) -> str:
     """Completely remove from Bundle + NetReg + MVDB (+ Unlock), optionally recurse. Requires AdvancedBundleEditorPlugin."""
-    return format_result(frosty_client.send_command("completely_remove_from_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "completely_remove_from_bundle", {
         "name": name, "guid": guid, "bundle": bundle, "recursive": recursive,
     }))
 
 
 @mcp.tool()
-def validate_bundle_add(name: str = "", guid: str = "", bundle: str = "") -> str:
+async def validate_bundle_add(name: str = "", guid: str = "", bundle: str = "") -> str:
     """Validate whether an asset can be (recursively) added / netreg / mvdb for a bundle."""
-    return format_result(frosty_client.send_command("validate_bundle_add", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "validate_bundle_add", {
         "name": name, "guid": guid, "bundle": bundle,
     }))
 
 
 @mcp.tool()
-def create_advanced_bundle(
+async def create_advanced_bundle(
     bundle: str = "",
     super_bundle: str = "",
     bundle_type: str = "Shared",
@@ -2224,7 +2466,7 @@ def create_advanced_bundle(
     blueprint_type: str = "BlueprintBundle",
 ) -> str:
     """Create a new bundle via BunpyApi.AddBundle (Blueprint + NetReg + MVDB scaffolding). Requires AdvancedBundleEditorPlugin."""
-    return format_result(frosty_client.send_command("create_advanced_bundle", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_advanced_bundle", {
         "bundle": bundle, "super_bundle": super_bundle,
         "bundle_type": bundle_type, "generate_blueprints": generate_blueprints,
         "blueprint_type": blueprint_type,
@@ -2232,71 +2474,273 @@ def create_advanced_bundle(
 
 
 @mcp.tool()
-def set_bundle_super(bundle: str = "", super_bundle: str = "") -> str:
+async def set_bundle_super(bundle: str = "", super_bundle: str = "") -> str:
     """Repoint an existing (added) bundle to a different super bundle. Frosty's AddBundle returns the existing bundle unchanged, so this is the only way to fix a bundle's super bundle after creation."""
-    return format_result(frosty_client.send_command("set_bundle_super", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_bundle_super", {
         "bundle": bundle, "super_bundle": super_bundle,
     }))
 
 
 @mcp.tool()
-def delete_bundle(bundle: str = "", clear_members: bool = True) -> str:
-    """Delete an added bundle (Frosty's RevertBundle removes it). Optionally clears its id from every asset's added bundles."""
-    return format_result(frosty_client.send_command("delete_bundle", {
-        "bundle": bundle, "clear_members": clear_members,
+async def delete_bundle(bundle: str = "", clear_members: bool = True, commit: bool = False) -> str:
+    """Delete an added bundle (Frosty's RevertBundle removes it). Optionally clears its id from every asset's added bundles.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "delete_bundle", {
+        "bundle": bundle, "clear_members": clear_members, "commit": commit,
     }))
 
 
 @mcp.tool()
-def list_super_bundles() -> str:
+async def list_super_bundles() -> str:
     """List super bundles with their bundle counts."""
-    return format_result(frosty_client.send_command("list_super_bundles", {}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_super_bundles", {}))
 
 
 @mcp.tool()
-def project_stats() -> str:
+async def project_stats() -> str:
     """Project totals: modified/dirty counts, added vs modified EBX, added bundles/res/chunks."""
-    return format_result(frosty_client.send_command("project_stats", {}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "project_stats", {}))
+
+
+# ---------------------------------------------------------------------------
+# Project lifecycle (mirrors the editor File menu)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def create_asset(name: str = "", type: str = "", based_on: str = "", based_on_guid: str = "",
+                      new_type: str = "", bundle: str = "", commit: bool = False) -> str:
+    """Create a resource-backed asset (EBX+RES+Chunk) via PVZBundleManagerPlugin handlers.
+
+    Use this instead of create_ebx for Texture/Mesh/Sound/Atlas assets.
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "create_asset", {
+        "name": name, "type": type, "based_on": based_on, "based_on_guid": based_on_guid,
+        "new_type": new_type, "bundle": bundle, "commit": commit,
+    }))
 
 
 @mcp.tool()
-def batch_set_field(items: list = []) -> str:
+async def import_sound(name: str = "", guid: str = "", path: str = "", codec: int = 0,
+                       channel_count: int = 0, seekable: bool = False, remix: bool = True,
+                       chunk_index: int = 0, segment_index: int = -1,
+                       variation_index: int = -1) -> str:
+    """Re-encode an audio file into a SoundWave asset (requires SoundEditorPlugin).
+
+    codec/channel_count are read from the existing chunk when left at 0.
+    """
+    params = {"name": name, "guid": guid, "path": path, "remix": remix,
+              "chunk_index": chunk_index, "segment_index": segment_index,
+              "variation_index": variation_index}
+    if codec > 0:
+        params["codec"] = codec
+    if channel_count > 0:
+        params["channel_count"] = channel_count
+    if seekable:
+        params["seekable"] = seekable
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_sound", params))
+
+
+@mcp.tool()
+async def import_project(path: str = "", overwrite_modified: bool = False, commit: bool = False) -> str:
+    """Merge bundles/assets from another .fbproject into the open project.
+
+    overwrite_modified=True replaces assets that already have unsaved edits.
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "import_project", {
+        "path": path, "overwrite_modified": overwrite_modified, "commit": commit,
+    }))
+
+
+@mcp.tool()
+async def capabilities() -> str:
+    """Report bridge version, profile, whether a project is open, and which optional plugins are loaded."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "capabilities", {}))
+
+
+@mcp.tool()
+async def get_project_info() -> str:
+    """Current .fbproject: display name, filename, profile, dirty flag, ModSettings."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_project_info", {}))
+
+
+@mcp.tool()
+async def save_project() -> str:
+    """Save the current project to its existing filename."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "save_project", {}))
+
+
+@mcp.tool()
+async def save_project_as(path: str = "", overwrite: bool = False) -> str:
+    """Save the current project under a new .fbproject path and switch to it."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "save_project_as", {
+        "path": path, "overwrite": overwrite,
+    }))
+
+
+@mcp.tool()
+async def save_project_copy(path: str = "", overwrite: bool = False) -> str:
+    """Write a copy of the project to path without changing the open project or its dirty flag."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "save_project_copy", {
+        "path": path, "overwrite": overwrite,
+    }))
+
+
+@mcp.tool()
+async def open_project(path: str = "", save_first: bool = False) -> str:
+    """Open another .fbproject. Refuses when the current project is dirty unless save_first=True."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "open_project", {
+        "path": path, "save_first": save_first,
+    }))
+
+
+@mcp.tool()
+async def new_project(save_first: bool = False) -> str:
+    """Start a blank project. Refuses when the current project is dirty unless save_first=True."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "new_project", {
+        "save_first": save_first,
+    }))
+
+
+@mcp.tool()
+async def revert_all(discard: bool = False, commit: bool = False) -> str:
+    """Revert every asset and remove added bundles. Requires discard=True when the project is dirty.
+
+    First call returns would_change; call again with commit=True to execute.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "revert_all", {
+        "discard": discard, "commit": commit,
+    }))
+
+
+@mcp.tool()
+async def get_mod_settings() -> str:
+    """Read the project's ModSettings (title/author/category/version/description/link/icon/screenshots)."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_mod_settings", {}))
+
+
+@mcp.tool()
+async def set_mod_settings(title: str = "", author: str = "", category: str = "",
+                           version: str = "", description: str = "", link: str = "",
+                           selected_category: int = -1, icon_path: str = "",
+                           screenshot_paths_json: str = "[]") -> str:
+    """Update ModSettings fields. icon_path and screenshot_paths_json (up to 4 paths) are optional."""
+    import json as _json
+    params = {
+        "title": title, "author": author, "category": category,
+        "version": version, "description": description, "link": link,
+    }
+    if selected_category >= 0:
+        params["selected_category"] = selected_category
+    if icon_path:
+        params["icon_path"] = icon_path
+    try:
+        params["screenshot_paths"] = _json.loads(screenshot_paths_json) if screenshot_paths_json else []
+    except Exception as exc:
+        return format_result({"success": False, "error": "screenshot_paths_json is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_mod_settings", params))
+
+
+@mcp.tool()
+async def export_mod(path: str = "", overwrite: bool = False, title: str = "", author: str = "",
+                     category: str = "", version: str = "", description: str = "",
+                     link: str = "", icon_path: str = "") -> str:
+    """Write a .fbmod from the current project. This never runs automatically."""
+    params = {"path": path, "overwrite": overwrite}
+    for key, value in (("title", title), ("author", author), ("category", category),
+                       ("version", version), ("description", description),
+                       ("link", link), ("icon_path", icon_path)):
+        if value:
+            params[key] = value
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "export_mod", params))
+
+
+@mcp.tool()
+async def get_log(max_chars: int = 20000) -> str:
+    """Return the tail of the Frosty editor log."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_log", {
+        "max_chars": max_chars,
+    }))
+
+
+@mcp.tool()
+async def list_linked_assets(kind: str = "ebx", name: str = "", guid: str = "") -> str:
+    """List LinkedAssets of an EBX/RES/Chunk entry."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_linked_assets", {
+        "kind": kind, "name": name, "guid": guid,
+    }))
+
+
+@mcp.tool()
+async def link_asset(kind: str = "ebx", name: str = "", guid: str = "",
+                     linked_kind: str = "res", linked_name: str = "", linked_guid: str = "") -> str:
+    """Add a LinkedAsset from one asset entry to another."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "link_asset", {
+        "kind": kind, "name": name, "guid": guid,
+        "linked_kind": linked_kind, "linked_name": linked_name, "linked_guid": linked_guid,
+    }))
+
+
+@mcp.tool()
+async def unlink_asset(kind: str = "ebx", name: str = "", guid: str = "",
+                       linked_kind: str = "res", linked_name: str = "", linked_guid: str = "") -> str:
+    """Remove a LinkedAsset link between two asset entries."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "unlink_asset", {
+        "kind": kind, "name": name, "guid": guid,
+        "linked_kind": linked_kind, "linked_name": linked_name, "linked_guid": linked_guid,
+    }))
+
+
+@mcp.tool()
+async def check_guid_invariants(limit: int = 100) -> str:
+    """Scan EBX entries for entry.Guid != asset.FileGuid and duplicate file GUIDs."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "check_guid_invariants", {
+        "limit": limit,
+    }))
+
+
+@mcp.tool()
+async def batch_set_field(items: list = []) -> str:
     """Apply many field writes in one call. items entries use the same params as set_ebx_field, or set_component_property when index/component_type is present."""
-    return format_result(frosty_client.send_command("batch_set_field", {"items": items}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "batch_set_field", {"items": items}))
 
 
 @mcp.tool()
-def diff_ebx(name: str = "", guid: str = "", limit: int = 200) -> str:
+async def diff_ebx(name: str = "", guid: str = "", limit: int = 200) -> str:
     """Field-level YAML diff of a modified EBX against its unmodified (vanilla) data."""
-    return format_result(frosty_client.send_command("diff_ebx", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "diff_ebx", {
         "name": name, "guid": guid, "limit": limit,
     }))
 
 
 @mcp.tool()
-def validate_refs(names: list = [], limit: int = 200) -> str:
+async def validate_refs(names: list = [], limit: int = 200) -> str:
     """Scan modified assets (or the given names) for dangling external/self/internal pointer refs."""
-    return format_result(frosty_client.send_command("validate_refs", {"names": names, "limit": limit}))
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "validate_refs", {"names": names, "limit": limit}))
 
 
 @mcp.tool()
-def bundle_closure_check(bundle: str = "", include_outside: bool = False, limit: int = 200) -> str:
+async def bundle_closure_check(bundle: str = "", include_outside: bool = False, limit: int = 200) -> str:
     """Check a bundle's EBX dependency closure: dangling deps and (optionally) deps that live outside the bundle."""
-    return format_result(frosty_client.send_command("bundle_closure_check", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "bundle_closure_check", {
         "bundle": bundle, "include_outside": include_outside, "limit": limit,
     }))
 
 
 @mcp.tool()
-def registry_gap(name: str = "", names: list = [], registry: str = "", registries: list = [], limit: int = 200) -> str:
+async def registry_gap(name: str = "", names: list = [], registry: str = "", registries: list = [], limit: int = 200) -> str:
     """Compare an asset's exported object GUIDs against NetworkRegistry entries and list what is missing."""
-    return format_result(frosty_client.send_command("registry_gap", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "registry_gap", {
         "name": name, "names": names, "registry": registry, "registries": registries, "limit": limit,
     }))
 
 
 @mcp.tool()
-def list_bundle_contents(
+async def list_bundle_contents(
     bundle: str = "",
     type: str = "",
     modified_only: bool = False,
@@ -2304,55 +2748,55 @@ def list_bundle_contents(
     limit: int = 200,
 ) -> str:
     """List EBX assets inside a bundle (optional type filter / modified_only)."""
-    return format_result(frosty_client.send_command("list_bundle_contents", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_bundle_contents", {
         "bundle": bundle, "type": type, "modified_only": modified_only,
         "offset": offset, "limit": limit,
     }))
 
 
 @mcp.tool()
-def resolve_hash(hash: str = "", value: str = "") -> str:
+async def resolve_hash(hash: str = "", value: str = "") -> str:
     """Reverse FNV hash to string via Utils.GetString (same as Blueprint Editor hashing utils).
 
     Pass decimal or 0xHEX in hash (or value).
     """
-    return format_result(frosty_client.send_command("resolve_hash", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "resolve_hash", {
         "hash": hash or value, "value": value,
     }))
 
 
 @mcp.tool()
-def encode_property_flags(
+async def encode_property_flags(
     realm: str = "ClientAndServer",
     prop_type: str = "Default",
     source_cant_be_static: bool = False,
 ) -> str:
     """Encode PropertyConnection Flags (mirrors BlueprintEditor PropertyFlagsHelper). Pair with decode_connection_flags."""
-    return format_result(frosty_client.send_command("encode_property_flags", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "encode_property_flags", {
         "realm": realm, "prop_type": prop_type, "source_cant_be_static": source_cant_be_static,
     }))
 
 
 @mcp.tool()
-def list_node_ports(type: str = "", component_type: str = "") -> str:
+async def list_node_ports(type: str = "", component_type: str = "") -> str:
     """List Blueprint Editor node input/output ports for an EntityData type (EntityNode extension or SDK fallback)."""
-    return format_result(frosty_client.send_command("list_node_ports", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_node_ports", {
         "type": type or component_type, "component_type": component_type,
     }))
 
 
 @mcp.tool()
-def list_registered_node_types(query: str = "", offset: int = 0, limit: int = 200) -> str:
+async def list_registered_node_types(query: str = "", offset: int = 0, limit: int = 200) -> str:
     """List EntityNode / EntityMappingNode types registered by FrostyBlueprintEditor."""
-    return format_result(frosty_client.send_command("list_registered_node_types", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "list_registered_node_types", {
         "query": query, "offset": offset, "limit": limit,
     }))
 
 
 @mcp.tool()
-def validate_connections(name: str = "", guid: str = "") -> str:
+async def validate_connections(name: str = "", guid: str = "") -> str:
     """Scan Property/Event/Link connections for null pointers and empty field names."""
-    return format_result(frosty_client.send_command("validate_connections", {
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "validate_connections", {
         "name": name, "guid": guid,
     }))
 

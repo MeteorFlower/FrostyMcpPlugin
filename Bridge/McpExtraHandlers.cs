@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using Frosty.Core.Controls;
 using FrostySdk;
 using FrostySdk.Ebx;
@@ -34,38 +34,49 @@ namespace FrostyMcpPlugin.Bridge
             bool lowercase = p.Value<bool?>("lowercase") ?? false;
             var result = new Dictionary<string, object> { ["success"] = true };
 
-            if (!string.IsNullOrEmpty(text))
+            try
             {
-                string src = lowercase ? text.ToLowerInvariant() : text;
-                int fnv = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-                    ? int.Parse(text.Substring(2), NumberStyles.AllowHexSpecifier)
-                    : Utils.HashString(src);
-                uint fnvU = unchecked((uint)fnv);
+                if (!string.IsNullOrEmpty(text))
+                {
+                    string src = lowercase ? text.ToLowerInvariant() : text;
+                    int fnv = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                        ? int.Parse(text.Substring(2), NumberStyles.AllowHexSpecifier)
+                        : Utils.HashString(src);
+                    uint fnvU = unchecked((uint)fnv);
 
-                // BF1DevPlugin localized hash: hashId = char + 33 * hashId, start uint.MaxValue
-                uint loc = uint.MaxValue;
-                string locSrc = lowercase ? text.ToLowerInvariant() : text;
-                for (int i = 0; i < locSrc.Length; i++)
-                    loc = locSrc[i] + 33u * loc;
+                    // BF1DevPlugin localized hash: hashId = char + 33 * hashId, start uint.MaxValue
+                    uint loc = uint.MaxValue;
+                    string locSrc = lowercase ? text.ToLowerInvariant() : text;
+                    for (int i = 0; i < locSrc.Length; i++)
+                        loc = locSrc[i] + 33u * loc;
 
-                result["text"] = text;
-                result["fnv1"] = fnv;
-                result["fnv1_hex"] = "0x" + fnvU.ToString("X8");
-                result["fnv1_uint"] = fnvU;
-                result["localized_hash"] = loc;
-                result["localized_hash_hex"] = "0x" + loc.ToString("X8");
+                    result["text"] = text;
+                    result["fnv1"] = fnv;
+                    result["fnv1_hex"] = "0x" + fnvU.ToString("X8");
+                    result["fnv1_uint"] = fnvU;
+                    result["localized_hash"] = loc;
+                    result["localized_hash_hex"] = "0x" + loc.ToString("X8");
+                }
+
+                if (p["float"] != null)
+                {
+                    float f = Convert.ToSingle(p["float"].ToString(), CultureInfo.InvariantCulture);
+                    byte[] bytes = BitConverter.GetBytes(f);
+                    if (BitConverter.IsLittleEndian)
+                        Array.Reverse(bytes);
+                    int hexInt = BitConverter.ToInt32(bytes, 0);
+                    result["float"] = f;
+                    result["float_hex"] = "0x" + unchecked((uint)hexInt).ToString("X8");
+                    result["float_hex_int"] = hexInt;
+                }
             }
-
-            if (p["float"] != null)
+            catch (FormatException)
             {
-                float f = Convert.ToSingle(p["float"].ToString(), CultureInfo.InvariantCulture);
-                byte[] bytes = BitConverter.GetBytes(f);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(bytes);
-                int hexInt = BitConverter.ToInt32(bytes, 0);
-                result["float"] = f;
-                result["float_hex"] = "0x" + unchecked((uint)hexInt).ToString("X8");
-                result["float_hex_int"] = hexInt;
+                return McpHandlers.Error("text/0xHEX or float has an invalid format", "INVALID_PARAMS");
+            }
+            catch (OverflowException)
+            {
+                return McpHandlers.Error("value is out of range", "INVALID_PARAMS");
             }
 
             return result;
@@ -75,10 +86,23 @@ namespace FrostyMcpPlugin.Bridge
         // Localization
         // =====================================================================
 
+        // Frosty always assigns a database; when no plugin registered one it is the
+        // internal DefaultLocalizedStringDatabase, whose every method is a no-op.
+        private static object RequireLocalization()
+        {
+            ILocalizedStringDatabase db = LocalizedStringDatabase.Current;
+            if (db == null)
+                return McpHandlers.Error("LocalizedStringDatabase not ready", "NOT_READY");
+            if (db.GetType().Name == "DefaultLocalizedStringDatabase")
+                return McpHandlers.Error("No localization database plugin is registered for this profile", "PLUGIN_MISSING");
+            return null;
+        }
+
         public static object GetLocalizedString(JObject p)
         {
-            if (LocalizedStringDatabase.Current == null)
-                return McpHandlers.Error("LocalizedStringDatabase not ready", "NOT_READY");
+            object unavailable = RequireLocalization();
+            if (unavailable != null)
+                return unavailable;
 
             string idStr = (p.Value<string>("id") ?? p.Value<string>("string_id") ?? "").Trim();
             if (string.IsNullOrEmpty(idStr) && p["hash"] == null)
@@ -121,8 +145,9 @@ namespace FrostyMcpPlugin.Bridge
 
         public static object SetLocalizedString(JObject p)
         {
-            if (LocalizedStringDatabase.Current == null)
-                return McpHandlers.Error("LocalizedStringDatabase not ready", "NOT_READY");
+            object unavailable = RequireLocalization();
+            if (unavailable != null)
+                return unavailable;
 
             string value = p.Value<string>("value");
             if (value == null)
@@ -166,8 +191,9 @@ namespace FrostyMcpPlugin.Bridge
 
         public static object RevertLocalizedString(JObject p)
         {
-            if (LocalizedStringDatabase.Current == null)
-                return McpHandlers.Error("LocalizedStringDatabase not ready", "NOT_READY");
+            object unavailable = RequireLocalization();
+            if (unavailable != null)
+                return unavailable;
 
             try
             {
@@ -199,8 +225,9 @@ namespace FrostyMcpPlugin.Bridge
 
         public static object ListLocalizedStrings(JObject p)
         {
-            if (LocalizedStringDatabase.Current == null)
-                return McpHandlers.Error("LocalizedStringDatabase not ready", "NOT_READY");
+            object unavailable = RequireLocalization();
+            if (unavailable != null)
+                return unavailable;
 
             string query = (p.Value<string>("query") ?? "").Trim();
             bool modifiedOnly = p.Value<bool?>("modified_only") ?? false;
@@ -616,29 +643,67 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
-                entry.AddToBundle(bid);
-                linked.Add("ebx:" + entry.Name);
+                bool ebxAdded = McpHandlers.AddToBundleExportable(entry, bid);
+                if (ebxAdded)
+                    linked.Add("ebx:" + entry.Name);
 
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
                 dynamic root = asset.RootObject;
                 string type = entry.Type ?? "";
 
-                if (TypeLibrary.IsSubClassOf(type, "TextureBaseAsset") || type.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (type.IndexOf("MovieTexture", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    // Movie textures have ChunkGuid / SubtitleChunkGuid and no Resource.
+                    try
+                    {
+                        Type rootType = ((object)root).GetType();
+                        foreach (string chunkPropName in new[] { "ChunkGuid", "SubtitleChunkGuid" })
+                        {
+                            PropertyInfo chunkProp = rootType.GetProperty(chunkPropName);
+                            if (chunkProp == null) continue;
+                            object raw = chunkProp.GetValue(root);
+                            Guid cid = raw is Guid g ? g : Guid.Empty;
+                            if (cid == Guid.Empty) continue;
+                            ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(cid);
+                            if (chunk == null) continue;
+                            if (McpHandlers.AddToBundleExportable(chunk, bid))
+                                linked.Add("chunk:" + cid);
+                            entry.LinkAsset(chunk);
+                        }
+                    }
+                    catch (Exception ex) { linked.Add("movie_error:" + ex.Message); }
+                }
+                else if (type.IndexOf("NewWave", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    try
+                    {
+                        ResAssetEntry resEntry = App.AssetManager.GetResEntry(entry.Name.ToLowerInvariant());
+                        if (resEntry != null)
+                        {
+                            if (McpHandlers.AddToBundleExportable(resEntry, bid))
+                                linked.Add("res:" + resEntry.Name);
+                            entry.LinkAsset(resEntry);
+                        }
+                        AddChunkListToBundle(entry, root, bid, linked);
+                    }
+                    catch (Exception ex) { linked.Add("newwave_error:" + ex.Message); }
+                }
+                else if (TypeLibrary.IsSubClassOf(type, "TextureBaseAsset") || type.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     try
                     {
                         ResAssetEntry resEntry = App.AssetManager.GetResEntry((ulong)root.Resource);
                         if (resEntry != null)
                         {
-                            resEntry.AddToBundle(bid);
-                            linked.Add("res:" + resEntry.Name);
+                            if (McpHandlers.AddToBundleExportable(resEntry, bid))
+                                linked.Add("res:" + resEntry.Name);
                             Texture texture = App.AssetManager.GetResAs<Texture>(resEntry);
                             ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(texture.ChunkId);
                             if (chunk != null)
                             {
-                                chunk.AddToBundle(bid);
+                                if (McpHandlers.AddToBundleExportable(chunk, bid))
+                                    linked.Add("chunk:" + chunk.Id);
                                 chunk.FirstMip = texture.FirstMip;
-                                linked.Add("chunk:" + chunk.Id);
                                 resEntry.LinkAsset(chunk);
                             }
                             entry.LinkAsset(resEntry);
@@ -653,8 +718,8 @@ namespace FrostyMcpPlugin.Bridge
                         ResAssetEntry resEntry = App.AssetManager.GetResEntry((ulong)root.MeshSetResource);
                         if (resEntry != null)
                         {
-                            resEntry.AddToBundle(bid);
-                            linked.Add("res:" + resEntry.Name);
+                            if (McpHandlers.AddToBundleExportable(resEntry, bid))
+                                linked.Add("res:" + resEntry.Name);
                             entry.LinkAsset(resEntry);
 
                             Type meshSetType = FindType("MeshSetPlugin.Resources.MeshSet");
@@ -668,9 +733,9 @@ namespace FrostyMcpPlugin.Bridge
                                     if (chunkId == Guid.Empty) continue;
                                     ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(chunkId);
                                     if (chunk == null) continue;
-                                    chunk.AddToBundle(bid);
+                                    if (McpHandlers.AddToBundleExportable(chunk, bid))
+                                        linked.Add("chunk:" + chunkId);
                                     resEntry.LinkAsset(chunk);
-                                    linked.Add("chunk:" + chunkId);
                                 }
                             }
                         }
@@ -679,50 +744,39 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 else if (type.IndexOf("SoundWave", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    try
-                    {
-                        // Common pattern: Chunks array of guids / PointerRefs
-                        PropertyInfo chunksProp = ((object)root).GetType().GetProperty("Chunks");
-                        if (chunksProp != null && chunksProp.GetValue(root) is IList chunks)
-                        {
-                            foreach (object item in chunks)
-                            {
-                                Guid cid = Guid.Empty;
-                                if (item is Guid g) cid = g;
-                                else
-                                {
-                                    try { cid = (Guid)item.GetType().GetProperty("ChunkId").GetValue(item); } catch { }
-                                }
-                                if (cid == Guid.Empty) continue;
-                                ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(cid);
-                                if (chunk == null) continue;
-                                chunk.AddToBundle(bid);
-                                entry.LinkAsset(chunk);
-                                linked.Add("chunk:" + cid);
-                            }
-                        }
-                    }
+                    try { AddChunkListToBundle(entry, root, bid, linked); }
                     catch (Exception ex) { linked.Add("sound_error:" + ex.Message); }
                 }
                 else
                 {
-                    // Generic: try Resource property
                     try
                     {
-                        PropertyInfo resProp = ((object)root).GetType().GetProperty("Resource");
+                        string resProperty = null;
+                        if (type.IndexOf("ClothWrapping", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "ClothWrappingAssetResource";
+                        else if (type.IndexOf("ClothColliderSet", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "ClothColliderSetAssetResource";
+                        else if (type.IndexOf("Cloth", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "ClothAssetResource";
+                        else if (type.IndexOf("Enlighten", StringComparison.OrdinalIgnoreCase) >= 0)
+                            resProperty = "DatabaseResource";
+                        else
+                            resProperty = "Resource";
+
+                        PropertyInfo resProp = ((object)root).GetType().GetProperty(resProperty);
                         if (resProp != null)
                         {
                             ulong rid = Convert.ToUInt64(resProp.GetValue(root));
                             ResAssetEntry resEntry = App.AssetManager.GetResEntry(rid);
                             if (resEntry != null)
                             {
-                                resEntry.AddToBundle(bid);
+                                if (McpHandlers.AddToBundleExportable(resEntry, bid))
+                                    linked.Add("res:" + resEntry.Name);
                                 entry.LinkAsset(resEntry);
-                                linked.Add("res:" + resEntry.Name);
                             }
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { linked.Add("resource_error:" + ex.Message); }
                 }
 
                 return new Dictionary<string, object>
@@ -731,7 +785,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["name"] = entry.Name,
                     ["bundle"] = bundleName,
                     ["bundle_id"] = bid,
-                    ["linked"] = linked
+                    ["added"] = ebxAdded,
+                    ["linked"] = linked,
+                    ["linked_count"] = linked.Count
                 };
             }
             catch (Exception ex)
@@ -743,6 +799,29 @@ namespace FrostyMcpPlugin.Bridge
         // =====================================================================
         // Helpers
         // =====================================================================
+
+        private static void AddChunkListToBundle(EbxAssetEntry entry, dynamic root, int bid, List<string> linked)
+        {
+            PropertyInfo chunksProp = ((object)root).GetType().GetProperty("Chunks");
+            if (chunksProp == null || !(chunksProp.GetValue(root) is IList chunks))
+                return;
+
+            foreach (object item in chunks)
+            {
+                Guid cid = Guid.Empty;
+                if (item is Guid g) cid = g;
+                else
+                {
+                    try { cid = (Guid)item.GetType().GetProperty("ChunkId").GetValue(item); } catch { }
+                }
+                if (cid == Guid.Empty) continue;
+                ChunkAssetEntry chunk = App.AssetManager.GetChunkEntry(cid);
+                if (chunk == null) continue;
+                if (McpHandlers.AddToBundleExportable(chunk, bid))
+                    linked.Add("chunk:" + cid);
+                entry.LinkAsset(chunk);
+            }
+        }
 
         private static bool LooksLikeHash(string s)
         {

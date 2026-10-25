@@ -1,4 +1,4 @@
-using Newtonsoft.Json.Linq;
+﻿using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 
@@ -127,6 +127,14 @@ namespace FrostyMcpPlugin.Bridge
                 ["export_atlas_texture"] = McpMediaHandlers.ExportAtlasTexture,
                 ["import_atlas_texture"] = McpMediaHandlers.ImportAtlasTexture,
                 ["export_svg"] = McpMediaHandlers.ExportSvg,
+                ["import_svg"] = McpMediaHandlers.ImportSvg,
+                ["export_all_ebx"] = McpBulkHandlers.ExportAllEbx,
+                ["export_ies"] = McpBulkHandlers.ExportIes,
+                ["import_sound"] = McpSoundHandlers.ImportSound,
+                ["create_asset"] = McpAssetCreateHandlers.CreateAsset,
+                ["can_be_loaded_by_bundle"] = McpBulkHandlers.CanBeLoadedByBundle,
+                ["manage_bundles"] = McpBulkHandlers.ManageBundles,
+                ["import_project"] = McpMergeHandlers.ImportProject,
                 ["get_sound_info"] = McpMediaHandlers.GetSoundInfo,
                 ["export_sound_wav"] = McpMoreHandlers.ExportSoundWav,
                 ["import_sound_wav"] = McpMoreHandlers.ImportSoundWav,
@@ -145,6 +153,22 @@ namespace FrostyMcpPlugin.Bridge
                 ["delete_bundle"] = McpProjectTools.DeleteBundle,
                 ["list_super_bundles"] = McpProjectTools.ListSuperBundles,
                 ["project_stats"] = McpProjectTools.ProjectStats,
+                ["get_project_info"] = McpProjectLifecycleHandlers.GetProjectInfo,
+                ["save_project"] = McpProjectLifecycleHandlers.SaveProject,
+                ["save_project_as"] = McpProjectLifecycleHandlers.SaveProjectAs,
+                ["save_project_copy"] = McpProjectLifecycleHandlers.SaveProjectCopy,
+                ["open_project"] = McpProjectLifecycleHandlers.OpenProject,
+                ["new_project"] = McpProjectLifecycleHandlers.NewProject,
+                ["revert_all"] = McpProjectLifecycleHandlers.RevertAll,
+                ["get_mod_settings"] = McpProjectLifecycleHandlers.GetModSettings,
+                ["set_mod_settings"] = McpProjectLifecycleHandlers.SetModSettings,
+                ["export_mod"] = McpProjectLifecycleHandlers.ExportMod,
+                ["get_log"] = McpProjectLifecycleHandlers.GetLog,
+                ["list_linked_assets"] = McpProjectLifecycleHandlers.ListLinkedAssets,
+                ["link_asset"] = McpProjectLifecycleHandlers.LinkAsset,
+                ["unlink_asset"] = McpProjectLifecycleHandlers.UnlinkAsset,
+                ["check_guid_invariants"] = McpProjectLifecycleHandlers.CheckGuidInvariants,
+                ["capabilities"] = McpProjectLifecycleHandlers.Capabilities,
                 ["batch_set_field"] = McpProjectTools.BatchSetField,
                 ["diff_ebx"] = McpProjectTools.DiffEbx,
                 ["validate_refs"] = McpProjectTools.ValidateRefs,
