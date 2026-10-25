@@ -337,6 +337,8 @@ created. A false `type_matches` means the name is taken by a bundle of another t
 **`limit: 0` means zero rows, not the default.** It is the way to read `total` alone. A
 page-length field means the array was capped; compare it with the paired count.
 
+**`search_ebx` matches asset names and types, not field values.** Looking for who uses a component type or a GUID returns nothing useful from it. `search_ebx_fields` searches field names and values, `find_pointer_references` answers which assets point at one object, and `find_references` answers the same for a whole file. There is no whole-database scan, so scope every search with `query` or a type.
+
 **A bounded scan that finished early is not a clean result.** `check_guid_invariants`,
 `find_pointer_references` and `registry_gap` stop at a limit and say so in `scan_truncated`,
 `candidate_count` or `registries_skipped`. Page or narrow the query until the flag is false
@@ -574,7 +576,11 @@ the whole file was applied.
 
 **A new networked object also has to be registered.** Adding a Synced component or a new networked entity data object to a blueprint is not enough: the server keeps and replicates state for objects it finds in a NetworkRegistry asset. Without a matching registry entry the change is visible on the host and silently missing on clients. `registry_gap` compares an asset's exported object GUIDs against the registries and lists what is missing.
 
-**`diff_ebx` compares against vanilla, and object numbering drifts after a revert.** Diff rows are keyed on object GUIDs, and those are reassigned when the asset is reverted or the editor restarts, so the same object can appear as removed and added. Read the diff by object name and position, not by GUID, and re-run `list_components` after any revert before comparing.
+**`diff_ebx` compares against vanilla, and object numbering drifts after a revert.** Diff rows are keyed on object GUIDs, and those are reassigned when the asset is reverted or the editor restarts, so the same object can appear as removed and added. Read the diff by object name and position, not by GUID.
+
+**To learn what the mod really changes, run the round trip.** Call `export_ebx_bin`, then `revert_asset`, then export again and compare the two files. A clean asset round-trips byte for byte, so anything that differs is yours. Align the two exports by object name and order rather than by internal GUID, because the revert reassigns them.
+
+**A new asset of a runtime-registered type can crash the game while looking perfectly correct.** In Battle for Neighborville a freshly created BuffData crashes at character spawn inside the asset registration path, whether it came from `create_ebx` or `duplicate_ebx`, with a matching class table, bundle hash and pointers. Reusing a vanilla asset of the same type that nothing else references, and editing that, works. For gameplay-critical types, treat "the editor accepted it" as no evidence and test in game before building on it.
 
 **An edit writes the whole asset, not the field.** Any tool that marks an asset modified causes the entire asset to be serialised into the `.fbmod`. Fields changed earlier for convenience, or defaults changed while experimenting, ship with it. `diff_ebx` shows exactly what will be written; use it before packaging, especially on an asset that other work already touched.
 
