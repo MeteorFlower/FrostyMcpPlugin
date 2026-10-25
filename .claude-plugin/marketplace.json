@@ -1,0 +1,22 @@
+{
+  "name": "frosty",
+  "description": "Frosty Editor MCP bridge: an agent skill and a stdio MCP server for EBX, bundles, blueprints and .fbmod export.",
+  "owner": {
+    "name": "MeteorFlower"
+  },
+  "plugins": [
+    {
+      "name": "frosty-mcp",
+      "description": "Frosty Editor MCP bridge for EBX assets, components, blueprint connections, bundles, network registries, project lifecycle and .fbmod export.",
+      "source": "./",
+      "category": "tooling",
+      "tags": [
+        "frosty",
+        "frostbite",
+        "ebx",
+        "mcp",
+        "modding"
+      ]
+    }
+  ]
+}
