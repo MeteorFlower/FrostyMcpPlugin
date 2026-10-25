@@ -251,7 +251,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["skipped_count"] = skipped.Count,
                     ["added"] = added,
                     ["skipped"] = skipped,
-                    ["warning"] = "Do NOT register MpSoldierAI — causes Giant's Shadow crash"
+                    ["warning"] = IsBattlefield1()
+                        ? "Do NOT register MpSoldierAI — causes Giant's Shadow crash"
+                        : null
                 };
             }
             catch (Exception ex)
@@ -533,6 +535,13 @@ namespace FrostyMcpPlugin.Bridge
                 return n.IndexOf("NetworkRegistry", StringComparison.OrdinalIgnoreCase) >= 0;
             }
             catch { return false; }
+        }
+
+        private static bool IsBattlefield1()
+        {
+            string profile = FrostySdk.ProfilesLibrary.ProfileName ?? "";
+            return profile.IndexOf("Battlefield1", StringComparison.OrdinalIgnoreCase) >= 0
+                || profile.IndexOf("Battlefield 1", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static List<PointerRef> ParsePointerList(JObject p, out string error)

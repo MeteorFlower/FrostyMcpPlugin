@@ -279,6 +279,14 @@ namespace FrostyMcpPlugin.Bridge
                 newEntry.ModifiedEntry.DependentAssets.AddRange(newAsset.Dependencies);
 
                 bool copyLinked = p.Value<bool?>("copy_linked") ?? false;
+                var sharedLinked = new List<string>();
+                if (!copyLinked)
+                {
+                    // Without copy_linked the duplicate keeps pointing at the source
+                    // RES/Chunk, so editing one changes both. Say so.
+                    foreach (AssetEntry linkedEntry in entry.LinkedAssets)
+                        sharedLinked.Add(linkedEntry.Type + ":" + linkedEntry.Name);
+                }
                 if (copyLinked)
                 {
                     // Best-effort: duplicate linked res/chunks when present on root
@@ -288,14 +296,22 @@ namespace FrostyMcpPlugin.Bridge
                 newAsset.Update();
                 App.AssetManager.ModifyEbx(newEntry.Name, newAsset);
 
-                return new Dictionary<string, object>
+                var result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["source"] = McpHandlers.SerializeEbxEntry(entry),
                     ["asset"] = McpHandlers.SerializeEbxEntry(newEntry),
                     ["file_guid"] = newAsset.FileGuid.ToString(),
-                    ["class_guid"] = newAsset.RootInstanceGuid.ToString()
+                    ["class_guid"] = newAsset.RootInstanceGuid.ToString(),
+                    ["copy_linked"] = copyLinked,
+                    ["shared_linked_assets"] = sharedLinked
                 };
+                if (sharedLinked.Count > 0)
+                {
+                    result["linked_assets_shared"] = true;
+                    result["warning"] = "The duplicate shares these resources with the source; editing either changes both";
+                }
+                return result;
             }
             catch (Exception ex)
             {
@@ -868,14 +884,27 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                bool existed = App.AssetManager.GetBundleId(name) >= 0;
                 BundleEntry be = App.AssetManager.AddBundle(name, bundleType, sbIndex);
+                string existingSuper = App.AssetManager.GetSuperBundle(be.SuperBundleId)?.Name;
+                bool typeMatches = be.Type == bundleType;
+                bool superMatches = be.SuperBundleId == sbIndex;
+
                 return new Dictionary<string, object>
                 {
+                    // AddBundle returns the existing entry when the name is taken,
+                    // so report what it actually is instead of implying a create.
                     ["success"] = true,
                     ["name"] = be.Name,
                     ["type"] = be.Type.ToString(),
+                    ["requested_type"] = bundleType.ToString(),
+                    ["type_matches"] = typeMatches,
                     ["added"] = be.Added,
-                    ["super_bundle"] = App.AssetManager.GetSuperBundle(be.SuperBundleId)?.Name,
+                    ["existing"] = existed,
+                    ["created"] = !existed,
+                    ["super_bundle"] = existingSuper,
+                    ["requested_super_bundle"] = App.AssetManager.GetSuperBundle(sbIndex)?.Name,
+                    ["super_matches"] = superMatches,
                     ["bundle_id"] = App.AssetManager.GetBundleId(be.Name)
                 };
             }
@@ -2064,7 +2093,7 @@ namespace FrostyMcpPlugin.Bridge
                 import.Invoke(importer, new object[] { path, meshSet, asset, entry, settings, task }));
         }
 
-        private static object CreateTaskWindow()
+        internal static object CreateTaskWindow()
         {
             Type taskType = FindType("Frosty.Core.Windows.FrostyTaskWindow");
             if (taskType == null)

@@ -31,6 +31,8 @@ namespace FrostyMcpPlugin.Bridge
                 ["get_type_field"] = McpTypeExplorerHandlers.GetTypeField,
                 ["list_type_namespaces"] = McpTypeExplorerHandlers.ListTypeNamespaces,
                 ["find_references"] = McpEditHandlers.FindReferences,
+                ["find_pointer_references"] = McpRefHandlers.FindPointerReferences,
+                ["insert_ebx_item"] = McpRefHandlers.InsertEbxItem,
 
                 // EBX edit
                 ["get_ebx_property"] = McpEditHandlers.GetEbxProperty,
@@ -134,6 +136,8 @@ namespace FrostyMcpPlugin.Bridge
                 ["create_asset"] = McpAssetCreateHandlers.CreateAsset,
                 ["can_be_loaded_by_bundle"] = McpBulkHandlers.CanBeLoadedByBundle,
                 ["manage_bundles"] = McpBulkHandlers.ManageBundles,
+                ["check_asset_ready"] = McpBulkHandlers.CheckAssetReady,
+                ["refresh_mesh_variations"] = McpBulkHandlers.RefreshMeshVariations,
                 ["import_project"] = McpMergeHandlers.ImportProject,
                 ["get_sound_info"] = McpMediaHandlers.GetSoundInfo,
                 ["export_sound_wav"] = McpMoreHandlers.ExportSoundWav,

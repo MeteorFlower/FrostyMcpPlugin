@@ -99,6 +99,7 @@
     <Compile Include="Bridge\McpMergeHandlers.cs" />
     <Compile Include="Bridge\McpSoundHandlers.cs" />
     <Compile Include="Bridge\McpAssetCreateHandlers.cs" />
+    <Compile Include="Bridge\McpRefHandlers.cs" />
     <Compile Include="Bridge\PipeProfiles.g.cs" />
     <Compile Include="Bridge\McpTypeExplorerHandlers.cs" />
     <Compile Include="Extensions\McpStartupAction.cs" />

@@ -744,6 +744,37 @@ async def get_asset_dependencies(name: str = "", guid: str = "", recursive: bool
 
 
 @mcp.tool()
+async def find_pointer_references(name: str = "", file_guid: str = "", class_guid: str = "",
+                                  query: str = "", max_scan: int = 3000,
+                                  offset: int = 0, limit: int = 200) -> str:
+    """Find every External PointerRef that points at an asset (and optionally one class GUID).
+
+    The dependency graph only tracks file-level GUIDs; this walks the pointer
+    fields so component-level references are visible. Bounded by max_scan.
+    """
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "find_pointer_references", {
+        "name": name, "file_guid": file_guid, "class_guid": class_guid, "query": query,
+        "max_scan": max_scan, "offset": offset, "limit": limit,
+    }))
+
+
+@mcp.tool()
+async def insert_ebx_item(name: str = "", guid: str = "", path: str = "", class_guid: str = "",
+                          index: int = -1, source_index: int = -1) -> str:
+    """Insert an element into an EBX array, mirroring the property grid's Insert item.
+
+    With source_index the element at that position is reused; otherwise a default
+    value is inserted (a null PointerRef for PointerRef lists).
+    """
+    params = {"name": name, "guid": guid, "path": path, "class_guid": class_guid}
+    if index >= 0:
+        params["index"] = index
+    if source_index >= 0:
+        params["source_index"] = source_index
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "insert_ebx_item", params))
+
+
+@mcp.tool()
 async def get_type_info(
     name: str,
     declared_only: bool = True,
@@ -2584,6 +2615,20 @@ async def import_project(path: str = "", overwrite_modified: bool = False, commi
     return format_result(await asyncio.to_thread(frosty_client.send_command, "import_project", {
         "path": path, "overwrite_modified": overwrite_modified, "commit": commit,
     }))
+
+
+@mcp.tool()
+async def check_asset_ready(name: str = "", guid: str = "", bundle: str = "") -> str:
+    """Report whether a bundle has everything the asset needs (deps and linked assets)."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "check_asset_ready", {
+        "name": name, "guid": guid, "bundle": bundle,
+    }))
+
+
+@mcp.tool()
+async def refresh_mesh_variations() -> str:
+    """Reload Frosty's MeshVariationDb, the same pass the Refresh Mesh Variations menu runs."""
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "refresh_mesh_variations", {}))
 
 
 @mcp.tool()
