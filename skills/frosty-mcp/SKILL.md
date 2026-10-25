@@ -5,18 +5,19 @@ description: Use the Frosty Editor MCP bridge to inspect and edit Frostbite EBX 
 
 # Frosty Editor MCP
 
-Wraps a running Frosty Editor through a named pipe. 160 tools.
+Wraps a running Frosty Editor through a named pipe. 162 tools.
 
 ## Servers and prerequisites
 
-The plugin registers one server per Frosty profile it supports, named `frosty-<profile>`.
-Tool names and arguments are identical across them; only the editor behind the pipe
-differs. Use the server that matches the profile you are editing.
+One MCP server can drive several editors. Each running editor listens on its own pipe,
+named `Frosty_MCP_Bridge_v1_<profile>`. The server follows the only editor that is running;
+with more than one open it refuses to guess and asks for `use_profile`, which pins every
+later call to one pipe. `FROSTY_MCP_PROFILE` does the same thing at startup.
 
 The bridge lives inside the editor process. Nothing works until Frosty Editor is running
-with a profile loaded; the pipe name is derived from that profile at startup, so it cannot
-be switched without restarting the editor. Profiles are chosen by hand in the editor's
-launcher window; no tool can do it.
+with a profile loaded. Each editor's pipe name is fixed when it starts, so a running
+editor cannot change profile: start another editor for another game and switch with
+`use_profile`. The profile itself is chosen by hand in the editor's launcher window.
 
 ## Before anything else
 
@@ -59,6 +60,8 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 
 ### Connectivity and editor state
 - `ping`: reachability, version, pipe name.
+- `list_profiles`: which editors are listening, and which pipe this server uses.
+- `use_profile`: point later calls at one editor, or return to auto detection.
 - `capabilities`: profile, project-open flag, plugin availability, localization DB.
 - `get_editor_info`: profile, packs, EBX count, dirty count, SDK version, selection.
 - `get_selected_asset`: the Data Explorer selection and the opened editor tab.
@@ -271,6 +274,7 @@ code; messages change.
 | `NOT_A_BLUEPRINT` / `NOT_A_SOUND` | Asset type does not carry the arrays or scans asked for |
 | `PREVIEW_ONLY` | A two-phase tool was called without `commit: true` |
 | `COMMIT_REQUIRED` | `commit: true` without a matching immediately preceding preview |
+| `PROFILE_NOT_RUNNING` | `use_profile` named a profile that no editor is listening on |
 | `DIRTY_PROJECT` | Operation refused while the project has unsaved changes |
 | `ASSETS_LOST` | `open_project` failed after the editor had already unloaded the old project |
 | `NOTHING_TO_EXPORT` | `export_mod` on a project with no modifications |
@@ -336,6 +340,8 @@ created. A false `type_matches` means the name is taken by a bundle of another t
 
 **`limit: 0` means zero rows, not the default.** It is the way to read `total` alone. A
 page-length field means the array was capped; compare it with the paired count.
+
+**`use_profile` is process wide and stays in effect.** It changes the pipe every later call uses, not just the next one, and two clients sharing one server entry will both jump to the newly chosen editor. Call it back with no argument to return to auto detection, and check `active_pipe` in the reply before a long edit. When two callers must talk to two editors at the same time, give each its own server entry with `FROSTY_MCP_PROFILE` instead.
 
 **`search_ebx` matches asset names and types, not field values.** Looking for who uses a component type or a GUID returns nothing useful from it. `search_ebx_fields` searches field names and values, `find_pointer_references` answers which assets point at one object, and `find_references` answers the same for a whole file. There is no whole-database scan, so scope every search with `query` or a type.
 

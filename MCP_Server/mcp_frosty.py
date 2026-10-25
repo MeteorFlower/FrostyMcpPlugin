@@ -156,28 +156,35 @@ def _load_pipe_profiles():
     return profiles
 
 
-def _detect_running_pipe():
-    """Find the open bridge pipe when no profile was requested.
+PIPE_NAME_PREFIX = "Frosty_MCP_Bridge_v1_"
 
-    One editor is the normal case, so the only pipe wins. Several editors need
-    FROSTY_MCP_PROFILE, because picking one of them silently would talk to the
-    wrong game.
-    """
-    prefix = "Frosty_MCP_Bridge_v1_"
+
+def _open_bridge_pipes():
+    """Every bridge pipe the editor is currently listening on, by profile suffix."""
     pipe_root = "\\\\.\\pipe\\"
     try:
         names = os.listdir(pipe_root)
     except OSError:
-        return None
+        return []
 
-    matches = [n for n in names if n.startswith(prefix)]
-    if len(matches) == 1:
-        debug_log("using the only open bridge pipe: " + matches[0])
-        return PIPE_PREFIX + "_" + matches[0][len(prefix):]
-    if len(matches) > 1:
+    return sorted(n[len(PIPE_NAME_PREFIX):] for n in names if n.startswith(PIPE_NAME_PREFIX))
+
+
+def _detect_running_pipe():
+    """Find the open bridge pipe when no profile was requested.
+
+    One editor is the normal case, so the only pipe wins. Several editors are
+    listed instead of guessed at, because connecting to the wrong one edits the
+    wrong game.
+    """
+    profiles = _open_bridge_pipes()
+    if len(profiles) == 1:
+        debug_log("using the only open bridge pipe: " + profiles[0])
+        return PIPE_PREFIX + "_" + profiles[0]
+    if len(profiles) > 1:
         debug_log(
-            "several bridge pipes are open; set FROSTY_MCP_PROFILE to choose one: "
-            + ", ".join(sorted(n[len(prefix):] for n in matches))
+            "several bridge pipes are open; call use_profile to choose one: "
+            + ", ".join(profiles)
         )
     return None
 
@@ -264,6 +271,9 @@ class FrostyNamedPipeBridgeClient:
         # the race, so a timed-out pipe never stays open for good.
         self._orphan_lock = threading.Lock()
         self._orphans = set()
+        # Pipe chosen by use_profile, or None when the server follows whichever
+        # editor is running.
+        self.pinned_pipe = None
         if win32file is None or pywintypes is None:
             raise RuntimeError(
                 "Named pipe transport requires Windows and pywin32. "
@@ -281,7 +291,9 @@ class FrostyNamedPipeBridgeClient:
             if self.handle is not None:
                 return True
 
-            if PIPE_NAME_IS_AUTO:
+            if self.pinned_pipe:
+                PIPE_NAME = self.pinned_pipe
+            elif PIPE_NAME_IS_AUTO:
                 detected = _detect_running_pipe()
                 if detected:
                     PIPE_NAME = detected
@@ -399,6 +411,13 @@ class FrostyNamedPipeBridgeClient:
                     break
                 time.sleep(0.2 * (attempt + 1))
             if not connected:
+                running = _open_bridge_pipes()
+                if len(running) > 1:
+                    raise ConnectionError(
+                        "Several editors are listening (%s) and FROSTY_MCP_PROFILE is not set. "
+                        "Call use_profile with one of them first."
+                        % ", ".join(running)
+                    )
                 raise ConnectionError(
                     "Frosty MCP Bridge is not reachable at %s. "
                     "Start Frosty Editor with FrostyMcpPlugin loaded first."
@@ -433,6 +452,23 @@ class FrostyNamedPipeBridgeClient:
             return response["result"]
         return response
 
+    def set_pipe(self, pipe_name):
+        """Point every later call at one pipe. None returns to auto detection."""
+        global PIPE_NAME
+        with self._lock:
+            handle = self.handle
+            self.handle = None
+            self.pinned_pipe = pipe_name
+            if pipe_name:
+                PIPE_NAME = pipe_name
+            else:
+                PIPE_NAME = _detect_running_pipe() or PIPE_PREFIX
+        if handle is not None:
+            try:
+                win32file.CloseHandle(handle)
+            except Exception:
+                pass
+
     def close(self):
         with self._lock:
             handle = self.handle
@@ -464,6 +500,53 @@ mcp = FastMCP(
         "Run capabilities() first to see which optional plugins are loaded."
     ),
 )
+
+
+@mcp.tool()
+async def list_profiles() -> str:
+    """List the editors currently listening, and which one this server talks to.
+
+    One bridge pipe exists per running editor, named after its profile. The
+    active pipe is the one every other tool call goes to.
+    """
+    return format_result({
+        "success": True,
+        "active_pipe": PIPE_NAME,
+        "pinned": frosty_client.pinned_pipe,
+        "profiles": _open_bridge_pipes(),
+    })
+
+
+@mcp.tool()
+async def use_profile(profile: str = "", pipe: str = "") -> str:
+    """Point every later tool call at one running editor.
+
+    profile is the suffix list_profiles reports, for example PVZBattleforNeighborville.
+    pipe takes a full pipe path when the name is not enough. Passing neither returns
+    to auto detection, which follows the only editor that is running and refuses to
+    guess when there are several.
+    """
+    wanted = (pipe or "").strip()
+    if not wanted:
+        name = (profile or "").strip()
+        if name:
+            available = _open_bridge_pipes()
+            if name not in available:
+                return format_result({
+                    "success": False,
+                    "error": "No editor is listening on profile " + name,
+                    "error_code": "PROFILE_NOT_RUNNING",
+                    "profiles": available,
+                })
+            wanted = PIPE_PREFIX + "_" + name
+
+    frosty_client.set_pipe(wanted or None)
+    return format_result({
+        "success": True,
+        "active_pipe": PIPE_NAME,
+        "pinned": frosty_client.pinned_pipe,
+        "profiles": _open_bridge_pipes(),
+    })
 
 
 @mcp.tool()
