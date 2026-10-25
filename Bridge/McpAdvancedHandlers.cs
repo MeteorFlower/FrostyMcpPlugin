@@ -246,7 +246,7 @@ namespace FrostyMcpPlugin.Bridge
                     ["network_valid"] = net,
                     ["mesh_variation_valid"] = mv,
                     ["op_add_valid"] = op,
-                    ["already_in_bundle"] = entry.IsInBundle(App.AssetManager.GetBundleId(bundle))
+                    ["already_in_bundle"] = entry.EnumerateBundles().Contains(App.AssetManager.GetBundleId(bundle))
                 };
             }
             catch (Exception ex)
@@ -314,6 +314,24 @@ namespace FrostyMcpPlugin.Bridge
             if (bid < 0)
                 return McpHandlers.Error("Bundle not found", "NOT_FOUND");
 
+            BundleEntry be = App.AssetManager.GetBundleEntry(bid);
+
+            // A .fbmod only carries Added bundles, so re-pointing a vanilla bundle
+            // changes the editor view and nothing else. Refuse unless forced.
+            bool force = p.Value<bool?>("force") ?? false;
+            if (!be.Added && !force)
+            {
+                return new Dictionary<string, object>
+                {
+                    ["success"] = false,
+                    ["error"] = "Bundle is vanilla; changing its super bundle would not be written to a .fbmod",
+                    ["error_code"] = "NOT_EXPORTED",
+                    ["bundle"] = be.Name,
+                    ["bundle_id"] = bid,
+                    ["game_effect"] = "none"
+                };
+            }
+
             int sbIndex = App.AssetManager.GetSuperBundleId(superName);
             if (sbIndex < 0)
             {
@@ -323,7 +341,6 @@ namespace FrostyMcpPlugin.Bridge
             if (sbIndex < 0)
                 return McpHandlers.Error("SuperBundle not found and could not be created", "NOT_FOUND");
 
-            BundleEntry be = App.AssetManager.GetBundleEntry(bid);
             int oldIndex = be.SuperBundleId;
             be.SuperBundleId = sbIndex;
 
@@ -332,6 +349,8 @@ namespace FrostyMcpPlugin.Bridge
                 ["success"] = true,
                 ["bundle"] = be.Name,
                 ["bundle_id"] = bid,
+                ["added_bundle"] = be.Added,
+                ["game_effect"] = be.Added ? "mod" : "none",
                 ["old_super_bundle"] = App.AssetManager.GetSuperBundle(oldIndex)?.Name,
                 ["super_bundle"] = App.AssetManager.GetSuperBundle(sbIndex)?.Name
             };
@@ -680,7 +699,11 @@ namespace FrostyMcpPlugin.Bridge
 
             return new Dictionary<string, object>
             {
-                ["success"] = true,
+                // A failed section scan means the asset was not fully checked, so
+                // this must not look like a clean pass.
+                ["success"] = scanErrors.Count == 0,
+                ["error"] = scanErrors.Count == 0 ? null : "One or more connection sections could not be read",
+                ["error_code"] = scanErrors.Count == 0 ? null : "SCAN_INCOMPLETE",
                 ["name"] = entry.Name,
                 ["property_count"] = propCount,
                 ["event_count"] = eventCount,
@@ -809,7 +832,8 @@ namespace FrostyMcpPlugin.Bridge
         {
             int flags = 0;
             try { flags = (int)connection.Flags; } catch { return; }
-            int realm = flags & 0xF;
+            // realm is bits 0-2; bit 3 is source_cant_be_static.
+            int realm = flags & 0x7;
             int propType = (flags >> 4) & 0x3;
             if (realm < 0 || realm > 5)
             {

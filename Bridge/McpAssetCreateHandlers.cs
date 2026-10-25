@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.Managers;
 using FrostySdk.Managers.Entries;
@@ -33,6 +33,7 @@ namespace FrostyMcpPlugin.Bridge
             string basedOn = (p.Value<string>("based_on") ?? "").Trim();
             string newTypeName = (p.Value<string>("new_type") ?? "").Trim();
             string bundleName = (p.Value<string>("bundle") ?? "").Trim();
+            bool copyBundles = p.Value<bool?>("copy_bundles") ?? false;
 
             if (string.IsNullOrEmpty(typeName) && string.IsNullOrEmpty(basedOn))
                 return McpHandlers.Error("type or based_on is required", "INVALID_PARAMS");
@@ -111,6 +112,16 @@ namespace FrostyMcpPlugin.Bridge
                     if (created == null)
                         return McpHandlers.Error("Asset handler returned no entry", "CREATE_FAILED");
 
+                    // BaseAssetHandler.Create copies the source bundle memberships in.
+                    // Drop them unless the caller asked for them, so a new asset does
+                    // not land next to its original.
+                    int inheritedBundles = created.AddedBundles.Count;
+                    if (!copyBundles && basedOnEntry != null)
+                    {
+                        created.AddedBundles.Clear();
+                        created.IsDirty = true;
+                    }
+
                     if (bundleId >= 0)
                         McpHandlers.AddToBundleExportable(created, bundleId);
 
@@ -119,6 +130,8 @@ namespace FrostyMcpPlugin.Bridge
                         ["success"] = true,
                         ["handler"] = handlerType,
                         ["asset"] = McpHandlers.SerializeEbxEntry(created),
+                        ["inherited_bundles"] = inheritedBundles,
+                        ["copy_bundles"] = copyBundles,
                         ["linked_assets"] = created.LinkedAssets.Select(McpHandlers.SerializeAssetEntry).ToList()
                     };
                 }

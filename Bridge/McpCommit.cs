@@ -70,15 +70,19 @@ namespace FrostyMcpPlugin.Bridge
                     };
                 }
 
-                var response = new Dictionary<string, object>
+                // Nothing was applied yet, so this is not a success. Treating the
+                // preview as success is how a caller ends up believing the change
+                // happened when only the plan exists.
+                return new Dictionary<string, object>
                 {
-                    ["success"] = true,
+                    ["success"] = false,
+                    ["error"] = "Preview only; repeat the same call with commit=true to apply it",
+                    ["error_code"] = "PREVIEW_ONLY",
                     ["would_change"] = true,
                     ["commit_required"] = true,
                     ["tool"] = tool,
                     ["plan"] = plan
                 };
-                return response;
             }
 
             Func<object> pendingExecute = null;

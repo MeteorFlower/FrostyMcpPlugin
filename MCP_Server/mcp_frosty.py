@@ -289,21 +289,36 @@ class FrostyNamedPipeBridgeClient:
 
         result_holder = {}
         error_holder = {}
+        state = {"handle": self.handle, "orphaned": False}
 
         def _worker():
             try:
                 result_holder["response"] = self._exchange_once(req_json)
             except Exception as exc:
                 error_holder["error"] = exc
+            finally:
+                # A timed-out request keeps the pipe until the editor answers.
+                # Closing that handle here, rather than from the timing thread,
+                # stops Windows from handing the same handle value to a new
+                # connection while this read is still in flight.
+                if state["orphaned"]:
+                    try:
+                        win32file.CloseHandle(state["handle"])
+                    except Exception:
+                        pass
 
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
         worker.join(timeout)
 
         if worker.is_alive():
-            self.close()
+            state["orphaned"] = True
+            # Detach the handle so this client opens a fresh pipe next time; the
+            # worker closes the old one when the editor finally replies.
+            self.handle = None
             raise TimeoutError(
-                f"Command '{method}' timed out after {timeout:g}s (FROSTY_MCP_TIMEOUT)."
+                f"Command '{method}' timed out after {timeout:g}s (FROSTY_MCP_TIMEOUT). "
+                "The request may still be running in the editor."
             )
 
         if "error" in error_holder:
@@ -316,7 +331,13 @@ class FrostyNamedPipeBridgeClient:
         # the editor did not run the command, so resending could duplicate a
         # create/duplicate/add. Reconnect happens on the next explicit call.
         if not self.connected:
-            if not self.connect():
+            connected = False
+            for attempt in range(3):
+                if self.connect():
+                    connected = True
+                    break
+                time.sleep(0.2 * (attempt + 1))
+            if not connected:
                 raise ConnectionError(
                     "Frosty MCP Bridge is not reachable at %s. "
                     "Start Frosty Editor with FrostyMcpPlugin loaded first."
@@ -343,9 +364,10 @@ class FrostyNamedPipeBridgeClient:
                 return {
                     "success": False,
                     "error": error.get("message", str(error)),
-                    "error_code": error.get("code"),
+                    "error_code": "RPC_ERROR",
+                    "rpc_code": error.get("code"),
                 }
-            return {"success": False, "error": str(error)}
+            return {"success": False, "error": str(error), "error_code": "RPC_ERROR"}
         if "result" in response:
             return response["result"]
         return response
@@ -706,17 +728,19 @@ async def get_bundle(name: str, offset: int = 0, limit: int = 100) -> str:
 
 @mcp.tool()
 async def get_asset_dependencies(name: str = "", guid: str = "", recursive: bool = False,
-                                max_nodes: int = 2000) -> str:
+                                max_nodes: int = 0, compact: bool = False,
+                                offset: int = 0, limit: int = 200) -> str:
     """List EBX dependencies / linked assets for an EBX asset.
 
-    recursive=True walks the transitive dependency graph up to max_nodes.
+    recursive=True walks the transitive graph; the walk stops at max_nodes
+    (default 200 when recursive, 2000 otherwise). compact=True returns only
+    name/type/depth per entry. Results are paged with offset/limit.
     """
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_asset_dependencies", {
-        "name": name,
-        "guid": guid,
-        "recursive": recursive,
-        "max_nodes": max_nodes,
-    }))
+    params = {"name": name, "guid": guid, "recursive": recursive, "compact": compact,
+              "offset": offset, "limit": limit}
+    if max_nodes > 0:
+        params["max_nodes"] = max_nodes
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "get_asset_dependencies", params))
 
 
 @mcp.tool()
@@ -1181,10 +1205,14 @@ async def update_property_connection(
     target_field: str = "",
     realm: str = "",
     prop_type: str = "",
-    source_cant_be_static: bool = False,
+    source_cant_be_static: bool = None,
     flags: str = "",
 ) -> str:
-    """Update an existing PropertyConnection by index (fields/flags optional)."""
+    """Update an existing PropertyConnection by index (fields/flags optional).
+
+    Omitted fields keep their current value; source_cant_be_static is only sent
+    when explicitly given.
+    """
     params = {"name": name, "guid": guid, "index": index}
     if source_guid:
         params["source_guid"] = source_guid
@@ -1200,7 +1228,8 @@ async def update_property_connection(
         params["prop_type"] = prop_type
     if flags:
         params["flags"] = flags
-    params["source_cant_be_static"] = source_cant_be_static
+    if source_cant_be_static is not None:
+        params["source_cant_be_static"] = source_cant_be_static
     return format_result(await asyncio.to_thread(frosty_client.send_command, "update_property_connection", params))
 
 
@@ -2228,12 +2257,11 @@ async def setup_lua(
         params["path"] = path
     try:
         params["input_events"] = _json.loads(input_events_json) if input_events_json else []
-    except Exception:
-        params["input_events"] = []
-    try:
         params["output_events"] = _json.loads(output_events_json) if output_events_json else []
-    except Exception:
-        params["output_events"] = []
+    except Exception as exc:
+        return format_result({"success": False,
+                              "error": "input_events_json / output_events_json is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
     return format_result(await asyncio.to_thread(frosty_client.send_command, "setup_lua", params))
 
 
@@ -2363,12 +2391,13 @@ async def create_schematic_channel_entity(
     }
     try:
         params["input_properties"] = _json.loads(input_properties_json) if input_properties_json else []
-    except Exception:
-        params["input_properties"] = []
-    try:
         params["output_properties"] = _json.loads(output_properties_json) if output_properties_json else []
-    except Exception:
-        params["output_properties"] = []
+        params["input_ref_properties"] = _json.loads(input_ref_properties_json) if input_ref_properties_json else []
+        params["output_ref_properties"] = _json.loads(output_ref_properties_json) if output_ref_properties_json else []
+    except Exception as exc:
+        return format_result({"success": False,
+                              "error": "schematic property list is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
     try:
         params["input_ref_properties"] = _json.loads(input_ref_properties_json) if input_ref_properties_json else []
     except Exception:
@@ -2510,7 +2539,8 @@ async def project_stats() -> str:
 
 @mcp.tool()
 async def create_asset(name: str = "", type: str = "", based_on: str = "", based_on_guid: str = "",
-                      new_type: str = "", bundle: str = "", commit: bool = False) -> str:
+                      new_type: str = "", bundle: str = "", copy_bundles: bool = False,
+                      commit: bool = False) -> str:
     """Create a resource-backed asset (EBX+RES+Chunk) via PVZBundleManagerPlugin handlers.
 
     Use this instead of create_ebx for Texture/Mesh/Sound/Atlas assets.
@@ -2518,7 +2548,8 @@ async def create_asset(name: str = "", type: str = "", based_on: str = "", based
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "create_asset", {
         "name": name, "type": type, "based_on": based_on, "based_on_guid": based_on_guid,
-        "new_type": new_type, "bundle": bundle, "commit": commit,
+        "new_type": new_type, "bundle": bundle, "copy_bundles": copy_bundles,
+        "commit": commit,
     }))
 
 
@@ -2590,18 +2621,26 @@ async def save_project_copy(path: str = "", overwrite: bool = False) -> str:
 
 
 @mcp.tool()
-async def open_project(path: str = "", save_first: bool = False) -> str:
-    """Open another .fbproject. Refuses when the current project is dirty unless save_first=True."""
+async def open_project(path: str = "", save_first: bool = False, discard: bool = False) -> str:
+    """Open another .fbproject.
+
+    Refuses when the current project is dirty: pass save_first=True to save it
+    first, or discard=True to drop the unsaved changes.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "open_project", {
-        "path": path, "save_first": save_first,
+        "path": path, "save_first": save_first, "discard": discard,
     }))
 
 
 @mcp.tool()
-async def new_project(save_first: bool = False) -> str:
-    """Start a blank project. Refuses when the current project is dirty unless save_first=True."""
+async def new_project(save_first: bool = False, discard: bool = False) -> str:
+    """Start a blank project.
+
+    Refuses when the current project is dirty: pass save_first=True to save it
+    first, or discard=True to drop the unsaved changes.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "new_project", {
-        "save_first": save_first,
+        "save_first": save_first, "discard": discard,
     }))
 
 
@@ -2648,9 +2687,12 @@ async def set_mod_settings(title: str = "", author: str = "", category: str = ""
 @mcp.tool()
 async def export_mod(path: str = "", overwrite: bool = False, title: str = "", author: str = "",
                      category: str = "", version: str = "", description: str = "",
-                     link: str = "", icon_path: str = "") -> str:
-    """Write a .fbmod from the current project. This never runs automatically."""
-    params = {"path": path, "overwrite": overwrite}
+                     link: str = "", icon_path: str = "", allow_empty: bool = False) -> str:
+    """Write a .fbmod from the current project. This never runs automatically.
+
+    A project with no modifications is refused unless allow_empty=True.
+    """
+    params = {"path": path, "overwrite": overwrite, "allow_empty": allow_empty}
     for key, value in (("title", title), ("author", author), ("category", category),
                        ("version", version), ("description", description),
                        ("link", link), ("icon_path", icon_path)):
@@ -2696,11 +2738,21 @@ async def unlink_asset(kind: str = "ebx", name: str = "", guid: str = "",
 
 
 @mcp.tool()
-async def check_guid_invariants(limit: int = 100) -> str:
-    """Scan EBX entries for entry.Guid != asset.FileGuid and duplicate file GUIDs."""
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "check_guid_invariants", {
-        "limit": limit,
-    }))
+async def check_guid_invariants(limit: int = 100, max_scan: int = 5000, query: str = "",
+                                added_only: bool = False, names_json: str = "[]") -> str:
+    """Scan EBX entries for entry.Guid != asset.FileGuid and duplicate file GUIDs.
+
+    The scan is bounded by max_scan (default 5000 assets); narrow it with query,
+    added_only or names_json for a full project sweep in several calls.
+    """
+    import json as _json
+    params = {"limit": limit, "max_scan": max_scan, "query": query, "added_only": added_only}
+    try:
+        params["names"] = _json.loads(names_json) if names_json else []
+    except Exception as exc:
+        return format_result({"success": False, "error": "names_json is not valid JSON: %s" % exc,
+                              "error_code": "INVALID_PARAMS"})
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "check_guid_invariants", params))
 
 
 @mcp.tool()
@@ -2732,10 +2784,16 @@ async def bundle_closure_check(bundle: str = "", include_outside: bool = False, 
 
 
 @mcp.tool()
-async def registry_gap(name: str = "", names: list = [], registry: str = "", registries: list = [], limit: int = 200) -> str:
-    """Compare an asset's exported object GUIDs against NetworkRegistry entries and list what is missing."""
+async def registry_gap(name: str = "", names: list = [], registry: str = "", registries: list = [],
+                       limit: int = 200, max_registries: int = 8) -> str:
+    """Compare an asset's exported object GUIDs against NetworkRegistry entries and list what is missing.
+
+    When no registry is named, up to max_registries discovered NetworkRegistryAsset
+    names are checked; registries_skipped reports how many were left out.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "registry_gap", {
-        "name": name, "names": names, "registry": registry, "registries": registries, "limit": limit,
+        "name": name, "names": names, "registry": registry, "registries": registries,
+        "limit": limit, "max_registries": max_registries,
     }))
 
 

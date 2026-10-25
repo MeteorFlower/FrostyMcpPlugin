@@ -640,6 +640,7 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
 
             var linked = new List<string>();
+            var errors = new List<object>();
 
             try
             {
@@ -671,7 +672,7 @@ namespace FrostyMcpPlugin.Bridge
                             entry.LinkAsset(chunk);
                         }
                     }
-                    catch (Exception ex) { linked.Add("movie_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "movie", ["error"] = ex.Message }); }
                 }
                 else if (type.IndexOf("NewWave", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
@@ -686,7 +687,7 @@ namespace FrostyMcpPlugin.Bridge
                         }
                         AddChunkListToBundle(entry, root, bid, linked);
                     }
-                    catch (Exception ex) { linked.Add("newwave_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "newwave", ["error"] = ex.Message }); }
                 }
                 else if (TypeLibrary.IsSubClassOf(type, "TextureBaseAsset") || type.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
@@ -709,7 +710,7 @@ namespace FrostyMcpPlugin.Bridge
                             entry.LinkAsset(resEntry);
                         }
                     }
-                    catch (Exception ex) { linked.Add("texture_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "texture", ["error"] = ex.Message }); }
                 }
                 else if (TypeLibrary.IsSubClassOf(type, "MeshAsset") || type.EndsWith("MeshAsset", StringComparison.OrdinalIgnoreCase))
                 {
@@ -740,12 +741,12 @@ namespace FrostyMcpPlugin.Bridge
                             }
                         }
                     }
-                    catch (Exception ex) { linked.Add("mesh_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "mesh", ["error"] = ex.Message }); }
                 }
                 else if (type.IndexOf("SoundWave", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     try { AddChunkListToBundle(entry, root, bid, linked); }
-                    catch (Exception ex) { linked.Add("sound_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "sound", ["error"] = ex.Message }); }
                 }
                 else
                 {
@@ -776,18 +777,36 @@ namespace FrostyMcpPlugin.Bridge
                             }
                         }
                     }
-                    catch (Exception ex) { linked.Add("resource_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "resource", ["error"] = ex.Message }); }
+                }
+
+                if (!ebxAdded && linked.Count == 0 && errors.Count == 0)
+                {
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Asset is already a member and has no resources left to add",
+                        ["error_code"] = "NOT_MEMBER",
+                        ["name"] = entry.Name,
+                        ["bundle"] = bundleName
+                    };
                 }
 
                 return new Dictionary<string, object>
                 {
-                    ["success"] = true,
+                    // A sub-step failure means the bundle is not complete, so the
+                    // call cannot report success.
+                    ["success"] = errors.Count == 0,
+                    ["error"] = errors.Count == 0 ? null : "One or more resources could not be added",
+                    ["error_code"] = errors.Count == 0 ? null : "PARTIAL",
                     ["name"] = entry.Name,
                     ["bundle"] = bundleName,
                     ["bundle_id"] = bid,
                     ["added"] = ebxAdded,
                     ["linked"] = linked,
-                    ["linked_count"] = linked.Count
+                    ["linked_count"] = linked.Count,
+                    ["errors"] = errors,
+                    ["error_count"] = errors.Count
                 };
             }
             catch (Exception ex)

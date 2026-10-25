@@ -606,16 +606,27 @@ namespace FrostyMcpPlugin.Bridge
                     return Error("Failed to load EBX data", "LOAD_FAILED");
 
                 bool recursive = p.Value<bool?>("recursive") ?? false;
-                int maxNodes = p.Value<int?>("max_nodes") ?? 2000;
+                bool compact = p.Value<bool?>("compact") ?? recursive;
+                int maxNodes = p.Value<int?>("max_nodes") ?? (recursive ? 200 : 2000);
                 if (maxNodes < 1) maxNodes = 1;
+                int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
+                int limit = ClampLimit(p.Value<int?>("limit") ?? 200);
 
                 List<object> deps = new List<object>();
 
                 foreach (AssetEntry linked in entry.LinkedAssets)
-                    deps.Add(SerializeAssetEntry(linked));
+                    deps.Add(compact
+                        ? (object)new Dictionary<string, object>
+                        {
+                            ["linked"] = linked.Name,
+                            ["linked_type"] = linked.Type,
+                            ["depth"] = 0
+                        }
+                        : SerializeAssetEntry(linked));
 
                 HashSet<Guid> seen = new HashSet<Guid> { entry.Guid };
                 int depth = 1;
+                int missing = 0;
                 List<Guid> frontier = new List<Guid>();
                 frontier.AddRange(entry.EnumerateDependencies());
                 frontier.AddRange(asset.Dependencies);
@@ -638,9 +649,21 @@ namespace FrostyMcpPlugin.Bridge
                         EbxAssetEntry dep = App.AssetManager.GetEbxEntry(fileGuid);
                         if (dep != null)
                         {
-                            Dictionary<string, object> row = SerializeEbxEntry(dep);
-                            row["depth"] = depth;
-                            deps.Add(row);
+                            if (compact)
+                            {
+                                deps.Add(new Dictionary<string, object>
+                                {
+                                    ["name"] = dep.Name,
+                                    ["type"] = dep.Type,
+                                    ["depth"] = depth
+                                });
+                            }
+                            else
+                            {
+                                Dictionary<string, object> row = SerializeEbxEntry(dep);
+                                row["depth"] = depth;
+                                deps.Add(row);
+                            }
 
                             if (recursive)
                             {
@@ -654,9 +677,9 @@ namespace FrostyMcpPlugin.Bridge
                         }
                         else
                         {
+                            missing++;
                             deps.Add(new Dictionary<string, object>
                             {
-                                ["asset_type"] = "ebx",
                                 ["guid"] = fileGuid.ToString(),
                                 ["missing"] = true,
                                 ["depth"] = depth
@@ -669,15 +692,23 @@ namespace FrostyMcpPlugin.Bridge
                     depth++;
                 }
 
+                List<object> page = deps.Skip(offset).Take(limit).ToList();
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
                     ["guid"] = entry.Guid.ToString(),
                     ["recursive"] = recursive,
-                    ["count"] = deps.Count,
-                    ["truncated"] = truncated,
-                    ["dependencies"] = deps
+                    ["compact"] = compact,
+                    ["total"] = deps.Count,
+                    ["offset"] = offset,
+                    ["limit"] = limit,
+                    ["returned"] = page.Count,
+                    ["missing_count"] = missing,
+                    ["max_nodes"] = maxNodes,
+                    ["depth_reached"] = depth,
+                    ["truncated"] = truncated || deps.Count > offset + page.Count,
+                    ["dependencies"] = page
                 };
             }
             catch (Exception ex)
@@ -783,7 +814,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["asset_type"] = "chunk",
                 ["name"] = entry.Name,
                 ["id"] = entry.Id.ToString(),
-                ["is_modified"] = entry.IsModified,
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
                 ["size"] = entry.Size,
@@ -852,10 +882,12 @@ namespace FrostyMcpPlugin.Bridge
             };
         }
 
+        // A caller passing 0 or a negative limit is asking for no rows (usually to
+        // read only the totals); returning one row instead hides that intent.
         internal static int ClampLimit(int limit)
         {
             if (limit < 1)
-                return 1;
+                return 0;
             if (limit > MaxLimit)
                 return MaxLimit;
             return limit;

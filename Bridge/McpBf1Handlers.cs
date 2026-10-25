@@ -611,7 +611,12 @@ namespace FrostyMcpPlugin.Bridge
                         }
                         classGuid = acg;
                     }
-                    list.Add(new PointerRef(new EbxImportReference { FileGuid = a.FileGuid, ClassGuid = classGuid }));
+                    if (a.FileGuid != ae.Guid)
+                    {
+                        error = "GUID_INCONSISTENT: entry " + ae.Guid + ", file " + a.FileGuid;
+                        return list;
+                    }
+                    list.Add(new PointerRef(new EbxImportReference { FileGuid = ae.Guid, ClassGuid = classGuid }));
                 }
             }
 

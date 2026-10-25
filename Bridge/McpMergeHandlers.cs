@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.IO;
 using FrostySdk.Managers;
@@ -44,14 +44,23 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 catch (Exception ex)
                 {
-                    return McpHandlers.Error(ex.Message, "MERGE_FAILED");
+                    // Merging mutates the project as it reads, so a failure part way
+                    // through leaves whatever was already applied.
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = ex.Message,
+                        ["error_code"] = "MERGE_FAILED",
+                        ["partial_changes_possible"] = true
+                    };
                 }
             });
         }
 
         private static object Merge(string path, bool allowOverwrite)
         {
-            int bundlesAdded = 0, ebxMerged = 0, resMerged = 0, chunksMerged = 0, skipped = 0;
+            int bundlesAdded = 0, bundlesExisting = 0, ebxMerged = 0, resMerged = 0, chunksMerged = 0;
+            int skippedMissing = 0, skippedProtected = 0;
             var errors = new List<object>();
 
             using (NativeReader reader = new NativeReader(new FileStream(path, FileMode.Open, FileAccess.Read)))
@@ -98,6 +107,10 @@ namespace FrostyMcpPlugin.Bridge
                         App.AssetManager.AddBundle(name, type, App.AssetManager.GetSuperBundleId(sbName));
                         bundlesAdded++;
                     }
+                    else
+                    {
+                        bundlesExisting++;
+                    }
                 }
 
                 numItems = reader.ReadInt();
@@ -108,7 +121,8 @@ namespace FrostyMcpPlugin.Bridge
                         Name = reader.ReadNullTerminatedString(),
                         Guid = reader.ReadGuid()
                     };
-                    App.AssetManager.AddEbx(entry);
+                    if (App.AssetManager.GetEbxEntry(entry.Name) == null)
+                        App.AssetManager.AddEbx(entry);
                     entry.IsDirty = true;
                 }
 
@@ -122,7 +136,8 @@ namespace FrostyMcpPlugin.Bridge
                         ResType = reader.ReadUInt(),
                         ResMeta = reader.ReadBytes(0x10)
                     };
-                    App.AssetManager.AddRes(entry);
+                    if (App.AssetManager.GetResEntry(entry.ResRid) == null)
+                        App.AssetManager.AddRes(entry);
                 }
 
                 numItems = reader.ReadInt();
@@ -133,7 +148,8 @@ namespace FrostyMcpPlugin.Bridge
                         Id = reader.ReadGuid(),
                         H32 = reader.ReadInt()
                     };
-                    App.AssetManager.AddChunk(entry);
+                    if (App.AssetManager.GetChunkEntry(entry.Id) == null)
+                        App.AssetManager.AddChunk(entry);
                 }
 
                 var h32map = new Dictionary<int, AssetEntry>();
@@ -144,7 +160,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     string name = reader.ReadNullTerminatedString();
                     List<AssetEntry> linkedEntries = FrostyProject.LoadLinkedAssets(reader);
-                    List<int> bundles = ReadBundleList(reader, version);
+                    List<int> bundles = version >= 13 ? ReadBundleList(reader) : new List<int>();
 
                     bool isModified = reader.ReadBoolean();
                     bool isTransientModified = false;
@@ -157,7 +173,7 @@ namespace FrostyMcpPlugin.Bridge
                         if (version >= 12)
                             userData = reader.ReadNullTerminatedString();
                         if (version < 13)
-                            bundles.AddRange(ReadBundleList(reader, version));
+                            bundles.AddRange(ReadBundleList(reader));
                         if (version >= 13)
                             modifiedResource = reader.ReadBoolean();
                         data = reader.ReadBytes(reader.ReadInt());
@@ -166,13 +182,15 @@ namespace FrostyMcpPlugin.Bridge
                     EbxAssetEntry entry = App.AssetManager.GetEbxEntry(name);
                     if (entry == null)
                     {
-                        skipped++;
+                        skippedMissing++;
                         continue;
                     }
 
-                    if (!(allowOverwrite || (!entry.IsDirty && !entry.IsModified)))
+                    // Same rule the menu uses: overwrite when the user allowed it,
+                    // when the asset already has unsaved edits, or when it is untouched.
+                    if (!allowOverwrite && !entry.IsDirty && entry.IsModified)
                     {
-                        skipped++;
+                        skippedProtected++;
                         continue;
                     }
 
@@ -226,7 +244,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     string name = reader.ReadNullTerminatedString();
                     List<AssetEntry> linkedEntries = FrostyProject.LoadLinkedAssets(reader);
-                    List<int> bundles = ReadBundleList(reader, version);
+                    List<int> bundles = version >= 13 ? ReadBundleList(reader) : new List<int>();
 
                     bool isModified = reader.ReadBoolean();
                     Sha1 sha1 = Sha1.Zero;
@@ -247,7 +265,7 @@ namespace FrostyMcpPlugin.Bridge
                             userData = reader.ReadNullTerminatedString();
 
                         if (version < 13)
-                            bundles.AddRange(ReadBundleList(reader, version));
+                            bundles.AddRange(ReadBundleList(reader));
 
                         data = reader.ReadBytes(reader.ReadInt());
                     }
@@ -255,13 +273,15 @@ namespace FrostyMcpPlugin.Bridge
                     ResAssetEntry entry = App.AssetManager.GetResEntry(name);
                     if (entry == null)
                     {
-                        skipped++;
+                        skippedMissing++;
                         continue;
                     }
 
-                    if (!(allowOverwrite || (!entry.IsDirty && !entry.IsModified)))
+                    // Same rule the menu uses: overwrite when the user allowed it,
+                    // when the asset already has unsaved edits, or when it is untouched.
+                    if (!allowOverwrite && !entry.IsDirty && entry.IsModified)
                     {
-                        skipped++;
+                        skippedProtected++;
                         continue;
                     }
 
@@ -304,7 +324,7 @@ namespace FrostyMcpPlugin.Bridge
                 for (int i = 0; i < numItems; i++)
                 {
                     Guid id = reader.ReadGuid();
-                    List<int> bundles = ReadBundleList(reader, version);
+                    List<int> bundles = version >= 13 ? ReadBundleList(reader) : new List<int>();
 
                     Sha1 sha1 = Sha1.Zero;
                     uint logicalOffset = 0, logicalSize = 0, rangeStart = 0, rangeEnd = 0;
@@ -343,7 +363,7 @@ namespace FrostyMcpPlugin.Bridge
                             userData = reader.ReadNullTerminatedString();
 
                         if (version < 13)
-                            bundles.AddRange(ReadBundleList(reader, version));
+                            bundles.AddRange(ReadBundleList(reader));
 
                         data = reader.ReadBytes(reader.ReadInt());
                     }
@@ -366,7 +386,7 @@ namespace FrostyMcpPlugin.Bridge
 
                         if (entry == null)
                         {
-                            skipped++;
+                            skippedMissing++;
                             continue;
                         }
 
@@ -407,20 +427,21 @@ namespace FrostyMcpPlugin.Bridge
                 ["success"] = errors.Count == 0,
                 ["path"] = Path.GetFullPath(path),
                 ["bundles_added"] = bundlesAdded,
+                ["bundles_existing"] = bundlesExisting,
                 ["ebx_merged"] = ebxMerged,
                 ["res_merged"] = resMerged,
                 ["chunks_merged"] = chunksMerged,
-                ["skipped"] = skipped,
+                ["skipped"] = skippedMissing + skippedProtected,
+                ["skipped_missing"] = skippedMissing,
+                ["skipped_protected"] = skippedProtected,
                 ["failed_count"] = errors.Count,
                 ["failures"] = errors
             };
         }
 
-        private static List<int> ReadBundleList(NativeReader reader, uint version)
+        private static List<int> ReadBundleList(NativeReader reader)
         {
             var bundles = new List<int>();
-            if (version < 13)
-                return bundles;
 
             int length = reader.ReadInt();
             for (int i = 0; i < length; i++)

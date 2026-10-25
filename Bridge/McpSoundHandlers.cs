@@ -1,4 +1,4 @@
-using Frosty.Core;
+﻿using Frosty.Core;
 using FrostySdk;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
@@ -65,9 +65,36 @@ namespace FrostyMcpPlugin.Bridge
                 using (NativeReader reader = new NativeReader(App.AssetManager.GetChunk(existingChunk)))
                     existingBytes = reader.ReadToEnd();
 
-                int codec = p.Value<int?>("codec") ?? GuessCodec(existingBytes);
+                // The codec nibble and channel count live in the sample header at
+                // the segment's SamplesOffset, the same place the editor reads them.
+                ResAssetEntry resEntry = App.AssetManager.GetResEntry(((string)root.Name).ToLowerInvariant());
+                if (resEntry == null)
+                    return McpHandlers.Error("NewWave resource not found", "NOT_FOUND");
+
+                MethodInfo getResAs = typeof(AssetManager).GetMethods()
+                    .First(m => m.Name == "GetResAs" && m.IsGenericMethodDefinition);
+                object newWave = getResAs.MakeGenericMethod(newWaveType).Invoke(App.AssetManager, new object[] { resEntry, null });
+                if (newWave == null)
+                    return McpHandlers.Error("Resource is not a NewWaveResource", "TYPE_MISMATCH");
+
+                IList segments = (IList)newWave.GetType().GetProperty("Segments").GetValue(newWave);
+                IList variations = (IList)newWave.GetType().GetProperty("Variations").GetValue(newWave);
+
+                int segmentIndex = p["segment_index"] == null ? 0 : p.Value<int>("segment_index");
+                int variationIndex = p["variation_index"] == null ? 0 : p.Value<int>("variation_index");
+                if (segmentIndex >= segments.Count) segmentIndex = -1;
+                if (variationIndex >= variations.Count) variationIndex = -1;
+
+                uint sampleStart = 0;
+                if (segmentIndex >= 0)
+                {
+                    dynamic seg = segments[segmentIndex];
+                    sampleStart = (uint)seg.SamplesOffset & ~3u;
+                }
+
+                int codec = p.Value<int?>("codec") ?? ReadCodecNibble(existingBytes, sampleStart);
                 string codecName = CodecName(codec);
-                int channelCount = p.Value<int?>("channel_count") ?? 1;
+                int channelCount = p.Value<int?>("channel_count") ?? ReadChannelCount(existingBytes, sampleStart);
                 bool isSeekable = p.Value<bool?>("seekable") ?? (bool)((dynamic)root).IsSeekable;
 
                 object helper = toolHelperType.GetProperty("Instance",
@@ -112,15 +139,6 @@ namespace FrostyMcpPlugin.Bridge
                 Guid newChunkId = !hasStreamPool ? App.AssetManager.AddChunk(chunkData, CompressionType.None) : chunkId;
                 float duration = DurationSeconds(spsData);
 
-                ResAssetEntry resEntry = App.AssetManager.GetResEntry(((string)((dynamic)asset.RootObject).Name).ToLowerInvariant());
-                if (resEntry == null)
-                    return McpHandlers.Error("NewWave resource not found", "NOT_FOUND");
-
-                MethodInfo getResAs = typeof(AssetManager).GetMethods()
-                    .First(m => m.Name == "GetResAs" && m.IsGenericMethodDefinition);
-                object newWave = getResAs.MakeGenericMethod(newWaveType).Invoke(App.AssetManager, new object[] { resEntry, null });
-                if (newWave == null)
-                    return McpHandlers.Error("Resource is not a NewWaveResource", "TYPE_MISMATCH");
 
                 bool chunkIsAlreadyModified = existingChunk != null && existingChunk.IsAdded && !hasStreamPool;
                 dynamic chunkToModify = chunkIsAlreadyModified || hasStreamPool
@@ -170,25 +188,25 @@ namespace FrostyMcpPlugin.Bridge
                     newChunk.AddToBundles(existingChunk.AddedBundles);
                 }
 
-                int segmentIndex = p.Value<int?>("segment_index") ?? -1;
-                IList segments = (IList)newWave.GetType().GetProperty("Segments").GetValue(newWave);
-                if (segmentIndex >= 0 && segmentIndex < segments.Count)
+                bool segmentUpdated = false;
+                if (segmentIndex >= 0)
                 {
                     dynamic segment = segments[segmentIndex];
                     segment.SamplesOffset = samplesOffset;
                     segment.SeekTableOffset = seekTableOffset;
                     segment.SegmentLength = duration;
+                    segmentUpdated = true;
                 }
 
-                int variationIndex = p.Value<int?>("variation_index") ?? -1;
-                IList variations = (IList)newWave.GetType().GetProperty("Variations").GetValue(newWave);
-                if (variationIndex >= 0 && variationIndex < variations.Count)
+                bool variationUpdated = false;
+                if (variationIndex >= 0)
                 {
                     dynamic variation = variations[variationIndex];
                     if (hasStreamPool)
                         variation.StreamChunkIndex = (uint)chunkIndex;
                     else
                         variation.MemoryChunkIndex = (uint)chunkIndex;
+                    variationUpdated = true;
                 }
 
                 // Rebuild the resource's chunk table from the EBX chunk list, keeping
@@ -217,9 +235,12 @@ namespace FrostyMcpPlugin.Bridge
                 asset.Update();
                 App.AssetManager.ModifyEbx(entry.Name, asset);
 
+                // Both ModifyRes(ulong, Resource) and ModifyRes(string, Resource) exist;
+                // the resource id overload is the one that takes the entry's rid.
                 MethodInfo modifyResResource = typeof(AssetManager).GetMethods()
                     .First(m => m.Name == "ModifyRes"
                         && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType == typeof(ulong)
                         && m.GetParameters()[1].ParameterType.Name == "Resource");
                 modifyResResource.Invoke(App.AssetManager, new[] { (object)resEntry.ResRid, newWave });
 
@@ -241,7 +262,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["duration_seconds"] = duration,
                     ["chunk_index"] = chunkIndex,
                     ["segment_index"] = segmentIndex,
-                    ["variation_index"] = variationIndex
+                    ["variation_index"] = variationIndex,
+                    ["segment_updated"] = segmentUpdated,
+                    ["variation_updated"] = variationUpdated
                 };
             }
             catch (Exception ex)
@@ -250,16 +273,21 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        private static int GuessCodec(byte[] chunkData)
+        // First byte of the sample data is the codec nibble.
+        private static int ReadCodecNibble(byte[] chunkData, uint offset)
         {
-            // Byte 0 is the endian/flag byte; byte 1..3 carry 0x53 0x43 0x4E markers
-            // for EA layer formats. Without a reliable read we default to PCM16.
-            if (chunkData != null && chunkData.Length > 3)
-            {
-                if (chunkData[1] == 0x53 && chunkData[2] == 0x43 && chunkData[3] == 0x4E)
-                    return 11;
-            }
-            return 2;
+            if (chunkData == null || offset >= chunkData.Length)
+                return 2;
+            int codec = chunkData[offset] & 0xF;
+            return codec == 0 ? 2 : codec;
+        }
+
+        // Fifth byte of the sample data packs the channel count in the upper bits.
+        private static int ReadChannelCount(byte[] chunkData, uint offset)
+        {
+            if (chunkData == null || offset + 5 >= chunkData.Length)
+                return 1;
+            return (chunkData[offset + 5] >> 2) + 1;
         }
 
         private static string CodecName(int codec)
