@@ -1022,11 +1022,16 @@ async def duplicate_res(name: str = "", res_rid: str = "", new_name: str = "", r
 
 
 @mcp.tool()
-async def duplicate_chunk(id: str = "", guid: str = "") -> str:
-    """Duplicate a chunk to a new GUID (keeps original bundle membership)."""
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_chunk", {
-        "id": id or guid, "guid": guid or id,
-    }))
+async def duplicate_chunk(id: str = "", guid: str = "", texture_res: str = "") -> str:
+    """Duplicate a chunk to a new GUID (keeps original bundle membership).
+
+    Pass texture_res (a Texture RES name) when the chunk belongs to a texture, so the
+    copy carries the texture metadata instead of a bare chunk.
+    """
+    params = {"id": id or guid, "guid": guid or id}
+    if texture_res:
+        params["texture_res"] = texture_res
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_chunk", params))
 
 
 @mcp.tool()
@@ -1390,6 +1395,7 @@ async def create_component(
     realm: str = "",
     properties_json: object = "",
     at_index: int = -1,
+    array_host_guid: str = "",
 ) -> str:
     """Create a new internal component from Frostbite SDK type (e.g. DelayEntityData).
 
@@ -1399,10 +1405,14 @@ async def create_component(
         flag_preset: client | server | client_and_server (optional).
         realm: e.g. ClientAndServer / Client / Server.
         properties_json: JSON object of initial property values (string or object).
+        array_host_guid: class GUID of a nested host when the target array is not on the
+            root object; available_arrays in the error reply lists valid names.
     """
     params = {"name": name, "guid": guid, "type": type}
     if array:
         params["array"] = array
+    if array_host_guid:
+        params["array_host_guid"] = array_host_guid
     if at_index >= 0:
         params["at_index"] = at_index
     if flag_preset:
@@ -1900,6 +1910,7 @@ async def research_component_usage(
     max_scan: int = 150,
     max_examples: int = 20,
     include_properties: bool = True,
+    assets_json: str = "[]",
 ) -> str:
     """Research how an SDK component type (e.g. DelayEntityData) is used across EBX assets.
 
@@ -1926,6 +1937,7 @@ async def research_component_usage(
         "max_scan": max_scan,
         "max_examples": max_examples,
         "include_properties": include_properties,
+        "assets": json.loads(assets_json) if assets_json else [],
     }))
 
 
@@ -2454,15 +2466,18 @@ async def advanced_add_to_bundle(
     netreg: bool = False,
     mvdb: bool = False,
     unlock_table: bool = False,
+    allow_fallback: bool = False,
 ) -> str:
     """Add EBX via AdvancedBundleEditorPlugin.BundleEditors (with RES/Chunk extensions).
 
     Optional: also add to NetworkRegistry / MeshVariationDb / UnlockIdTable.
-    Falls back to add_to_bundle_smart if Advanced Bundle plugin is not loaded.
+    Without the plugin this returns PLUGIN_MISSING; allow_fallback=True switches
+    to add_to_bundle_smart instead.
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "advanced_add_to_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
         "netreg": netreg, "mvdb": mvdb, "unlock_table": unlock_table,
+        "allow_fallback": allow_fallback,
     }))
 
 
@@ -2474,10 +2489,16 @@ async def advanced_remove_from_bundle(
     netreg: bool = False,
     mvdb: bool = False,
     unlock_table: bool = False,
+    allow_fallback: bool = False,
 ) -> str:
-    """Remove EBX via AdvancedBundleEditorPlugin (optionally NetReg/MVDB/Unlock table)."""
+    """Remove EBX via AdvancedBundleEditorPlugin (optionally NetReg/MVDB/Unlock table).
+
+    Without the plugin this returns PLUGIN_MISSING; allow_fallback=True switches
+    to remove_from_bundle_smart instead.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "advanced_remove_from_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
+        "allow_fallback": allow_fallback,
         "netreg": netreg, "mvdb": mvdb, "unlock_table": unlock_table,
     }))
 
@@ -2536,10 +2557,15 @@ async def create_advanced_bundle(
 
 
 @mcp.tool()
-async def set_bundle_super(bundle: str = "", super_bundle: str = "") -> str:
-    """Repoint an existing (added) bundle to a different super bundle. Frosty's AddBundle returns the existing bundle unchanged, so this is the only way to fix a bundle's super bundle after creation."""
+async def set_bundle_super(bundle: str = "", super_bundle: str = "", force: bool = False) -> str:
+    """Repoint a bundle at a different super bundle.
+
+    Only editor-added bundles reach a .fbmod, so a vanilla bundle is refused with
+    NOT_EXPORTED unless force=True, in which case the editor changes and the mod
+    does not.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "set_bundle_super", {
-        "bundle": bundle, "super_bundle": super_bundle,
+        "bundle": bundle, "super_bundle": super_bundle, "force": force,
     }))
 
 
@@ -2851,11 +2877,15 @@ async def list_bundle_contents(
     modified_only: bool = False,
     offset: int = 0,
     limit: int = 200,
+    kind: str = "ebx",
 ) -> str:
-    """List EBX assets inside a bundle (optional type filter / modified_only)."""
+    """List the members of a bundle.
+
+    kind is ebx (default), res, chunk or all; type/modified_only only apply to EBX.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "list_bundle_contents", {
         "bundle": bundle, "type": type, "modified_only": modified_only,
-        "offset": offset, "limit": limit,
+        "offset": offset, "limit": limit, "kind": kind,
     }))
 
 
