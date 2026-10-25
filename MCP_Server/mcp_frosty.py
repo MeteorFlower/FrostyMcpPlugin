@@ -476,11 +476,16 @@ async def get_selected_asset() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def set_root_flags(name: str = "", guid: str = "", flags: int = 15) -> str:
-    """Set EBX root object Flags. BF1 SpatialPrefabBlueprint root must be 15."""
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_root_flags", {
-        "name": name, "guid": guid, "flags": flags,
-    }))
+async def set_root_flags(name: str = "", guid: str = "", flags: int = -1) -> str:
+    """Set EBX root object Flags.
+
+    flags is required; leaving it at -1 sends nothing and the bridge refuses the
+    call, because a default here would rewrite the word on every asset type.
+    """
+    params = {"name": name, "guid": guid}
+    if flags >= 0:
+        params["flags"] = flags
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "set_root_flags", params))
 
 
 @mcp.tool()

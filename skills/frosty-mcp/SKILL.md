@@ -106,8 +106,8 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `batch_set_field`: many field writes in one call, each item shaped like the single call.
 - `get_ebx_guids`: file GUID, root class GUID, and optionally every object's class GUID.
 - `get_internal_pointer_ref`: build an External PointerRef for one asset or component.
-- `set_root_flags`: the root object `Flags` word. Some profiles require 15 on spatial
-  prefab roots.
+- `set_root_flags`: the root object `Flags` word. `flags` is required; some profiles
+  require 15 on spatial prefab roots and others use a different value.
 - `research_component_usage`: how often one component type appears, with the field names
   and peer types it is wired to; `assets_json` studies an explicit asset list instead of
   scanning.
@@ -544,7 +544,7 @@ the whole file was applied.
 
 **`import_sound` fails on its own defaults because `-1` is sent instead of omitted.** The Python payload always includes `segment_index` and `variation_index`, defaulting to `-1`. The C# handler treats a present key as an explicit request and range-checks it, returning `INVALID_PARAMS` with `segment_index must be 0..N` as soon as the value is negative, before its own absent-means-zero fallback runs. So a normal call with a path and nothing else fails on any sound that has segments, and you must pass `segment_index=0` and `variation_index=0` yourself. In the other direction, `codec: 0`, `channel_count: 0` and `seekable: False` are dropped from the payload, so they mean read the sample header and keep the asset's IsSeekable rather than force that value.
 
-**`set_root_flags` defaults to the Battlefield 1 spatial prefab value of 15.** The Python default is `flags: int = 15`, and unlike the C# handler, which errors with `INVALID_PARAMS` when `flags` is missing, the wrapper always sends a number. Calling `set_root_flags(name=...)` with no flags therefore rewrites the root `Flags` word to 15 on any asset type, marks the asset modified, and returns `success: true` with `flags: 15`. The C# hint text about SpatialPrefabBlueprint is the only thing tying 15 to Battlefield 1; nothing validates the asset type. Always pass flags explicitly, and read the current value first if the intent is anything other than 15.
+**`set_root_flags` writes one word, and 15 is not a universal value.** The tool needs `flags` explicitly; called without it the bridge refuses with INVALID_PARAMS rather than picking a default, because a wrong value silently changes how the asset is treated at load time. Read the current word first and change only the bits you mean, then confirm with `get_ebx_property` on `Flags`.
 
 **`set_component_flags` swallows bad `flags_json` and lets its keys overwrite the target identity.** The wrapper parses `flags_json` and merges the result straight into the top level of the payload with `params.update(...)` inside a bare `except: pass`. Invalid JSON is silently ignored, so the remaining `flag_preset` and `realm` arguments are applied and the reply still says `success: true`. A valid object is merged at the same level as `name`, `guid`, `class_guid` and `index`, so a key such as `"name"` or `"class_guid"` replaces the asset or component you meant to edit, and a misspelled bit name such as `"cleint_event"` is ignored by the C# bit reader while the call still reports success.
 
