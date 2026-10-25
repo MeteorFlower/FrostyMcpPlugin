@@ -555,10 +555,18 @@ namespace FrostyMcpPlugin.Bridge
             return value == null ? 0 : 1;
         }
 
-        // Plugin.BundleManager is a public static property on PvZBundleManagerPlugin.Plugin.
+        // The plugin assembly has shipped under both spellings, so both are accepted.
+        internal static Type FindBundleManagerPluginType()
+        {
+            return FindType("PVZBundleManagerPlugin.Plugin")
+                ?? FindType("PvZBundleManagerPlugin.Plugin")
+                ?? FindType("GW2BundleManagerPlugin.Plugin");
+        }
+
+        // Plugin.BundleManager is a public static property on the plugin class.
         private static object GetBundleManager()
         {
-            Type pluginType = FindType("PvZBundleManagerPlugin.Plugin");
+            Type pluginType = FindBundleManagerPluginType();
             if (pluginType == null)
                 return null;
             PropertyInfo prop = pluginType.GetProperty("BundleManager",
