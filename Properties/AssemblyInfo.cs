@@ -1,4 +1,4 @@
-using Frosty.Core.Attributes;
+﻿using Frosty.Core.Attributes;
 using FrostyMcpPlugin.Extensions;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -14,7 +14,7 @@ using System.Windows;
 
 [assembly: PluginDisplayName("Frosty MCP Bridge")]
 [assembly: PluginAuthor("Frosty2000")]
-[assembly: PluginVersion("2.1.1.0")]
+[assembly: PluginVersion("2.2.1.0")]
 
 [assembly: RegisterStartupAction(typeof(McpStartupAction))]
 [assembly: RegisterMenuExtension(typeof(McpStatusMenuExtension))]

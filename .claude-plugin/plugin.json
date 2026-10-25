@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "frosty-mcp",
-  "version": "2.1.1",
+  "version": "2.2.1",
   "description": "Frosty Editor MCP bridge for EBX assets, components, blueprint connections, bundles, network registries, project lifecycle and .fbmod export.",
   "skills": "./skills/",
   "mcpServers": {
@@ -10,7 +10,7 @@
         "${CLAUDE_PLUGIN_ROOT}/MCP_Server/mcp_frosty.py"
       ],
       "env": {
-        "FROSTY_MCP_VERSION": "2.1.1"
+        "FROSTY_MCP_VERSION": "2.2.1"
       }
     }
   }

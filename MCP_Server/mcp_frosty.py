@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import json as _json
 
@@ -444,7 +444,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "2.1.1")
+        + os.environ.get("FROSTY_MCP_VERSION", "2.2.1")
         + ". Tools that take a commit parameter are two-phase: the first call "
         "returns would_change + plan, and repeating the identical call with "
         "commit=true executes it. Tools without commit apply immediately. "
