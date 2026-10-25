@@ -82,8 +82,18 @@ namespace FrostyMcpPlugin.Bridge
 
                 int segmentIndex = p["segment_index"] == null ? 0 : p.Value<int>("segment_index");
                 int variationIndex = p["variation_index"] == null ? 0 : p.Value<int>("variation_index");
-                if (segmentIndex >= segments.Count) segmentIndex = -1;
-                if (variationIndex >= variations.Count) variationIndex = -1;
+                if (p["segment_index"] != null && (segmentIndex < 0 || segmentIndex >= segments.Count))
+                    return McpHandlers.Error(
+                        "segment_index must be 0.." + (segments.Count - 1) + " (" + segments.Count + " segments)",
+                        "INVALID_PARAMS");
+                if (p["variation_index"] != null && (variationIndex < 0 || variationIndex >= variations.Count))
+                    return McpHandlers.Error(
+                        "variation_index must be 0.." + (variations.Count - 1) + " (" + variations.Count + " variations)",
+                        "INVALID_PARAMS");
+                if (segments.Count == 0)
+                    segmentIndex = -1;
+                if (variations.Count == 0)
+                    variationIndex = -1;
 
                 uint sampleStart = 0;
                 if (segmentIndex >= 0)
@@ -92,9 +102,28 @@ namespace FrostyMcpPlugin.Bridge
                     sampleStart = (uint)seg.SamplesOffset & ~3u;
                 }
 
-                int codec = p.Value<int?>("codec") ?? ReadCodecNibble(existingBytes, sampleStart);
+                // A guessed codec silently re-encodes the asset in the wrong format, so
+                // refuse to continue when the sample header cannot be read.
+                int codec = p.Value<int?>("codec") ?? 0;
+                if (codec == 0)
+                {
+                    codec = ReadCodecNibble(existingBytes, sampleStart);
+                    if (codec < 0)
+                        return McpHandlers.Error(
+                            "Could not read the codec from the existing sample data; pass codec explicitly",
+                            "CODEC_UNKNOWN");
+                }
                 string codecName = CodecName(codec);
-                int channelCount = p.Value<int?>("channel_count") ?? ReadChannelCount(existingBytes, sampleStart);
+
+                int channelCount = p.Value<int?>("channel_count") ?? 0;
+                if (channelCount == 0)
+                {
+                    channelCount = ReadChannelCount(existingBytes, sampleStart);
+                    if (channelCount < 0)
+                        return McpHandlers.Error(
+                            "Could not read the channel count from the existing sample data; pass channel_count explicitly",
+                            "CHANNELS_UNKNOWN");
+                }
                 bool isSeekable = p.Value<bool?>("seekable") ?? (bool)((dynamic)root).IsSeekable;
 
                 object helper = toolHelperType.GetProperty("Instance",
@@ -262,7 +291,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["duration_seconds"] = duration,
                     ["chunk_index"] = chunkIndex,
                     ["segment_index"] = segmentIndex,
+                    ["segment_count"] = segments.Count,
                     ["variation_index"] = variationIndex,
+                    ["variation_count"] = variations.Count,
                     ["segment_updated"] = segmentUpdated,
                     ["variation_updated"] = variationUpdated
                 };
@@ -281,20 +312,26 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        // First byte of the sample data is the codec nibble.
+        // Sample data starts with a 0x48 marker, a big-endian header size, then the
+        // codec nibble at +4 and the channel count at +5. Returns -1 when the offset
+        // does not point at a sample header.
         private static int ReadCodecNibble(byte[] chunkData, uint offset)
         {
-            if (chunkData == null || offset >= chunkData.Length)
-                return 2;
-            int codec = chunkData[offset] & 0xF;
-            return codec == 0 ? 2 : codec;
+            if (chunkData == null || offset + 4 >= chunkData.Length)
+                return -1;
+            if (chunkData[offset] != 0x48)
+                return -1;
+            int codec = chunkData[offset + 4] & 0xF;
+            return codec == 0 ? -1 : codec;
         }
 
-        // Fifth byte of the sample data packs the channel count in the upper bits.
+        // Byte +5 of the sample header packs the channel count in its upper six bits.
         private static int ReadChannelCount(byte[] chunkData, uint offset)
         {
             if (chunkData == null || offset + 5 >= chunkData.Length)
-                return 1;
+                return -1;
+            if (chunkData[offset] != 0x48)
+                return -1;
             return (chunkData[offset + 5] >> 2) + 1;
         }
 

@@ -73,7 +73,7 @@ Shared stdio launch:
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
 | `env` | `FROSTY_MCP_VERSION=2.1.1` (optional; bump it when tool schemas change so clients reload) |
-| `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix) |
+| `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix. Leave it unset when one editor is running: the server then uses the only open bridge pipe) |
 | `env` | `FROSTY_MCP_PIPE=\\.\pipe\...` (optional; full pipe path override, wins over `FROSTY_MCP_PROFILE`) |
 
 After changing tools, bump `FROSTY_MCP_VERSION` and restart the MCP server in that client. Call `ping` first; it should return `profile_loaded: true` once Frosty has a profile open.
@@ -123,6 +123,19 @@ claude mcp add frosty --scope user -- python D:/path/to/FrostyMcpPlugin/MCP_Serv
 ```
 
 If you already configured Claude Desktop, you can import with `claude mcp add-from-claude-desktop`. Then `claude mcp list` and restart Claude Code.
+
+### Bundled skill and plugin manifest
+
+The repository ships an agent skill and a plugin manifest, so a Claude Code installation can load the tools and their usage notes together:
+
+| Path | Purpose |
+|------|---------|
+| `skills/frosty-mcp/SKILL.md` | The skill. Claude Code exposes it as `frosty-mcp:frosty-mcp` when the repository is installed as a plugin |
+| `.claude-plugin/plugin.json` | Declares the `frosty` stdio server (`${CLAUDE_PLUGIN_ROOT}/MCP_Server/mcp_frosty.py`) and points at `./skills/` |
+
+Install it as a plugin from a marketplace entry that points at this repository, or keep using the per-client JSON above. The skill file is plain Markdown; other clients can read it as documentation.
+
+The skill covers the two-phase commit protocol, all tool groups, the error codes, pitfalls that produce a wrong result without an error, and the tools that need an optional Frosty plugin.
 
 ### OpenAI Codex (CLI, IDE extension, ChatGPT desktop Codex)
 

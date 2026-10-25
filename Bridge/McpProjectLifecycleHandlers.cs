@@ -72,7 +72,7 @@ namespace FrostyMcpPlugin.Bridge
             if (project == null)
                 return McpHandlers.Error("No Frosty project window is available", "NOT_READY");
             if (string.IsNullOrEmpty(project.Filename))
-                return McpHandlers.Error("Project has no filename; use save_project_as", "INVALID_STATE");
+                return McpHandlers.Error("Project has no filename", "INVALID_STATE");
 
             try
             {
@@ -371,6 +371,14 @@ namespace FrostyMcpPlugin.Bridge
                     return McpHandlers.Error(field + " must not contain braces", "INVALID_PARAMS");
             }
 
+            int? selectedCategory = null;
+            if (p["selected_category"] != null)
+            {
+                selectedCategory = p.Value<int?>("selected_category");
+                if (selectedCategory == null || selectedCategory < 0 || selectedCategory >= ModCategories.Length)
+                    return McpHandlers.Error("selected_category must be 0.." + (ModCategories.Length - 1), "INVALID_PARAMS");
+            }
+
             string iconPath = p.Value<string>("icon_path");
             byte[] icon = null;
             if (!string.IsNullOrEmpty(iconPath))
@@ -408,14 +416,11 @@ namespace FrostyMcpPlugin.Bridge
                 if (p.Value<string>("version") != null) settings.Version = p.Value<string>("version");
                 if (p.Value<string>("description") != null) settings.Description = p.Value<string>("description");
                 if (p.Value<string>("link") != null) settings.Link = p.Value<string>("link");
-                if (p["selected_category"] != null)
+                if (selectedCategory != null)
                 {
-                    int selected = p.Value<int>("selected_category");
-                    if (selected < 0 || selected >= ModCategories.Length)
-                        return McpHandlers.Error("selected_category must be 0.." + (ModCategories.Length - 1), "INVALID_PARAMS");
-                    settings.SelectedCategory = selected;
-                    if (selected != 0 && p.Value<string>("category") == null)
-                        settings.Category = ModCategories[selected];
+                    settings.SelectedCategory = selectedCategory.Value;
+                    if (selectedCategory.Value != 0 && p.Value<string>("category") == null)
+                        settings.Category = ModCategories[selectedCategory.Value];
                 }
                 if (icon != null) settings.Icon = icon;
                 foreach (KeyValuePair<int, byte[]> shot in screenshots)
@@ -518,9 +523,12 @@ namespace FrostyMcpPlugin.Bridge
                     throw;
                 }
 
+                // File.Replace swaps atomically on the same volume, so a failure
+                // leaves the previous .fbmod untouched instead of deleting it first.
                 if (File.Exists(finalPath))
-                    File.Delete(finalPath);
-                File.Move(tempPath, finalPath);
+                    File.Replace(tempPath, finalPath, null);
+                else
+                    File.Move(tempPath, finalPath);
 
                 return new Dictionary<string, object>
                 {
@@ -863,9 +871,9 @@ namespace FrostyMcpPlugin.Bridge
             return null;
         }
 
-        // The File menu refreshes the explorers, the title, the recent project list
-        // and the autosave timer after a save. Do the same, ignoring anything that
-        // does not exist in this build.
+        // The File menu refreshes the explorers, the title and the recent project list
+        // after a save. The autosave timer is the editor's own and is not reproduced
+        // here. Anything missing from this build is skipped.
         private static void RefreshAfterSave(FrostyProject project)
         {
             RefreshDataExplorer();

@@ -94,16 +94,29 @@ namespace FrostyMcpPlugin.Bridge
             if (App.AssetManager == null)
                 return McpHandlers.Error("AssetManager not ready", "NOT_READY");
 
-            List<BundleEntry> bundles = App.AssetManager.EnumerateBundles().ToList();
+            // One pass over the bundles builds every count; the loop used to rescan
+            // the whole bundle list for each super bundle.
+            Dictionary<int, int> counts = new Dictionary<int, int>();
+            foreach (BundleEntry be in App.AssetManager.EnumerateBundles())
+            {
+                int id = be.SuperBundleId;
+                int seen;
+                counts.TryGetValue(id, out seen);
+                counts[id] = seen + 1;
+            }
+
             List<object> result = new List<object>();
+            int superId = 0;
             foreach (SuperBundleEntry sb in App.AssetManager.EnumerateSuperBundles())
             {
-                int sbId = App.AssetManager.GetSuperBundleId(sb);
+                int id = superId++;
+                int count;
+                counts.TryGetValue(id, out count);
                 result.Add(new Dictionary<string, object>
                 {
                     ["name"] = sb.Name,
                     ["added"] = sb.Added,
-                    ["bundle_count"] = bundles.Count(b => b.SuperBundleId == sbId)
+                    ["bundle_count"] = count
                 });
             }
             return new Dictionary<string, object> { ["success"] = true, ["count"] = result.Count, ["super_bundles"] = result };

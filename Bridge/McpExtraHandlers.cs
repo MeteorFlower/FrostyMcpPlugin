@@ -382,7 +382,7 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // =====================================================================
-        // Create struct (no GUID) — BF1DevPlugin Core.CreateStructObject
+        // Create struct (no GUID); ports BF1DevPlugin Core.CreateStructObject
         // =====================================================================
 
         public static object CreateStruct(JObject p)

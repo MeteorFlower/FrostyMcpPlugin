@@ -120,7 +120,7 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 catch (Exception)
                 {
-                    // Client disconnect / pipe recreate — keep listening
+                    // Client disconnect or pipe recreate; keep listening
                 }
                 finally
                 {

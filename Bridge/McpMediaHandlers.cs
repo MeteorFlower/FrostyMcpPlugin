@@ -112,7 +112,7 @@ namespace FrostyMcpPlugin.Bridge
                         return McpHandlers.Error("File not found: " + path, "NOT_FOUND");
                     string ext = Path.GetExtension(path).ToLowerInvariant();
                     if (ext == ".luares")
-                        return McpHandlers.Error("Import .luares raw not supported; use .lua source + compile", "UNSUPPORTED");
+                        return McpHandlers.Error("Import of a raw .luares file is not supported", "UNSUPPORTED");
                     source = File.ReadAllText(path, Encoding.UTF8);
                 }
                 else if (!string.IsNullOrEmpty(body))
@@ -169,7 +169,7 @@ namespace FrostyMcpPlugin.Bridge
 
         /// <summary>
         /// Create LuaRunnerCompiledLua EBX + CompiledLua RES by duplicating a template
-        /// (Frostbite does not support creating Lua from empty — same as BF1DevPlugin).
+        /// (Frostbite cannot create Lua from empty, same as BF1DevPlugin).
         /// </summary>
         public static object CreateLuaAsset(JObject p)
         {
@@ -305,7 +305,7 @@ namespace FrostyMcpPlugin.Bridge
                         flagsPi.SetValue(newObject, flagValue);
                 }
 
-                // Realm / flags presets via JObject reused by blueprint helpers — set simply
+                // Realm and flags presets arrive as JObjects shared with the blueprint helpers; apply them as given.
                 if (p["realm"] != null)
                 {
                     try
@@ -405,7 +405,7 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         /// <summary>
-        /// Full pipeline: duplicate Lua EBX+RES → create runner component → compile script body.
+        /// Full pipeline: duplicate the Lua EBX and RES, create the runner component, then compile the script body.
         /// </summary>
         public static object SetupLua(JObject p)
         {
@@ -424,7 +424,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["wrap_entrypoint"] = true
             };
             if (p["template_guid"] != null) createParams["template_guid"] = p["template_guid"];
-            // defer compile to after we know guid_name from create — still can pass body in create
+            // Compile is deferred until create returns guid_name; the body can still be passed to create.
             object createResult = CreateLuaAsset(createParams);
             var createDict = createResult as Dictionary<string, object>;
             if (createDict == null || !(createDict["success"] is bool cok && cok))

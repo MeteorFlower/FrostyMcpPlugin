@@ -33,7 +33,7 @@ namespace FrostyMcpPlugin.Bridge
         private const uint UnusedFlag = 0x80000000u;
 
         // =====================================================================
-        // Connections — list / add / update / remove
+        // Connections: list / add / update / remove
         // =====================================================================
 
         public static object ListConnections(JObject p)
@@ -401,7 +401,7 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // =====================================================================
-        // Components — list / get / create / duplicate / flags / properties
+        // Components: list / get / create / duplicate / flags / properties
         // =====================================================================
 
         public static object ListComponents(JObject p)
@@ -415,36 +415,34 @@ namespace FrostyMcpPlugin.Bridge
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 200);
             bool compact = p.Value<bool?>("compact") ?? true;
 
-            List<object> all = new List<object>();
+            // SerializeComponent resolves several members per object, so it runs only
+            // for rows inside the page window; the rest are only counted.
+            int total = 0;
+            List<object> page = new List<object>(limit);
             int i = 0;
             foreach (object obj in asset.Objects)
             {
+                int objectIndex = i++;
                 string typeName = obj.GetType().Name;
                 if (!string.IsNullOrEmpty(typeFilter) &&
                     !TypeLibrary.IsSubClassOf(typeName, typeFilter) &&
                     !typeName.Equals(typeFilter, StringComparison.OrdinalIgnoreCase))
-                {
-                    i++;
                     continue;
-                }
                 if (!string.IsNullOrEmpty(query) &&
                     typeName.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0 &&
                     (GetObjectName(obj) ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0)
-                {
-                    i++;
                     continue;
-                }
 
-                all.Add(SerializeComponent(obj, i, asset, compact));
-                i++;
+                int index = total++;
+                if (index < offset || page.Count >= limit)
+                    continue;
+                page.Add(SerializeComponent(obj, objectIndex, asset, compact));
             }
-
-            List<object> page = all.Skip(offset).Take(limit).ToList();
             return new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["name"] = entry.Name,
-                ["total"] = all.Count,
+                ["total"] = total,
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
@@ -588,9 +586,9 @@ namespace FrostyMcpPlugin.Bridge
                 if (!asset.Objects.Contains(copy) && !IsContainedInObjects(asset, copy))
                     asset.AddObject(copy);
 
-                // Older FrostySdk builds assign InternalId = objects.Count, which can
-                // collide with an existing object when the object list has gaps.
-                // Renumber only the objects this duplicate added.
+                // DeepCopy hands the objects over with InternalId = -1 and AddObject
+                // assigns max+1, so this guards against ids that still collide or are
+                // negative. Renumber only the objects this duplicate added.
                 RepairInternalIdCollisions(asset, preexisting);
 
                 PointerRef pref = new PointerRef(copy);
@@ -976,7 +974,7 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // =====================================================================
-        // InterfaceDescriptorData — Fields / InputEvents / OutputEvents
+        // InterfaceDescriptorData: Fields / InputEvents / OutputEvents
         // (BF1DevPlugin.Base.Blueprint CreateFields / CreateInputEvents / ...)
         // =====================================================================
 
@@ -1786,7 +1784,7 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         // =====================================================================
-        // Create New Class (PointerRef field — mirrors FrostyPointerRefEditor)
+        // Create New Class on a PointerRef field, mirroring FrostyPointerRefEditor
         // =====================================================================
 
         public static object ListEbxClassTypes(JObject p)
@@ -1802,7 +1800,7 @@ namespace FrostyMcpPlugin.Bridge
             {
                 object host = ResolveHostForClassCreate(asset, p, out _);
                 if (host == null)
-                    return McpHandlers.Error("Host component not found (provide class_guid/index or use root)", "NOT_FOUND");
+                    return McpHandlers.Error("Host component not found (provide class_guid or index)", "NOT_FOUND");
                 try
                 {
                     ResolvePointerAssignTarget(host, path, out _, out _, out _, out baseType, out _);
@@ -2421,8 +2419,8 @@ namespace FrostyMcpPlugin.Bridge
 
         /// <summary>
         /// Gives every internal object added since <paramref name="preexisting"/> a
-        /// unique InternalId. Needed because AddObject used objects.Count, which is
-        /// not a free id once the asset contains exported objects or gaps.
+        /// unique InternalId. AddObject already picks max+1, so this repairs ids that
+        /// arrive negative or duplicated.
         /// </summary>
         private static void RepairInternalIdCollisions(EbxAsset asset, List<object> preexisting)
         {
@@ -3843,7 +3841,7 @@ namespace FrostyMcpPlugin.Bridge
 
                 if (nameHit)
                 {
-                    // Property name matched but value is complex — still report
+                    // Property name matched but the value is complex; still report it
                     MaybeAddMatch(childPath, objectIndex, classGuid, objectType, value.GetType().Name, SummarizeValue(value), true, false, query, scope, cmp, matches, ref total, maxCollect);
                 }
 
@@ -4065,7 +4063,7 @@ namespace FrostyMcpPlugin.Bridge
             parent = current;
             if (string.IsNullOrEmpty(lastName))
             {
-                // path like "Items[0]" where Items already resolved — shouldn't happen with our split
+                // path like "Items[0]" where Items is already resolved; the split should prevent this
                 throw new InvalidOperationException("Invalid path ending: " + last);
             }
 
@@ -4182,7 +4180,7 @@ namespace FrostyMcpPlugin.Bridge
 
             if (propValue is IList listOnly)
             {
-                // bare list + mode set without index → append as convenience
+                // bare list with a mode and no index: append as a convenience
                 listOnly.Add(pref);
                 listIndex = listOnly.Count - 1;
                 assignedPath = lastName + "[" + listIndex + "]";
