@@ -19,6 +19,31 @@ This plugin talks to **whatever profile Frosty has loaded**. Here it is driven a
 - NetworkRegistry objects: list, add and remove external pointer refs
 - Texture, mesh, Lua, sound, atlas, and schematic helpers (when the matching Frosty plugins are loaded)
 
+## What's new
+
+- An agent skill ships with the repository at `skills/frosty-mcp/SKILL.md`, next to a Claude
+  Code plugin manifest at `.claude-plugin/plugin.json`. Installing the repository as a plugin
+  loads the MCP server and the usage notes in one step. Cursor, Claude Desktop and Codex keep
+  using the per-client JSON below.
+- `mcp_frosty.py` uses the only open bridge pipe when `FROSTY_MCP_PROFILE` is unset, so a
+  single running editor needs no environment at all. Two editors at once still need the
+  variable, or the full `FROSTY_MCP_PIPE`.
+- Tools that take `commit` are two-phase, and the preview reports `success: false` with
+  `PREVIEW_ONLY` instead of looking like a completed call. Tools without `commit` apply
+  immediately.
+- New tools: `find_pointer_references`, `insert_ebx_item`, `check_asset_ready` and
+  `refresh_mesh_variations`, plus `kind` on `list_bundle_contents`, `force` on
+  `set_bundle_super`, `allow_fallback` on the advanced bundle pair, and `assets_json` on
+  `research_component_usage`.
+- Failure paths report failure: mesh import returns `IMPORT_FAILED` instead of letting the
+  exception reach the editor's dispatcher, `import_sound` refuses with `CODEC_UNKNOWN` when
+  the sample header cannot be read, a `GUID_MISMATCH` bin import is reverted, `insert_ebx_item`
+  reports `ITEM_DROPPED` when `Update()` discards the element, and `export_mod` replaces an
+  existing `.fbmod` atomically.
+- `set_root_flags` requires `flags`; the Python wrapper no longer defaults the word to 15.
+- Listing tools count first and serialize only the requested page, and `EbxYamlWriter` caches
+  the property table per type, which matters on large assets.
+
 ## Architecture
 
 ```
@@ -63,6 +88,10 @@ pip install -r MCP_Server/requirements.txt
 ```
 
 ## 3. Connect an MCP client
+
+Two ways to install. The Claude Code plugin route brings the MCP server and the bundled
+skill together; see Bundled skill and plugin manifest under Claude Code below. Every
+other client points at the stdio server itself, as described here.
 
 The Python process is a **stdio** MCP server. Point every client at the same `command` / `args` (use an **absolute** path to `mcp_frosty.py`). Prefer the `python.exe` you used for `pip install` if `python` is not on PATH.
 
