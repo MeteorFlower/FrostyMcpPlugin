@@ -168,6 +168,8 @@ namespace FrostyMcpPlugin.Bridge
             if (App.PluginManager.GetCustomHandler(entry.Type) != null)
                 return McpHandlers.Error("Asset type uses a custom handler; .bin import is not supported", "UNSUPPORTED_TYPE");
 
+            var beforeGuids = ExportedClassGuids(entry);
+
             var plan = new Dictionary<string, object>
             {
                 ["name"] = entry.Name,
@@ -208,7 +210,7 @@ namespace FrostyMcpPlugin.Bridge
                     };
                 }
 
-                return new Dictionary<string, object>
+                var result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
@@ -217,6 +219,21 @@ namespace FrostyMcpPlugin.Bridge
                     ["file_guid"] = refreshed.Guid.ToString(),
                     ["asset"] = McpHandlers.SerializeEbxEntry(refreshed)
                 };
+
+                // data_only keeps the file and root identity but takes every other
+                // component GUID from the file, so pointers into those components
+                // can go stale without any other tool noticing.
+                var afterGuids = ExportedClassGuids(refreshed);
+                var changedGuids = beforeGuids.Where(g => !afterGuids.Contains(g)).ToList();
+                result["changed_class_guids"] = changedGuids.Select(g => g.ToString()).ToList();
+                result["changed_class_guid_count"] = changedGuids.Count;
+                if (changedGuids.Count > 0)
+                {
+                    int maxScan = p.Value<int?>("max_scan") ?? 1500;
+                    result["affected_assets"] = McpRefHandlers.FindAffectedAssets(
+                        refreshed.Guid, changedGuids, maxScan);
+                }
+                return result;
             }
             catch (Exception ex)
             {
@@ -1152,6 +1169,29 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
+        private static HashSet<Guid> ExportedClassGuids(EbxAssetEntry entry)
+        {
+            var guids = new HashSet<Guid>();
+            if (entry == null)
+                return guids;
+            EbxAsset asset;
+            try { asset = App.AssetManager.GetEbx(entry); }
+            catch { return guids; }
+            if (asset == null)
+                return guids;
+            foreach (object obj in asset.Objects)
+            {
+                try
+                {
+                    AssetClassGuid g = ((dynamic)obj).GetInstanceGuid();
+                    if (g.IsExported)
+                        guids.Add(g.ExportedGuid);
+                }
+                catch { }
+            }
+            return guids;
+        }
+
         private static bool IsResourceBackedType(string type)
         {
             if (string.IsNullOrEmpty(type))
@@ -2082,6 +2122,38 @@ namespace FrostyMcpPlugin.Bridge
             if (import == null)
                 throw new InvalidOperationException("ImportFBX not found in MeshSetPlugin");
 
+            // Prefer the real progress window, which is what the editor uses and which
+            // guarantees a fully initialised task object for the importer.
+            Type taskType = FindType("Frosty.Core.Windows.FrostyTaskWindow");
+            Type callbackType = FindType("Frosty.Core.Windows.FrostyTaskCallback");
+            if (taskType != null && callbackType != null)
+            {
+                MethodInfo show = taskType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Show"
+                        && m.GetParameters().Length == 5
+                        && m.GetParameters()[0].ParameterType == typeof(string));
+                object callback = CreateStaticDelegate(callbackType, "MeshImportCallback");
+
+                if (show != null && callback != null)
+                {
+                    s_meshImportAction = taskWindow => import.Invoke(importer,
+                        new object[] { path, meshSet, asset, entry, settings, taskWindow });
+                    try
+                    {
+                        McpHandlers.InvokeOnUi(() => show.Invoke(null,
+                            new object[] { "Mesh import", path, callback, false, null }));
+                        return;
+                    }
+                    finally
+                    {
+                        s_meshImportAction = null;
+                    }
+                }
+            }
+
+            // Fall back to a bare window instance. ImportFBX only calls Update on it,
+            // which just sets properties, so this path works without a modal loop.
             object task = McpHandlers.InvokeOnUi(() => CreateTaskWindow());
             if (task == null)
                 throw new InvalidOperationException("FrostyTaskWindow type is not available");
@@ -2090,6 +2162,31 @@ namespace FrostyMcpPlugin.Bridge
                 import.Invoke(importer, new object[] { path, meshSet, asset, entry, settings, task }));
         }
 
+        private static Action<object> s_meshImportAction;
+
+        // Entry point for the progress window callback; the body is swapped in per call.
+        private static void MeshImportCallback(object task)
+        {
+            Action<object> action = s_meshImportAction;
+            if (action != null)
+                action(task);
+        }
+
+        private static object CreateStaticDelegate(Type delegateType, string methodName)
+        {
+            MethodInfo mi = typeof(McpEditHandlers).GetMethod(methodName,
+                BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+            if (mi == null)
+                return null;
+            try
+            {
+                return Delegate.CreateDelegate(delegateType, mi);
+            }
+            catch
+            {
+                return null;
+            }
+        }
         internal static object CreateTaskWindow()
         {
             Type taskType = FindType("Frosty.Core.Windows.FrostyTaskWindow");
