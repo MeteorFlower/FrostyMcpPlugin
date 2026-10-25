@@ -24,8 +24,9 @@ This plugin talks to **whatever profile Frosty has loaded**. Battlefield 1 helpe
   loads the MCP server and the usage notes in one step. Cursor, Claude Desktop and Codex keep
   using the per-client JSON below.
 - `mcp_frosty.py` uses the only open bridge pipe when `FROSTY_MCP_PROFILE` is unset, so a
-  single running editor needs no environment at all. Two editors at once still need the
-  variable, or the full `FROSTY_MCP_PIPE`.
+  single running editor needs no environment at all. With several editors open, `list_profiles`
+  shows them and `use_profile` switches this server between them; `FROSTY_MCP_PROFILE` or
+  `FROSTY_MCP_PIPE` still pin the choice at startup.
 - Tools that take `commit` are two-phase, and the preview reports `success: false` with
   `PREVIEW_ONLY` instead of looking like a completed call. Tools without `commit` apply
   immediately.
@@ -107,7 +108,13 @@ After changing tools, bump `FROSTY_MCP_VERSION` and restart the MCP server in th
 
 ### Multiple editor profiles
 
-Every Frosty editor instance listens on `Frosty_MCP_Bridge_v1_<profile>`, so several editors can run at the same time. Add one server entry per profile and set `FROSTY_MCP_PROFILE` to the internal profile name or the display name shown in Frosty (for example `PVZBattleforNeighborville` or `Plants vs Zombies: Battle for Neighborville™`). `mcp_frosty.py` resolves it through `MCP_Server/pipe_profiles.json`; an unknown profile is used verbatim as the suffix, which matches the plugin.
+Every Frosty editor instance listens on `Frosty_MCP_Bridge_v1_<profile>`, so several editors can run at the same time. One server entry is enough for all of them:
+
+- Nothing running: the server uses whichever editor is up. With exactly one editor that is unambiguous and no configuration is needed.
+- Several editors: the server refuses to guess and returns the list of listening profiles. Call `list_profiles()` to see them and `use_profile("PVZBattleforNeighborville")` to pin every later call to one editor; `use_profile()` with no argument goes back to auto detection.
+- A fixed choice at startup: set `FROSTY_MCP_PROFILE` to the internal profile name or the display name shown in Frosty (for example `PVZBattleforNeighborville` or `Plants vs Zombies: Battle for Neighborville™`), or `FROSTY_MCP_PIPE` to the full pipe path. `mcp_frosty.py` resolves profiles through `MCP_Server/pipe_profiles.json`; an unknown profile is used verbatim as the suffix, which matches the plugin.
+
+Separate server entries per profile still work and are what you want when two clients must talk to two editors at the same time: they are independent processes, so neither one can be switched out from under the other.
 
 ### Cursor
 
