@@ -514,8 +514,11 @@ namespace FrostyMcpPlugin.Bridge
 
                 all.Add(new Dictionary<string, object>
                 {
+                    ["bundle_id"] = App.AssetManager.GetBundleId(be.Name),
                     ["name"] = be.Name,
                     ["type"] = be.Type.ToString(),
+                    ["added"] = be.Added,
+                    ["blueprint"] = be.Blueprint?.Name,
                     ["super_bundle"] = App.AssetManager.GetSuperBundle(be.SuperBundleId)?.Name
                 });
             }
