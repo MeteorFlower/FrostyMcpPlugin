@@ -362,7 +362,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "2.0.2")
+        + os.environ.get("FROSTY_MCP_VERSION", "2.0.3")
         + ". Includes Type Explorer (search_types, get_type_info, get_type_field, "
         "list_type_namespaces) and BF1 helpers: set_root_flags, add_to_network_registry, "
         "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles."

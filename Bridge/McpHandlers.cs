@@ -492,9 +492,20 @@ namespace FrostyMcpPlugin.Bridge
                 return Error("Bundle not found", "NOT_FOUND");
 
             BundleEntry be = App.AssetManager.GetBundleEntry(bundleId);
-            List<object> ebx = App.AssetManager.EnumerateEbx(be).Select(SerializeEbxEntry).Cast<object>().ToList();
-            List<object> res = App.AssetManager.EnumerateRes(be).Select(SerializeResEntry).Cast<object>().ToList();
-            List<object> chunks = App.AssetManager.EnumerateChunks(be).Select(SerializeChunkEntry).Cast<object>().ToList();
+
+            // EnumerateRes/EnumerateChunks(BundleEntry) only test entry.Bundles and
+            // ignore AddedBundles, so assets added to a bundle through the editor
+            // vanish from the listing even though the mod writer exports them.
+            // Filter by the effective bundle list instead.
+            List<object> ebx = App.AssetManager.EnumerateEbx()
+                .Where(e => e.EnumerateBundles().Contains(bundleId))
+                .Select(SerializeEbxEntry).Cast<object>().ToList();
+            List<object> res = App.AssetManager.EnumerateRes()
+                .Where(e => e.EnumerateBundles().Contains(bundleId))
+                .Select(SerializeResEntry).Cast<object>().ToList();
+            List<object> chunks = App.AssetManager.EnumerateChunks()
+                .Where(e => e.EnumerateBundles().Contains(bundleId))
+                .Select(SerializeChunkEntry).Cast<object>().ToList();
 
             return new Dictionary<string, object>
             {
