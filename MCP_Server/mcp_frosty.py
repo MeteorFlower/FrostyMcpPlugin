@@ -1022,11 +1022,16 @@ async def duplicate_res(name: str = "", res_rid: str = "", new_name: str = "", r
 
 
 @mcp.tool()
-async def duplicate_chunk(id: str = "", guid: str = "") -> str:
-    """Duplicate a chunk to a new GUID (keeps original bundle membership)."""
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_chunk", {
-        "id": id or guid, "guid": guid or id,
-    }))
+async def duplicate_chunk(id: str = "", guid: str = "", texture_res: str = "") -> str:
+    """Duplicate a chunk to a new GUID (keeps original bundle membership).
+
+    Pass texture_res (a Texture RES name) when the chunk belongs to a texture, so the
+    copy carries the texture metadata instead of a bare chunk.
+    """
+    params = {"id": id or guid, "guid": guid or id}
+    if texture_res:
+        params["texture_res"] = texture_res
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "duplicate_chunk", params))
 
 
 @mcp.tool()
@@ -1390,6 +1395,7 @@ async def create_component(
     realm: str = "",
     properties_json: object = "",
     at_index: int = -1,
+    array_host_guid: str = "",
 ) -> str:
     """Create a new internal component from Frostbite SDK type (e.g. DelayEntityData).
 
@@ -1399,10 +1405,14 @@ async def create_component(
         flag_preset: client | server | client_and_server (optional).
         realm: e.g. ClientAndServer / Client / Server.
         properties_json: JSON object of initial property values (string or object).
+        array_host_guid: class GUID of a nested host when the target array is not on the
+            root object; available_arrays in the error reply lists valid names.
     """
     params = {"name": name, "guid": guid, "type": type}
     if array:
         params["array"] = array
+    if array_host_guid:
+        params["array_host_guid"] = array_host_guid
     if at_index >= 0:
         params["at_index"] = at_index
     if flag_preset:
@@ -1900,6 +1910,7 @@ async def research_component_usage(
     max_scan: int = 150,
     max_examples: int = 20,
     include_properties: bool = True,
+    assets_json: str = "[]",
 ) -> str:
     """Research how an SDK component type (e.g. DelayEntityData) is used across EBX assets.
 
@@ -1926,6 +1937,7 @@ async def research_component_usage(
         "max_scan": max_scan,
         "max_examples": max_examples,
         "include_properties": include_properties,
+        "assets": json.loads(assets_json) if assets_json else [],
     }))
 
 
