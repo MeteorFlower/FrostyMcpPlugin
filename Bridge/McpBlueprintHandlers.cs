@@ -782,7 +782,7 @@ namespace FrostyMcpPlugin.Bridge
                     // Remove from Components / Objects arrays
                     RemovePointerFromArray(root, "Components", comp, guidUnique);
                     RemovePointerFromArray(root, "Objects", comp, guidUnique);
-                    RemoveReferencesToObject(asset, comp, guidUnique);
+                    List<string> clearedPaths = RemoveReferencesToObject(asset, comp, guidUnique);
 
                     if (removeObject)
                         asset.RemoveObject(comp);
@@ -793,7 +793,9 @@ namespace FrostyMcpPlugin.Bridge
                         ["success"] = true,
                         ["removed_index"] = index,
                         ["class_guid"] = classGuid.ToString(),
-                        ["removed_from_objects"] = removeObject
+                        ["removed_from_objects"] = removeObject,
+                        ["cleared_paths"] = clearedPaths,
+                        ["cleared_count"] = clearedPaths.Count
                     };
                 }
                 catch (Exception ex)
@@ -906,6 +908,7 @@ namespace FrostyMcpPlugin.Bridge
                 return McpCommit.Require("remove_ebx_item", p, plan, () =>
                 {
                 List<object> removed = new List<object>();
+                var clearedPaths = new List<string>();
                 foreach (int idx in toRemove)
                 {
                     object item = list[idx];
@@ -931,7 +934,7 @@ namespace FrostyMcpPlugin.Bridge
                                 (beforeL - CountList(asset.RootObject, "LinkConnections"));
                         }
                         if (cleanupConnections)
-                            RemoveReferencesToObject(asset, unwrapped, IsClassGuidUnique(asset, itemGuid));
+                            clearedPaths.AddRange(RemoveReferencesToObject(asset, unwrapped, IsClassGuidUnique(asset, itemGuid)));
 
                         if (removeObject && asset.Objects != null && asset.Objects.Cast<object>().Any(o => ReferenceEquals(o, unwrapped)))
                         {
@@ -959,7 +962,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["host_type"] = hostObj?.GetType().Name,
                     ["remaining"] = list.Count,
                     ["removed_count"] = removed.Count,
-                    ["removed"] = removed
+                    ["removed"] = removed,
+                    ["cleared_paths"] = clearedPaths,
+                    ["cleared_count"] = clearedPaths.Count
                 };
                 });
             }
@@ -2929,9 +2934,11 @@ namespace FrostyMcpPlugin.Bridge
 
         // Arrays other than the root Components/Objects can still point at the
         // removed object (children lists, nested member arrays). Clear those too.
-        private static void RemoveReferencesToObject(EbxAsset asset, object target, bool guidUnique)
+        // Returns the property paths that were cleared, so the caller can see what
+        // the removal touched instead of only getting a success flag.
+        private static List<string> RemoveReferencesToObject(EbxAsset asset, object target, bool guidUnique)
         {
-            PointerRef probe = new PointerRef(target);
+            var cleared = new List<string>();
             foreach (object host in asset.Objects.ToList())
             {
                 if (host == null || ReferenceEquals(host, target))
@@ -2946,11 +2953,21 @@ namespace FrostyMcpPlugin.Bridge
                     if (value == null)
                         continue;
 
+                    string path = host.GetType().Name + "." + pi.Name;
+
                     if (value is PointerRef pr)
                     {
                         if (PointerRefersTo(pr, target, guidUnique))
                         {
-                            try { if (pi.CanWrite) pi.SetValue(host, new PointerRef()); } catch { }
+                            try
+                            {
+                                if (pi.CanWrite)
+                                {
+                                    pi.SetValue(host, new PointerRef());
+                                    cleared.Add(path);
+                                }
+                            }
+                            catch { }
                         }
                         continue;
                     }
@@ -2961,12 +2978,18 @@ namespace FrostyMcpPlugin.Bridge
                         {
                             if (list[i] is PointerRef itemRef && PointerRefersTo(itemRef, target, guidUnique))
                             {
-                                try { list.RemoveAt(i); } catch { }
+                                try
+                                {
+                                    list.RemoveAt(i);
+                                    cleared.Add(path + "[" + i + "]");
+                                }
+                                catch { }
                             }
                         }
                     }
                 }
             }
+            return cleared;
         }
 
         private static bool PointerRefersTo(PointerRef pr, object target, bool guidUnique)
