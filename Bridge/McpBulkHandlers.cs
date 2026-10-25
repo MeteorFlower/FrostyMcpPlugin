@@ -315,6 +315,108 @@ namespace FrostyMcpPlugin.Bridge
             };
         }
 
+        public static object CheckAssetReady(JObject p)
+        {
+            if (App.AssetManager == null)
+                return McpHandlers.Error("AssetManager not ready", "NOT_READY");
+
+            EbxAssetEntry entry = McpHandlers.ResolveEbxEntry(p.Value<string>("name"), p.Value<string>("guid"));
+            if (entry == null)
+                return McpHandlers.Error("EBX not found", "NOT_FOUND");
+
+            string bundleName = (p.Value<string>("bundle") ?? "").Trim();
+            if (string.IsNullOrEmpty(bundleName))
+                return McpHandlers.Error("bundle is required", "INVALID_PARAMS");
+
+            int bid = McpHandlers.ResolveBundleId(bundleName);
+            if (bid < 0)
+                return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
+            BundleEntry bundle = App.AssetManager.GetBundleEntry(bid);
+
+            var reasons = new List<object>();
+            if (!entry.EnumerateBundles().Contains(bid))
+                reasons.Add(new Dictionary<string, object> { ["issue"] = "asset_not_in_bundle" });
+
+            EbxAsset asset;
+            try { asset = App.AssetManager.GetEbx(entry); }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error(ex.Message, "LOAD_FAILED");
+            }
+
+            var missingDeps = new List<object>();
+            foreach (Guid dep in asset.Dependencies)
+            {
+                EbxAssetEntry depEntry = App.AssetManager.GetEbxEntry(dep);
+                if (depEntry == null)
+                {
+                    missingDeps.Add(new Dictionary<string, object> { ["dep_guid"] = dep.ToString(), ["missing"] = true });
+                    continue;
+                }
+                if (!depEntry.EnumerateBundles().Contains(bid))
+                    missingDeps.Add(new Dictionary<string, object> { ["dep"] = depEntry.Name });
+            }
+            if (missingDeps.Count > 0)
+                reasons.Add(new Dictionary<string, object>
+                {
+                    ["issue"] = "dependencies_outside_bundle",
+                    ["count"] = missingDeps.Count,
+                    ["items"] = missingDeps
+                });
+
+            var missingLinked = new List<object>();
+            foreach (AssetEntry linked in entry.LinkedAssets)
+                if (!linked.EnumerateBundles().Contains(bid))
+                    missingLinked.Add(new Dictionary<string, object> { ["linked"] = linked.Name, ["type"] = linked.Type });
+            if (missingLinked.Count > 0)
+                reasons.Add(new Dictionary<string, object>
+                {
+                    ["issue"] = "linked_assets_outside_bundle",
+                    ["count"] = missingLinked.Count,
+                    ["items"] = missingLinked
+                });
+
+            return new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["name"] = entry.Name,
+                ["bundle"] = bundle.Name,
+                ["ready"] = reasons.Count == 0,
+                ["issue_count"] = reasons.Count,
+                ["issues"] = reasons,
+                ["note"] = "Linked assets are only reported once the editor has loaded them"
+            };
+        }
+
+        public static object RefreshMeshVariations(JObject p)
+        {
+            Type dbType = FindType("Frosty.Core.Viewport.MeshVariationDb");
+            if (dbType == null)
+                return McpHandlers.Error("MeshVariationDb is not available", "PLUGIN_MISSING");
+
+            MethodInfo load = dbType.GetMethod("LoadVariations",
+                BindingFlags.Public | BindingFlags.Static);
+            if (load == null)
+                return McpHandlers.Error("LoadVariations not found in this build", "NOT_IMPLEMENTED");
+
+            try
+            {
+                object task = McpHandlers.InvokeOnUi(() => McpEditHandlers.CreateTaskWindow());
+                object[] args = load.GetParameters().Length == 0
+                    ? new object[0]
+                    : new[] { task };
+                McpHandlers.InvokeOnUi(() => load.Invoke(null, args));
+                return new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["reloaded"] = true
+                };
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error(Unwrap(ex), "REFRESH_FAILED");
+            }
+        }
         public static object ManageBundles(JObject p)
         {
             if (App.AssetManager == null)

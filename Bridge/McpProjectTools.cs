@@ -497,7 +497,7 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("Bundle not found", "NOT_FOUND");
 
             BundleEntry be = App.AssetManager.GetBundleEntry(bid);
-            bool includeOutside = p.Value<bool?>("include_outside") ?? false;
+            bool includeOutside = p.Value<bool?>("include_outside") ?? true;
             int cap = p.Value<int?>("limit") ?? 200;
 
             int assets = 0, depTotal = 0, linkedTotal = 0;
