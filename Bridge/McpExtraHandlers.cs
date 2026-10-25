@@ -399,10 +399,6 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
-                // Bulk mode: properties = { "__bulk_file__": path, "__offset__": n, "__limit__": n }
-                if (p["properties"] is JObject bulkOpts && bulkOpts["__bulk_file__"] != null)
-                    return BulkCreateStructsFromFile(p, typeName, bulkOpts);
-
                 object inst = TypeLibrary.CreateObject(typeName);
                 if (inst == null)
                     return McpHandlers.Error("CreateObject returned null", "CREATE_FAILED");
@@ -465,97 +461,6 @@ namespace FrostyMcpPlugin.Bridge
             {
                 return McpHandlers.Error(ex.Message, "CREATE_FAILED");
             }
-        }
-
-        // Bulk-create structs from a JSON file, one object per entry, appended to a list path
-        private static object BulkCreateStructsFromFile(JObject p, string typeName, JObject opts)
-        {
-            string file = (opts.Value<string>("__bulk_file__") ?? "").Trim();
-            if (string.IsNullOrEmpty(file) || !System.IO.File.Exists(file))
-                return McpHandlers.Error("bulk file not found: " + file, "NOT_FOUND");
-
-            JArray items;
-            try
-            {
-                items = JArray.Parse(System.IO.File.ReadAllText(file));
-            }
-            catch (Exception ex)
-            {
-                return McpHandlers.Error("bulk file parse failed: " + ex.Message, "PARSE_FAILED");
-            }
-
-            EbxAssetEntry entry = McpHandlers.ResolveEbxEntry(p.Value<string>("name"), p.Value<string>("guid"));
-            if (entry == null)
-                return McpHandlers.Error("EBX not found for bulk assign", "NOT_FOUND");
-
-            string path = (p.Value<string>("path") ?? "").Trim();
-            if (string.IsNullOrEmpty(path))
-                return McpHandlers.Error("path is required for bulk assign", "INVALID_PARAMS");
-
-            int offset = Math.Max(0, opts.Value<int?>("__offset__") ?? 0);
-            int limit = opts.Value<int?>("__limit__") ?? int.MaxValue;
-
-            EbxAsset asset = App.AssetManager.GetEbx(entry);
-            object host = asset.RootObject;
-            string classGuid = (p.Value<string>("class_guid") ?? "").Trim();
-            if (!string.IsNullOrEmpty(classGuid) && Guid.TryParse(classGuid, out Guid cg))
-            {
-                foreach (object o in asset.Objects)
-                {
-                    try
-                    {
-                        if (((dynamic)o).GetInstanceGuid().ExportedGuid == cg) { host = o; break; }
-                    }
-                    catch { }
-                }
-            }
-
-            int created = 0;
-            List<string> errors = new List<string>();
-            int end = Math.Min(items.Count, offset + limit);
-            for (int i = offset; i < end; i++)
-            {
-                if (!(items[i] is JObject item))
-                    continue;
-                try
-                {
-                    object inst = TypeLibrary.CreateObject(typeName);
-                    if (inst == null)
-                    {
-                        errors.Add("item " + i + ": CreateObject returned null");
-                        continue;
-                    }
-                    foreach (JProperty prop in item.Properties())
-                    {
-                        PropertyInfo pi = inst.GetType().GetProperty(prop.Name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-                        if (pi == null || !pi.CanWrite)
-                            continue;
-                        pi.SetValue(inst, ConvertSimple(prop.Value, pi.PropertyType));
-                    }
-                    AppendOrSetStruct(host, path, inst);
-                    created++;
-                }
-                catch (Exception ex)
-                {
-                    errors.Add("item " + i + ": " + ex.Message);
-                }
-            }
-
-            asset.Update();
-            App.AssetManager.ModifyEbx(entry.Name, asset);
-
-            return new Dictionary<string, object>
-            {
-                ["success"] = true,
-                ["type"] = typeName,
-                ["assigned_to"] = entry.Name,
-                ["path"] = path,
-                ["created"] = created,
-                ["total"] = items.Count,
-                ["offset"] = offset,
-                ["failed"] = errors.Count,
-                ["errors"] = errors.GetRange(0, Math.Min(errors.Count, 20))
-            };
         }
 
         // =====================================================================
@@ -734,6 +639,7 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("Bundle not found: " + bundleName, "NOT_FOUND");
 
             var linked = new List<string>();
+            var errors = new List<object>();
 
             try
             {
@@ -765,7 +671,7 @@ namespace FrostyMcpPlugin.Bridge
                             entry.LinkAsset(chunk);
                         }
                     }
-                    catch (Exception ex) { linked.Add("movie_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "movie", ["error"] = ex.Message }); }
                 }
                 else if (type.IndexOf("NewWave", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
@@ -780,7 +686,7 @@ namespace FrostyMcpPlugin.Bridge
                         }
                         AddChunkListToBundle(entry, root, bid, linked);
                     }
-                    catch (Exception ex) { linked.Add("newwave_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "newwave", ["error"] = ex.Message }); }
                 }
                 else if (TypeLibrary.IsSubClassOf(type, "TextureBaseAsset") || type.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
@@ -803,7 +709,7 @@ namespace FrostyMcpPlugin.Bridge
                             entry.LinkAsset(resEntry);
                         }
                     }
-                    catch (Exception ex) { linked.Add("texture_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "texture", ["error"] = ex.Message }); }
                 }
                 else if (TypeLibrary.IsSubClassOf(type, "MeshAsset") || type.EndsWith("MeshAsset", StringComparison.OrdinalIgnoreCase))
                 {
@@ -834,12 +740,12 @@ namespace FrostyMcpPlugin.Bridge
                             }
                         }
                     }
-                    catch (Exception ex) { linked.Add("mesh_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "mesh", ["error"] = ex.Message }); }
                 }
                 else if (type.IndexOf("SoundWave", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     try { AddChunkListToBundle(entry, root, bid, linked); }
-                    catch (Exception ex) { linked.Add("sound_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "sound", ["error"] = ex.Message }); }
                 }
                 else
                 {
@@ -870,18 +776,36 @@ namespace FrostyMcpPlugin.Bridge
                             }
                         }
                     }
-                    catch (Exception ex) { linked.Add("resource_error:" + ex.Message); }
+                    catch (Exception ex) { errors.Add(new Dictionary<string, object> { ["section"] = "resource", ["error"] = ex.Message }); }
+                }
+
+                if (!ebxAdded && linked.Count == 0 && errors.Count == 0)
+                {
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Asset is already a member and has no resources left to add",
+                        ["error_code"] = "NOT_MEMBER",
+                        ["name"] = entry.Name,
+                        ["bundle"] = bundleName
+                    };
                 }
 
                 return new Dictionary<string, object>
                 {
-                    ["success"] = true,
+                    // A sub-step failure means the bundle is not complete, so the
+                    // call cannot report success.
+                    ["success"] = errors.Count == 0,
+                    ["error"] = errors.Count == 0 ? null : "One or more resources could not be added",
+                    ["error_code"] = errors.Count == 0 ? null : "PARTIAL",
                     ["name"] = entry.Name,
                     ["bundle"] = bundleName,
                     ["bundle_id"] = bid,
                     ["added"] = ebxAdded,
                     ["linked"] = linked,
-                    ["linked_count"] = linked.Count
+                    ["linked_count"] = linked.Count,
+                    ["errors"] = errors,
+                    ["error_count"] = errors.Count
                 };
             }
             catch (Exception ex)

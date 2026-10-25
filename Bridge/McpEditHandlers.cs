@@ -526,6 +526,17 @@ namespace FrostyMcpPlugin.Bridge
                     data = file;
                 }
 
+                // Keep the previous payload so a failed verification can put it back
+                // instead of leaving the asset in a half-written state.
+                byte[] previousData = null;
+                byte[] previousMeta = entry.ResMeta;
+                try
+                {
+                    using (NativeReader previous = new NativeReader(App.AssetManager.GetRes(entry)))
+                        previousData = previous.ReadToEnd();
+                }
+                catch { }
+
                 App.AssetManager.ModifyRes(entry.Name, data, meta);
 
                 // Read back through the same path the editor uses and compare bytes.
@@ -533,7 +544,14 @@ namespace FrostyMcpPlugin.Bridge
                 using (NativeReader reader = new NativeReader(App.AssetManager.GetRes(entry)))
                     roundtrip = reader.ReadToEnd();
                 if (!BytesEqual(data, roundtrip))
-                    return McpHandlers.Error("RES round-trip verification failed", "VERIFY_FAILED");
+                {
+                    if (previousData != null)
+                    {
+                        try { App.AssetManager.ModifyRes(entry.Name, previousData, previousMeta); }
+                        catch { }
+                    }
+                    return McpHandlers.Error("RES round-trip verification failed; the previous data was restored", "VERIFY_FAILED");
+                }
 
                 var result = new Dictionary<string, object>
                 {
@@ -1114,7 +1132,6 @@ namespace FrostyMcpPlugin.Bridge
                 catch { }
             }
         }
-
         private static bool IsResourceBackedType(string type)
         {
             if (string.IsNullOrEmpty(type))
@@ -1617,6 +1634,15 @@ namespace FrostyMcpPlugin.Bridge
             SetIfExists(options, "generateMipmaps", texture.MipCount > 1);
             SetIfExists(options, "resizeTexture", false);
 
+            // The converter needs the same output format the editor asks for,
+            // otherwise the rebuilt texture can switch pixel format wholesale.
+            try
+            {
+                bool srgb = (texture.Flags & TextureFlags.SrgbGamma) != 0;
+                SetIfExists(options, "format", TextureUtils.ToShaderFormat(texture.PixelFormat, srgb));
+            }
+            catch { }
+
             int fmtIndex = ext == ".tga" ? 1 : ext == ".hdr" ? 2 : 0;
             object imageFormat = Enum.ToObject(imageFormatType, fmtIndex);
             byte[] buf = File.ReadAllBytes(path);
@@ -1660,7 +1686,10 @@ namespace FrostyMcpPlugin.Bridge
 
             byte[] ddsData = File.ReadAllBytes(ddsPath);
 
-            if (rawChunk || FindType("TexturePlugin.FrostyTextureEditor") == null)
+            if (!rawChunk && FindType("TexturePlugin.FrostyTextureEditor") == null)
+                return McpHandlers.Error("TexturePlugin is not loaded; pass raw_chunk=true to write pixels without validation", "PLUGIN_MISSING");
+
+            if (rawChunk)
             {
                 if (oldTexture.Type != TextureType.TT_2d)
                     return McpHandlers.Error("Raw chunk import is only allowed for 2D textures; use a validated import", "TYPE_MISMATCH");
@@ -1804,8 +1833,7 @@ namespace FrostyMcpPlugin.Bridge
 
             if (ProfilesLibrary.MustAddChunks && chunkEntry != null && chunkEntry.Bundles.Count == 0 && !chunkEntry.IsAdded)
             {
-                // Chunk super-bundle bookkeeping exists only in the fork; the official
-                // SDK re-creates the chunk and lets the asset link carry the rest.
+                // Chunk super-bundle bookkeeping only exists in the fork.
                 chunkId = App.AssetManager.AddChunk(buffer, null, chunkTexture);
                 chunkEntry = App.AssetManager.GetChunkEntry(chunkId);
             }

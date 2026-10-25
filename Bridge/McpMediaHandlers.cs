@@ -175,7 +175,7 @@ namespace FrostyMcpPlugin.Bridge
             if (App.AssetManager == null)
                 return McpHandlers.Error("AssetManager not ready", "NOT_READY");
 
-            string newName = (p.Value<string>("new_name") ?? p.Value<string>("name") ?? "").Trim().Trim('/');
+            string newName = (p.Value<string>("new_name") ?? p.Value<string>("name") ?? "").Trim().Trim('/').ToLowerInvariant();
             if (string.IsNullOrEmpty(newName))
                 return McpHandlers.Error("new_name is required (e.g. Lua/LuaRunnerCompiledLua_MyScript_Win32)", "INVALID_PARAMS");
 
@@ -1008,6 +1008,11 @@ namespace FrostyMcpPlugin.Bridge
             "-*[0-9]+(([e]{1}[-]*([0-9]{0,12}))|([.]*(([0-9]{0,12}[ ,]{1})|([0-9]{0,3}))))",
             RegexOptions.Compiled);
 
+        private static float AsFloat(object host, string property)
+        {
+            object value = host?.GetType().GetProperty(property)?.GetValue(host);
+            return value == null ? 0f : Convert.ToSingle(value);
+        }
         private static float SvgFloat(string text)
         {
             return float.TryParse(text, System.Globalization.NumberStyles.Float,
@@ -1097,6 +1102,9 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 else if (token == 'L' || token == 'l')
                 {
+                    // SvgPath stores one cubic segment per three points, so an
+                    // on-curve command contributes three identical points, exactly
+                    // like the editor's importer.
                     for (int j = 0; j + 1 < data.Count; j += 2)
                     {
                         float x = data[j], y = data[j + 1];
@@ -1107,6 +1115,8 @@ namespace FrostyMcpPlugin.Bridge
                         }
                         setAbsolute(x, y);
                         add();
+                        add();
+                        add();
                     }
                 }
                 else if (token == 'V' || token == 'v')
@@ -1114,6 +1124,8 @@ namespace FrostyMcpPlugin.Bridge
                     foreach (float y in data)
                     {
                         setAbsolute(relPos.X, token == 'v' ? relPos.Y + y : y);
+                        add();
+                        add();
                         add();
                     }
                 }
@@ -1123,26 +1135,40 @@ namespace FrostyMcpPlugin.Bridge
                     {
                         setAbsolute(token == 'h' ? relPos.X + x : x, relPos.Y);
                         add();
+                        add();
+                        add();
                     }
                 }
                 else if (token == 'S' || token == 's')
                 {
                     for (int j = 0; j + 3 < data.Count; j += 4)
                     {
+                        // The first point is the previous control point reflected
+                        // about the current position, same as the editor.
+                        float rx = relPos.X, ry = relPos.Y;
                         float cx = data[j], cy = data[j + 1];
                         if (token == 's')
                         {
                             cx += relPos.X;
                             cy += relPos.Y;
                         }
-                        setAbsolute(cx, cy);
-                        add();
                         float ex = data[j + 2], ey = data[j + 3];
                         if (token == 's')
                         {
                             ex += relPos.X;
                             ey += relPos.Y;
                         }
+                        IList existing = (IList)pathType.GetProperty("Points").GetValue(currentPath);
+                        if (existing.Count >= 2)
+                        {
+                            object prev = existing[existing.Count - 2];
+                            rx = rx - AsFloat(prev, "X") + rx;
+                            ry = ry - AsFloat(prev, "Y") + ry;
+                        }
+                        setAbsolute(rx, ry);
+                        add();
+                        setAbsolute(cx, cy);
+                        add();
                         setAbsolute(ex, ey);
                         add();
                     }
@@ -1150,7 +1176,15 @@ namespace FrostyMcpPlugin.Bridge
                 else if (token == 'Z' || token == 'z')
                 {
                     if (hasPoints)
+                    {
                         pathType.GetProperty("Closed")?.SetValue(currentPath, true);
+                        IList closed = (IList)pathType.GetProperty("Points").GetValue(currentPath);
+                        if (closed.Count > 0)
+                        {
+                            object first = closed[0];
+                            setAbsolute(AsFloat(first, "X"), AsFloat(first, "Y"));
+                        }
+                    }
                 }
                 else if (token == 'A' || token == 'a')
                 {

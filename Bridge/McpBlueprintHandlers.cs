@@ -2231,7 +2231,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["name"] = GetObjectName(obj),
                 ["is_root"] = ReferenceEquals(obj, asset.RootObject),
                 ["flags"] = flags,
-                ["flags_hex"] = "0x" + flags.ToString("X8"),
                 ["realm"] = TryGetEnumString(obj, "Realm")
             };
             if (!compact)
@@ -3614,14 +3613,17 @@ namespace FrostyMcpPlugin.Bridge
             }
 
             object comp = ResolveComponent(asset, p, out int index);
-            if (comp == null && p["index"] == null && string.IsNullOrEmpty(p.Value<string>("class_guid")))
+            // Only fall back to the root when the caller named no component at all;
+            // a misspelled component_type must not silently read the root object.
+            if (comp == null && p["index"] == null && string.IsNullOrEmpty(p.Value<string>("class_guid"))
+                && string.IsNullOrEmpty(p.Value<string>("component_type")))
             {
                 // allow path-only relative to root
                 comp = asset.RootObject;
                 index = 0;
             }
             if (comp == null)
-                return McpHandlers.Error("Component not found (provide class_guid or index)", "NOT_FOUND");
+                return McpHandlers.Error("Component not found (provide class_guid, index or component_type)", "NOT_FOUND");
 
             try
             {

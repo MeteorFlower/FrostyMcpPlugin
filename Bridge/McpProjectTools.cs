@@ -315,7 +315,7 @@ namespace FrostyMcpPlugin.Bridge
 
             int cap = p.Value<int?>("limit") ?? 200;
             List<object> issues = new List<object>();
-            int scanned = 0, truncatedAssets = 0;
+            int scanned = 0;
 
             foreach (EbxAssetEntry entry in entries)
             {
@@ -336,7 +336,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     string typeName = obj.GetType().Name;
                     WalkRefs(obj, obj.GetType(), "", entry, entry.Guid, exported, issues, cap, 0);
-                    if (issues.Count >= cap) { truncatedAssets++; break; }
+                    if (issues.Count >= cap) break;
                 }
                 if (issues.Count >= cap) break;
             }
@@ -347,8 +347,8 @@ namespace FrostyMcpPlugin.Bridge
                 ["scanned_assets"] = scanned,
                 ["issue_count"] = issues.Count,
                 ["issues"] = issues,
-                ["truncated"] = issues.Count >= cap,
-                ["truncated_assets"] = truncatedAssets
+                ["unscanned_assets"] = entries.Count - scanned,
+                ["truncated"] = issues.Count >= cap || scanned < entries.Count
             };
         }
 
@@ -595,7 +595,12 @@ namespace FrostyMcpPlugin.Bridge
                 ["linked_outside_returned"] = linkedOutside.Count,
                 ["linked_outside"] = linkedOutside,
                 ["include_outside"] = includeOutside,
-                ["truncated"] = missingTotal > missing.Count || outsideTotal > outside.Count || linkedOutsideTotal > linkedOutside.Count
+                // outside is only collected when include_outside is set, so it is
+                // reported as omitted rather than truncated.
+                ["omitted_outside_count"] = includeOutside ? 0 : outsideTotal,
+                ["truncated"] = missingTotal > missing.Count
+                    || (includeOutside && outsideTotal > outside.Count)
+                    || linkedOutsideTotal > linkedOutside.Count
             };
         }
 
@@ -617,6 +622,7 @@ namespace FrostyMcpPlugin.Bridge
             }
 
             List<string> registries = new List<string>();
+            int registriesSkipped = 0;
             if (p["registries"] is JArray regs && regs.Count > 0)
                 registries.AddRange(regs.Select(r => r.ToString()));
             else if (!string.IsNullOrWhiteSpace(p.Value<string>("registry")))
@@ -624,14 +630,24 @@ namespace FrostyMcpPlugin.Bridge
             else
             {
                 // Discover the profile's own registries instead of assuming the
-                // BF1 character registry names.
+                // BF1 character registry names. A big profile has thousands of them
+                // and each one has to be loaded, so keep the default sweep small and
+                // say how many were skipped.
+                int maxRegistries = p.Value<int?>("max_registries") ?? 8;
+                if (maxRegistries < 1) maxRegistries = 1;
+                int discovered = 0;
                 foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
                 {
-                    if (e.Type != null && e.Type.EndsWith("NetworkRegistryAsset", StringComparison.OrdinalIgnoreCase))
+                    if (e.Type == null || !e.Type.EndsWith("NetworkRegistryAsset", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    discovered++;
+                    if (registries.Count < maxRegistries)
                         registries.Add(e.Name);
                 }
                 if (registries.Count == 0)
                     return McpHandlers.Error("No NetworkRegistryAsset found; pass registries explicitly", "NOT_FOUND");
+                if (discovered > registries.Count)
+                    registriesSkipped = discovered - registries.Count;
             }
 
             Dictionary<string, HashSet<string>> regSets = new Dictionary<string, HashSet<string>>();
@@ -714,6 +730,8 @@ namespace FrostyMcpPlugin.Bridge
             {
                 ["success"] = true,
                 ["asset_count"] = assetNames.Count,
+                ["registries_checked"] = registries,
+                ["registries_skipped"] = registriesSkipped,
                 ["missing_total"] = totalMissing,
                 ["assets"] = results
             };

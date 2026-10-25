@@ -23,9 +23,16 @@ namespace FrostyMcpPlugin.Bridge
     /// </summary>
     internal static class McpProjectLifecycleHandlers
     {
+        // Handlers run on the pipe thread; Application.Current.MainWindow may only be
+        // touched from the dispatcher thread, so read it through InvokeOnUi.
+        private static Window GetMainWindow()
+        {
+            return McpHandlers.InvokeOnUi(() => Application.Current?.MainWindow);
+        }
+
         private static FrostyProject GetProject()
         {
-            Window window = Application.Current?.MainWindow;
+            Window window = GetMainWindow();
             if (window == null)
                 return null;
             PropertyInfo pi = window.GetType().GetProperty("Project", BindingFlags.Public | BindingFlags.Instance);
@@ -69,6 +76,7 @@ namespace FrostyMcpPlugin.Bridge
             try
             {
                 McpHandlers.InvokeOnUi(() => project.Save());
+                McpHandlers.InvokeOnUi(() => RefreshAfterSave(project));
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -103,6 +111,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     project.Filename = path;
                     project.Save();
+                    RefreshAfterSave(project);
                 });
                 return new Dictionary<string, object>
                 {
@@ -153,7 +162,7 @@ namespace FrostyMcpPlugin.Bridge
         public static object OpenProject(JObject p)
         {
             FrostyProject project = GetProject();
-            Window window = Application.Current?.MainWindow;
+            Window window = GetMainWindow();
             if (project == null || window == null)
                 return McpHandlers.Error("No Frosty project window is available", "NOT_READY");
 
@@ -162,13 +171,18 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("path to an existing .fbproject is required", "INVALID_PARAMS");
 
             bool saveFirst = p.Value<bool?>("save_first") ?? false;
-            if (project.IsDirty)
+            bool discard = p.Value<bool?>("discard") ?? false;
+            if (project.IsDirty && discard)
+            {
+                saveFirst = false;
+            }
+            else if (project.IsDirty)
             {
                 if (!saveFirst)
                     return McpHandlers.Error("The current project has unsaved changes", "DIRTY_PROJECT");
                 if (string.IsNullOrEmpty(project.Filename))
                     return McpHandlers.Error("The current project has no filename to save to", "INVALID_STATE");
-                try { project.Save(); }
+                try { McpHandlers.InvokeOnUi(() => project.Save()); }
                 catch (Exception ex) { return McpHandlers.Error(ex.Message, "SAVE_FAILED"); }
             }
 
@@ -181,10 +195,26 @@ namespace FrostyMcpPlugin.Bridge
             try
             {
                 FrostyProject before = project;
+                int assetsBefore = (int)App.AssetManager.GetEbxCount();
                 McpHandlers.InvokeOnUi(() => load.Invoke(window, new object[] { path, false }));
                 FrostyProject after = GetProject();
                 if (ReferenceEquals(after, before))
-                    return McpHandlers.Error("The editor did not load the project (profile mismatch or invalid file)", "LOAD_FAILED");
+                {
+                    // Frosty resets the asset manager before it parses the file, so a
+                    // failed load leaves the editor with nothing loaded.
+                    int assetsAfter = (int)App.AssetManager.GetEbxCount();
+                    var failure = new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = assetsAfter < assetsBefore
+                            ? "The project could not be loaded and the previous project was unloaded in the process"
+                            : "The editor did not load the project (profile mismatch or invalid file)",
+                        ["error_code"] = assetsAfter < assetsBefore ? "ASSETS_LOST" : "LOAD_FAILED",
+                        ["assets_before"] = assetsBefore,
+                        ["assets_after"] = assetsAfter
+                    };
+                    return failure;
+                }
 
                 return new Dictionary<string, object>
                 {
@@ -208,20 +238,28 @@ namespace FrostyMcpPlugin.Bridge
         public static object NewProject(JObject p)
         {
             FrostyProject project = GetProject();
-            Window window = Application.Current?.MainWindow;
+            Window window = GetMainWindow();
             if (project == null || window == null)
                 return McpHandlers.Error("No Frosty project window is available", "NOT_READY");
 
             bool saveFirst = p.Value<bool?>("save_first") ?? false;
-            if (project.IsDirty)
+            bool discard = p.Value<bool?>("discard") ?? false;
+            if (project.IsDirty && discard)
+            {
+                saveFirst = false;
+            }
+            else if (project.IsDirty)
             {
                 if (!saveFirst)
                     return McpHandlers.Error("The current project has unsaved changes", "DIRTY_PROJECT");
                 if (string.IsNullOrEmpty(project.Filename))
                     return McpHandlers.Error("The current project has no filename to save to", "INVALID_STATE");
-                try { project.Save(); }
+                try { McpHandlers.InvokeOnUi(() => project.Save()); }
                 catch (Exception ex) { return McpHandlers.Error(ex.Message, "SAVE_FAILED"); }
             }
+
+            if (project.IsDirty)
+                return McpHandlers.Error("The project is still dirty after saving; NewProject would open a save prompt", "DIRTY_PROJECT");
 
             MethodInfo create = window.GetType().GetMethod("NewProject",
                 BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null);
@@ -230,12 +268,17 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                FrostyProject before = project;
                 McpHandlers.InvokeOnUi(() => create.Invoke(window, null));
+                FrostyProject after = GetProject();
+                if (ReferenceEquals(after, before))
+                    return McpHandlers.Error("The editor did not start a new project", "NEW_PROJECT_FAILED");
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
-                    ["filename"] = GetProject()?.Filename ?? "",
-                    ["is_dirty"] = GetProject()?.IsDirty ?? false
+                    ["filename"] = after.Filename ?? "",
+                    ["is_dirty"] = after.IsDirty
                 };
             }
             catch (TargetInvocationException tie)
@@ -364,7 +407,15 @@ namespace FrostyMcpPlugin.Bridge
                 if (p.Value<string>("version") != null) settings.Version = p.Value<string>("version");
                 if (p.Value<string>("description") != null) settings.Description = p.Value<string>("description");
                 if (p.Value<string>("link") != null) settings.Link = p.Value<string>("link");
-                if (p["selected_category"] != null) settings.SelectedCategory = p.Value<int>("selected_category");
+                if (p["selected_category"] != null)
+                {
+                    int selected = p.Value<int>("selected_category");
+                    if (selected < 0 || selected >= ModCategories.Length)
+                        return McpHandlers.Error("selected_category must be 0.." + (ModCategories.Length - 1), "INVALID_PARAMS");
+                    settings.SelectedCategory = selected;
+                    if (selected != 0 && p.Value<string>("category") == null)
+                        settings.Category = ModCategories[selected];
+                }
                 if (icon != null) settings.Icon = icon;
                 foreach (KeyValuePair<int, byte[]> shot in screenshots)
                     settings.SetScreenshot(shot.Key, shot.Value);
@@ -394,6 +445,13 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("path must end with .fbmod", "INVALID_PARAMS");
             if (File.Exists(path) && !(p.Value<bool?>("overwrite") ?? false))
                 return McpHandlers.Error("Target file already exists", "ALREADY_EXISTS");
+
+            if (App.AssetManager.GetModifiedCount() == 0u && !(p.Value<bool?>("allow_empty") ?? false))
+            {
+                return McpHandlers.Error(
+                    "The project has no modifications; pass allow_empty=true to export an empty mod",
+                    "NOTHING_TO_EXPORT");
+            }
 
             ModSettings baseSettings = project.GetModSettings();
             ModSettings export = new ModSettings
@@ -442,32 +500,48 @@ namespace FrostyMcpPlugin.Bridge
                         export.SetScreenshot(i, baseSettings.GetScreenshot(i));
                 }
 
-                // 1.0.6.3 takes editorLaunch + CancellationToken; the Virjoinga fork
-                // only takes the two main arguments. Bind whichever exists.
-                MethodInfo writeToMod = typeof(FrostyProject).GetMethods()
-                    .Where(m => m.Name == "WriteToMod")
-                    .OrderByDescending(m => m.GetParameters().Length)
-                    .FirstOrDefault();
-                if (writeToMod == null)
-                    return McpHandlers.Error("FrostyProject.WriteToMod not found", "NOT_IMPLEMENTED");
+                string finalPath = Path.GetFullPath(path);
+                string tempPath = finalPath + ".tmp";
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
 
-                ParameterInfo[] writeParams = writeToMod.GetParameters();
-                object[] writeArgs = new object[writeParams.Length];
-                writeArgs[0] = path;
-                writeArgs[1] = export;
-                for (int i = 2; i < writeParams.Length; i++)
-                    writeArgs[i] = writeParams[i].HasDefaultValue
-                        ? writeParams[i].DefaultValue
-                        : (writeParams[i].ParameterType.IsValueType
-                            ? Activator.CreateInstance(writeParams[i].ParameterType)
-                            : null);
+                // WriteToMod creates the target directly, so a failure would leave
+                // a truncated .fbmod behind. Build it beside the target and move it.
+                try
+                {
+                    // 1.0.6.3 takes editorLaunch + CancellationToken; pick the widest
+                    // overload and fill the extra arguments with defaults.
+                    MethodInfo writeToMod = typeof(FrostyProject).GetMethods()
+                        .Where(m => m.Name == "WriteToMod")
+                        .OrderByDescending(m => m.GetParameters().Length)
+                        .First();
+                    ParameterInfo[] writeParams = writeToMod.GetParameters();
+                    object[] writeArgs = new object[writeParams.Length];
+                    writeArgs[0] = tempPath;
+                    writeArgs[1] = export;
+                    for (int i = 2; i < writeParams.Length; i++)
+                        writeArgs[i] = writeParams[i].HasDefaultValue
+                            ? writeParams[i].DefaultValue
+                            : (writeParams[i].ParameterType.IsValueType
+                                ? Activator.CreateInstance(writeParams[i].ParameterType)
+                                : null);
+                    McpHandlers.InvokeOnUi(() => writeToMod.Invoke(project, writeArgs));
+                }
+                catch
+                {
+                    try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                    throw;
+                }
 
-                McpHandlers.InvokeOnUi(() => writeToMod.Invoke(project, writeArgs));
+                if (File.Exists(finalPath))
+                    File.Delete(finalPath);
+                File.Move(tempPath, finalPath);
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
-                    ["path"] = Path.GetFullPath(path),
-                    ["size"] = new FileInfo(path).Length
+                    ["path"] = finalPath,
+                    ["size"] = new FileInfo(finalPath).Length
                 };
             }
             catch (Exception ex)
@@ -489,13 +563,15 @@ namespace FrostyMcpPlugin.Bridge
 
             int maxChars = p.Value<int?>("max_chars") ?? 20000;
             if (maxChars < 1) maxChars = 20000;
-            bool truncated = text.Length > maxChars;
+            int totalLength = text.Length;
+            bool truncated = totalLength > maxChars;
             if (truncated)
-                text = text.Substring(text.Length - maxChars);
+                text = text.Substring(totalLength - maxChars);
             return new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["truncated"] = truncated,
+                ["total_length"] = totalLength,
                 ["length"] = text.Length,
                 ["text"] = text
             };
@@ -586,38 +662,83 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error("AssetManager not ready", "NOT_READY");
 
             int limit = p.Value<int?>("limit") ?? 100;
-            List<object> mismatches = new List<object>();
-            Dictionary<Guid, string> seen = new Dictionary<Guid, string>();
-            int scanned = 0;
+            if (limit < 1) limit = 1;
+            int maxScan = p.Value<int?>("max_scan") ?? 5000;
+            if (maxScan < 1) maxScan = 1;
+            string nameFilter = (p.Value<string>("query") ?? "").Trim();
+            bool addedOnly = p.Value<bool?>("added_only") ?? false;
 
-            foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
+            var candidates = new List<EbxAssetEntry>();
+            if (p["names"] is JArray names && names.Count > 0)
+            {
+                foreach (JToken token in names)
+                {
+                    EbxAssetEntry entry = McpHandlers.ResolveEbxEntry(token.ToString(), null);
+                    if (entry != null)
+                        candidates.Add(entry);
+                }
+            }
+            else
+            {
+                foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
+                {
+                    if (addedOnly && !entry.IsAdded)
+                        continue;
+                    if (!string.IsNullOrEmpty(nameFilter) &&
+                        entry.Name.IndexOf(nameFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+                    candidates.Add(entry);
+                }
+            }
+
+            bool scanTruncated = candidates.Count > maxScan;
+            if (scanTruncated)
+                candidates = candidates.Take(maxScan).ToList();
+
+            var mismatches = new List<object>();
+            var seen = new Dictionary<Guid, string>();
+            int scanned = 0, loadFailures = 0, issuesFound = 0;
+
+            foreach (EbxAssetEntry entry in candidates)
             {
                 EbxAsset asset;
                 try { asset = App.AssetManager.GetEbx(entry); }
-                catch { continue; }
-                if (asset == null) continue;
+                catch { loadFailures++; continue; }
+                if (asset == null)
+                {
+                    loadFailures++;
+                    continue;
+                }
                 scanned++;
 
-                if (asset.FileGuid != entry.Guid && mismatches.Count < limit)
+                if (asset.FileGuid != entry.Guid)
                 {
-                    mismatches.Add(new Dictionary<string, object>
+                    issuesFound++;
+                    if (mismatches.Count < limit)
                     {
-                        ["kind"] = "entry_file_mismatch",
-                        ["name"] = entry.Name,
-                        ["entry_guid"] = entry.Guid.ToString(),
-                        ["file_guid"] = asset.FileGuid.ToString()
-                    });
+                        mismatches.Add(new Dictionary<string, object>
+                        {
+                            ["kind"] = "entry_file_mismatch",
+                            ["name"] = entry.Name,
+                            ["entry_guid"] = entry.Guid.ToString(),
+                            ["file_guid"] = asset.FileGuid.ToString()
+                        });
+                    }
                 }
 
-                if (seen.TryGetValue(asset.FileGuid, out string other) && other != entry.Name && mismatches.Count < limit)
+                if (seen.TryGetValue(asset.FileGuid, out string other) && other != entry.Name)
                 {
-                    mismatches.Add(new Dictionary<string, object>
+                    issuesFound++;
+                    if (mismatches.Count < limit)
                     {
-                        ["kind"] = "duplicate_file_guid",
-                        ["name"] = entry.Name,
-                        ["other"] = other,
-                        ["file_guid"] = asset.FileGuid.ToString()
-                    });
+                        mismatches.Add(new Dictionary<string, object>
+                        {
+                            ["kind"] = "duplicate_file_guid",
+                            ["name"] = entry.Name,
+                            ["other"] = other,
+                            ["file_guid"] = asset.FileGuid.ToString()
+                        });
+                    }
                 }
                 else if (!seen.ContainsKey(asset.FileGuid))
                 {
@@ -628,10 +749,15 @@ namespace FrostyMcpPlugin.Bridge
             return new Dictionary<string, object>
             {
                 ["success"] = true,
+                ["candidate_count"] = candidates.Count,
                 ["scanned_assets"] = scanned,
-                ["issue_count"] = mismatches.Count,
+                ["load_failures"] = loadFailures,
+                ["max_scan"] = maxScan,
+                ["scan_truncated"] = scanTruncated,
+                ["issue_count"] = issuesFound,
+                ["issues_returned"] = mismatches.Count,
                 ["issues"] = mismatches,
-                ["truncated"] = mismatches.Count >= limit
+                ["truncated"] = issuesFound > mismatches.Count
             };
         }
 
@@ -645,7 +771,7 @@ namespace FrostyMcpPlugin.Bridge
                 "SvgImagePlugin.SvgImage",
                 "IesResourcePlugin.IesResource",
                 "DuplicationPlugin.DuplicateAssetExtension",
-                "PVZBundleManagerPlugin.BundleManager",
+                "PvZBundleManagerPlugin.Plugin",
                 "AdvancedBundleEditorPlugin.BundleEditors",
                 "BlueprintEditorPlugin.ExtensionsManager",
                 "Frosty.Core.Windows.FrostyTaskWindow"
@@ -671,25 +797,6 @@ namespace FrostyMcpPlugin.Bridge
                 ["plugins"] = plugins,
                 ["localization_db"] = LocalizationDatabaseKind()
             };
-        }
-
-        private static string ReadStringMember(object host, string name)
-        {
-            object value = host?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host);
-            return value as string ?? "";
-        }
-
-        private static bool ReadBoolMember(object host, string name)
-        {
-            object value = host?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host);
-            return value is bool b && b;
-        }
-
-        private static uint ReadUIntMember(object host, string name)
-        {
-            object value = host?.GetType().GetField(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host)
-                ?? host?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host);
-            return value == null ? 0u : Convert.ToUInt32(value);
         }
 
         private static string LocalizationDatabaseKind()
@@ -718,6 +825,14 @@ namespace FrostyMcpPlugin.Bridge
             return null;
         }
 
+        // Mirrors ModSettingsWindow.categories; index 0 means Custom, where the
+        // caller supplies the text itself.
+        private static readonly string[] ModCategories =
+        {
+            "Custom", "Audio", "Cosmetic", "Gameplay", "Graphic",
+            "Map", "Miscellaneous", "User Interface", "Visuals"
+        };
+
         // ---- helpers ----
 
         private static Dictionary<string, object> SerializeModSettings(ModSettings s)
@@ -731,6 +846,10 @@ namespace FrostyMcpPlugin.Bridge
                 ["version"] = s.Version,
                 ["description"] = s.Description,
                 ["link"] = s.Link,
+                // Link only reaches a .fbmod and SelectedCategory reaches neither
+                // file, so callers can see what a save will actually keep.
+                ["link_persists_to"] = "fbmod",
+                ["selected_category_persists_to"] = "none",
                 ["is_dirty"] = s.IsDirty,
                 ["has_icon"] = s.Icon != null,
                 ["screenshots"] = Enumerable.Range(0, 4).Count(i => s.GetScreenshot(i) != null)
@@ -759,6 +878,51 @@ namespace FrostyMcpPlugin.Bridge
             return null;
         }
 
+        // The File menu refreshes the explorers, the title, the recent project list
+        // and the autosave timer after a save. Do the same, ignoring anything that
+        // does not exist in this build.
+        private static void RefreshAfterSave(FrostyProject project)
+        {
+            RefreshDataExplorer();
+            object window = App.EditorWindow;
+            if (window == null)
+                return;
+
+            try
+            {
+                Type type = window.GetType();
+                MethodInfo recent = type.GetMethod("AddRecentProject",
+                    BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                if (recent != null && recent.GetParameters().Length == 1 && !string.IsNullOrEmpty(project?.Filename))
+                    recent.Invoke(window, new object[] { project.Filename });
+            }
+            catch { }
+
+            try
+            {
+                window.GetType().GetMethod("UpdateWindowTitle",
+                    BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance)?.Invoke(window, null);
+            }
+            catch { }
+        }
+        private static string ReadStringMember(object host, string name)
+        {
+            object value = host?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host);
+            return value as string ?? "";
+        }
+
+        private static bool ReadBoolMember(object host, string name)
+        {
+            object value = host?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host);
+            return value is bool b && b;
+        }
+
+        private static uint ReadUIntMember(object host, string name)
+        {
+            object value = host?.GetType().GetField(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host)
+                ?? host?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(host);
+            return value == null ? 0u : Convert.ToUInt32(value);
+        }
         private static void RefreshDataExplorer()
         {
             object window = App.EditorWindow;

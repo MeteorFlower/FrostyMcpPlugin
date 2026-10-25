@@ -43,7 +43,7 @@ namespace FrostyMcpPlugin.Bridge
             string typeFilter = (p.Value<string>("type") ?? "").Trim();
             int limit = p.Value<int?>("limit") ?? 0;
 
-            int tabSize = Config.Get<int>("ExportTabSize", 2);
+            Config.Get<int>("ExportTabSize", 2);
 
             List<EbxAssetEntry> entries = new List<EbxAssetEntry>();
             foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
@@ -67,6 +67,7 @@ namespace FrostyMcpPlugin.Bridge
 
             var exported = new List<object>();
             var failures = new List<object>();
+            int skippedExisting = 0;
             try
             {
                 Directory.CreateDirectory(outDir);
@@ -87,12 +88,7 @@ namespace FrostyMcpPlugin.Bridge
 
                 if (!overwrite && File.Exists(target))
                 {
-                    failures.Add(new Dictionary<string, object>
-                    {
-                        ["name"] = entry.Name,
-                        ["error"] = "already exists",
-                        ["error_code"] = "ALREADY_EXISTS"
-                    });
+                    skippedExisting++;
                     continue;
                 }
 
@@ -140,6 +136,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["dir"] = Path.GetFullPath(outDir),
                 ["format"] = format,
                 ["exported_count"] = exported.Count,
+                ["skipped_existing"] = skippedExisting,
                 ["failed_count"] = failures.Count,
                 ["exported"] = exported,
                 ["failures"] = failures
@@ -252,6 +249,21 @@ namespace FrostyMcpPlugin.Bridge
             {
                 try
                 {
+                    int cacheEntries = ReadBundleCacheCount(manager);
+                    if (cacheEntries == 0)
+                    {
+                        return new Dictionary<string, object>
+                        {
+                            ["success"] = true,
+                            ["name"] = entry.Name,
+                            ["bundle"] = bundle.Name,
+                            ["can_be_loaded"] = null,
+                            ["degraded"] = true,
+                            ["engine"] = "bundle_cache_not_loaded",
+                            ["hint"] = "PVZBundleManagerPlugin has no parent/prev bundle table yet"
+                        };
+                    }
+
                     MethodInfo method = manager.GetType().GetMethod("CanBeLoadedByBundle",
                         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null,
                         new[] { typeof(EbxAssetEntry), typeof(int) }, null);
@@ -311,6 +323,11 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("EBX not found", "NOT_FOUND");
 
+            if (!ProfilesLibrary.IsLoaded(ProfileVersion.PlantsVsZombiesGardenWarfare,
+                ProfileVersion.PlantsVsZombiesGardenWarfare2,
+                ProfileVersion.PlantsVsZombiesBattleforNeighborville))
+                return McpHandlers.Error("Bundle manager only supports GW1, GW2 and BFN", "NOT_SUPPORTED_PROFILE");
+
             object instance = GetBundleManager();
             if (instance == null)
                 return McpHandlers.Error("PVZBundleManagerPlugin is not loaded", "PLUGIN_MISSING");
@@ -331,14 +348,38 @@ namespace FrostyMcpPlugin.Bridge
             {
                 try
                 {
-                    object result = McpHandlers.InvokeOnUi(() => manage.Invoke(instance, new object[] { entry }));
-                    return Wrap(result, entry.Name);
+                    int bundlesBefore = entry.EnumerateBundles().Count();
+                    int modifiedBefore = (int)App.AssetManager.GetModifiedCount();
+                    McpHandlers.InvokeOnUi(() => manage.Invoke(instance, new object[] { entry }));
+
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["name"] = entry.Name,
+                        ["bundles_before"] = bundlesBefore,
+                        ["bundles_after"] = entry.EnumerateBundles().Count(),
+                        ["modified_before"] = modifiedBefore,
+                        ["modified_after"] = (int)App.AssetManager.GetModifiedCount(),
+                        ["engine"] = "PVZBundleManagerPlugin.BundleManager"
+                    };
                 }
                 catch (Exception ex)
                 {
                     return McpHandlers.Error(Unwrap(ex), "MANAGE_FAILED");
                 }
             });
+        }
+
+        // The plugin answers CanBeLoadedByBundle from this table; empty means the
+        // answer would only reflect direct membership.
+        private static int ReadBundleCacheCount(object manager)
+        {
+            FieldInfo field = manager.GetType().GetField("m_bundleAndParents",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            object value = field?.GetValue(manager);
+            if (value is System.Collections.ICollection collection)
+                return collection.Count;
+            return value == null ? 0 : 1;
         }
 
         // Plugin.BundleManager is a public static property on PvZBundleManagerPlugin.Plugin.
