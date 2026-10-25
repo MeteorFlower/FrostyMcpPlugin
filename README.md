@@ -157,6 +157,10 @@ If you already configured Claude Desktop, you can import with `claude mcp add-fr
 
 The repository ships an agent skill and a plugin manifest, so a Claude Code installation can load the tools and their usage notes together:
 
+```
+/plugin install frosty-mcp --marketplace MeteorFlower/FrostyMcpPlugin
+```
+
 | Path | Purpose |
 |------|---------|
 | `skills/frosty-mcp/SKILL.md` | The skill. Claude Code exposes it as `frosty-mcp:frosty-mcp` when the repository is installed as a plugin |
