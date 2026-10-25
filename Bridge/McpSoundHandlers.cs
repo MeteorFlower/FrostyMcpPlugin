@@ -259,7 +259,15 @@ namespace FrostyMcpPlugin.Bridge
             }
             catch (Exception ex)
             {
-                return McpHandlers.Error(Unwrap(ex), "IMPORT_FAILED");
+                // The encoder and the chunk write happen before the tables are
+                // updated, so a failure can leave an added chunk behind.
+                return new Dictionary<string, object>
+                {
+                    ["success"] = false,
+                    ["error"] = Unwrap(ex),
+                    ["error_code"] = "IMPORT_FAILED",
+                    ["partial_changes_possible"] = true
+                };
             }
         }
 
