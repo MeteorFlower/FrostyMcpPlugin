@@ -9,7 +9,7 @@ using System.Reflection;
 namespace FrostyMcpPlugin.Bridge
 {
     /// <summary>
-    /// Type Explorer–aligned SDK type browsing (list / detail / nested field types).
+    /// SDK type browsing aligned with Type Explorer (list / detail / nested field types).
     /// Mirrors Plugins/TypeExplorerPlugin/FrostyTypeExplorer.cs behavior for MCP.
     /// </summary>
     internal static class McpTypeExplorerHandlers
@@ -541,9 +541,10 @@ namespace FrostyMcpPlugin.Bridge
             return propName;
         }
 
+        // Matches McpHandlers.ClampLimit: 0 means no rows, not one.
         private static int ClampLimit(int limit)
         {
-            if (limit < 1) return 1;
+            if (limit < 1) return 0;
             if (limit > MaxLimit) return MaxLimit;
             return limit;
         }

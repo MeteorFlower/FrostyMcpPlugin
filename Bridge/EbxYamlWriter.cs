@@ -1,4 +1,4 @@
-using FrostySdk.Attributes;
+﻿using FrostySdk.Attributes;
 using FrostySdk.Ebx;
 using FrostySdk.Managers;
 using System;
@@ -18,6 +18,40 @@ namespace FrostySdk.IO
     public class EbxYamlWriter : IDisposable
     {
         private const BindingFlags PropertyBindingFlags = BindingFlags.Public | BindingFlags.Instance;
+
+        // A large asset repeats the same few hundred types, so the sorted property
+        // list and the __Guid field are resolved once per type. Concurrent because
+        // exports run on worker threads.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, PropertyInfo[]> s_props =
+            new System.Collections.Concurrent.ConcurrentDictionary<Type, PropertyInfo[]>();
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, FieldInfo[]> s_guidFields =
+            new System.Collections.Concurrent.ConcurrentDictionary<Type, FieldInfo[]>();
+
+        private static PropertyInfo[] VisibleProps(Type type)
+        {
+            return s_props.GetOrAdd(type, t =>
+            {
+                PropertyInfo[] props = t.GetProperties(PropertyBindingFlags);
+                Array.Sort(props, new PropertyComparer());
+
+                List<PropertyInfo> visible = new List<PropertyInfo>(props.Length);
+                foreach (PropertyInfo p in props)
+                {
+                    if (p.GetCustomAttribute<IsTransientAttribute>() == null)
+                        visible.Add(p);
+                }
+                return visible.ToArray();
+            });
+        }
+
+        private static FieldInfo[] GuidField(Type type)
+        {
+            return s_guidFields.GetOrAdd(type, t =>
+            {
+                FieldInfo fi = t.GetField("__Guid", BindingFlags.NonPublic | BindingFlags.Instance);
+                return fi == null ? new FieldInfo[0] : new[] { fi };
+            });
+        }
 
         internal class PropertyComparer : IComparer<PropertyInfo>
         {
@@ -57,53 +91,32 @@ namespace FrostySdk.IO
         private string ClassToYaml(object Obj, Type ObjType, int TabCount = 0)
         {
             StringBuilder SB = new StringBuilder();
-            PropertyInfo[] props = ObjType.GetProperties();
-            int TotalCount = props.Length;
-
-            PropertyInfo[] Properties = ObjType.GetProperties(PropertyBindingFlags);
-            Array.Sort(Properties, new PropertyComparer());
+            PropertyInfo[] Properties = VisibleProps(ObjType);
 
             string StrGuid = "";
-            FieldInfo FI = ObjType.GetField("__Guid", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (FI != null)
+            FieldInfo[] guidField = GuidField(ObjType);
+            if (guidField.Length > 0)
             {
-                AssetClassGuid Guid = (AssetClassGuid)FI.GetValue(Obj);
+                AssetClassGuid Guid = (AssetClassGuid)guidField[0].GetValue(Obj);
                 StrGuid = " <" + Guid.ToString() + ">";
-            }
-
-            bool hasProperties = false;
-            for (int i = 0; i < Properties.Length; i++)
-            {
-                if (Properties[i].GetCustomAttribute<IsTransientAttribute>() == null)
-                {
-                    hasProperties = true;
-                    break;
-                }
             }
 
             SB.AppendLine();
             SB.Append("".PadLeft(TabCount) + ObjType.Name + StrGuid + " : ");
 
-            if (hasProperties)
+            if (Properties.Length > 0)
             {
                 TabCount += tabSize;
                 foreach (PropertyInfo PI in Properties)
                 {
-                    if (PI.GetCustomAttribute<IsTransientAttribute>() != null)
-                        continue;
-
-                    string propertyString = ("".PadLeft(TabCount) + PI.Name + "[AddInfo]" + " : ");
-
                     object Value = PI.GetValue(Obj);
                     string Tmp = "";
 
                     string fieldValue = FieldToYaml(Value, ref Tmp, TabCount);
 
                     SB.AppendLine();
-                    SB.Append(propertyString);
+                    SB.Append("".PadLeft(TabCount) + PI.Name + Tmp + " : ");
                     SB.Append(fieldValue);
-
-                    SB = SB.Replace("[AddInfo]", Tmp);
                 }
                 TabCount -= tabSize;
             }
@@ -113,26 +126,31 @@ namespace FrostySdk.IO
 
         private string FieldToYaml(object Value, ref string AdditionalInfo, int TabCount = 0)
         {
+            if (Value == null)
+            {
+                AdditionalInfo = "";
+                return "null";
+            }
+
             Type FieldType = Value.GetType();
             StringBuilder SB = new StringBuilder();
 
-            if (FieldType.Name == "List`1")
+            // IList instead of get_Count / get_Item through reflection: the list
+            // branch used to build a MethodInfo per list and invoke it per element.
+            if (FieldType.Name == "List`1" && Value is IList items)
             {
-                int Count = (int)FieldType.GetMethod("get_Count").Invoke(Value, null);
-                AdditionalInfo = " [Count=" + Count + "]";
+                AdditionalInfo = " [Count=" + items.Count + "]";
 
-                if (Count > 0)
+                if (items.Count > 0)
                 {
                     TabCount += tabSize;
-                    for (int i = 0; i < Count; i++)
+                    for (int i = 0; i < items.Count; i++)
                     {
                         SB.AppendLine();
                         SB.Append("".PadLeft(TabCount) + "- member [" + i.ToString() + "] : ");
 
-                        object SubValue = FieldType.GetMethod("get_Item").Invoke(Value, new object[] { i });
                         string Tmp = "";
-
-                        SB.Append(FieldToYaml(SubValue, ref Tmp, TabCount));
+                        SB.Append(FieldToYaml(items[i], ref Tmp, TabCount));
                     }
                     TabCount -= tabSize;
                 }

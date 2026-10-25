@@ -9,12 +9,13 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace FrostyMcpPlugin.Bridge
 {
     /// <summary>
-    /// Pointer-level reference search and array insertion, the two gaps the audit
-    /// left in the component tools.
+    /// Pointer-level reference search and array insertion, which the component
+    /// tools cannot express.
     /// </summary>
     internal static class McpRefHandlers
     {
@@ -80,9 +81,12 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 scanned++;
 
+                int objectIndex = 0;
                 foreach (object obj in asset.Objects)
                 {
-                    CollectPointerHits(obj, obj.GetType(), "", entry, fileGuid, classGuid, hits, ref total, offset, limit);
+                    CollectPointerHits(obj, obj.GetType(), "", objectIndex, 0, new HashSet<int>(),
+                        entry, fileGuid, classGuid, hits, ref total, offset, limit);
+                    objectIndex++;
                 }
             }
 
@@ -103,10 +107,14 @@ namespace FrostyMcpPlugin.Bridge
             };
         }
 
-        private static void CollectPointerHits(object obj, Type type, string prefix, EbxAssetEntry entry,
-            Guid fileGuid, Guid classGuid, List<object> hits, ref int total, int offset, int limit)
+        // A reference can sit inside a struct or a BoxedValue, so those are walked
+        // too. Only value types and BoxedValue are followed: a Frostbite class is
+        // reached through a PointerRef, not through containment.
+        private static void CollectPointerHits(object obj, Type type, string prefix, int objectIndex, int depth,
+            HashSet<int> visited, EbxAssetEntry entry, Guid fileGuid, Guid classGuid,
+            List<object> hits, ref int total, int offset, int limit)
         {
-            if (obj == null)
+            if (obj == null || depth > 6)
                 return;
 
             foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
@@ -133,6 +141,7 @@ namespace FrostyMcpPlugin.Bridge
                     hits.Add(new Dictionary<string, object>
                     {
                         ["asset"] = entry.Name,
+                        ["object_index"] = objectIndex,
                         ["object_type"] = type.Name,
                         ["path"] = path,
                         ["target_file_guid"] = pr.External.FileGuid.ToString(),
@@ -145,23 +154,48 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     for (int i = 0; i < list.Count; i++)
                     {
-                        if (!(list[i] is PointerRef itemRef) || !PointerMatches(itemRef, fileGuid, classGuid))
-                            continue;
-                        total++;
-                        int index = total - 1;
-                        if (index < offset || hits.Count >= limit)
-                            continue;
-                        hits.Add(new Dictionary<string, object>
+                        object element = list[i];
+                        if (element is PointerRef itemRef)
                         {
-                            ["asset"] = entry.Name,
-                            ["object_type"] = type.Name,
-                            ["path"] = path + "[" + i + "]",
-                            ["target_file_guid"] = itemRef.External.FileGuid.ToString(),
-                            ["target_class_guid"] = itemRef.External.ClassGuid.ToString()
-                        });
+                            if (!PointerMatches(itemRef, fileGuid, classGuid))
+                                continue;
+                            total++;
+                            int index = total - 1;
+                            if (index < offset || hits.Count >= limit)
+                                continue;
+                            hits.Add(new Dictionary<string, object>
+                            {
+                                ["asset"] = entry.Name,
+                                ["object_index"] = objectIndex,
+                                ["object_type"] = type.Name,
+                                ["path"] = path + "[" + i + "]",
+                                ["target_file_guid"] = itemRef.External.FileGuid.ToString(),
+                                ["target_class_guid"] = itemRef.External.ClassGuid.ToString()
+                            });
+                            continue;
+                        }
+
+                        if (ShouldWalkInto(element) && visited.Add(RuntimeHelpers.GetHashCode(element)))
+                            CollectPointerHits(element, element.GetType(), path + "[" + i + "]", objectIndex,
+                                depth + 1, visited, entry, fileGuid, classGuid, hits, ref total, offset, limit);
                     }
+                    continue;
                 }
+
+                if (ShouldWalkInto(value) && visited.Add(RuntimeHelpers.GetHashCode(value)))
+                    CollectPointerHits(value, value.GetType(), path, objectIndex, depth + 1, visited,
+                        entry, fileGuid, classGuid, hits, ref total, offset, limit);
             }
+        }
+
+        private static bool ShouldWalkInto(object value)
+        {
+            if (value == null)
+                return false;
+            Type type = value.GetType();
+            if (type.IsValueType)
+                return true;
+            return type.Name == "BoxedValue";
         }
 
         private static bool PointerMatches(PointerRef pr, Guid fileGuid, Guid classGuid)
@@ -175,18 +209,35 @@ namespace FrostyMcpPlugin.Bridge
 
         // Lists the assets whose External PointerRefs still address the given
         // component GUIDs of one file. Bounded so a big project stays responsive.
-        internal static List<object> FindAffectedAssets(Guid fileGuid, ICollection<Guid> classGuids, int maxScan)
+        // Returns the assets that still reference the given internal GUIDs. The
+        // result carries its own completeness flags: a truncated scan looks exactly
+        // like a clean one otherwise.
+        internal static Dictionary<string, object> FindAffectedAssets(Guid fileGuid,
+            ICollection<Guid> classGuids, int maxScan, int maxMilliseconds)
         {
             var affected = new List<object>();
-            if (classGuids == null || classGuids.Count == 0)
-                return affected;
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int scanned = 0;
+            bool truncated = false;
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            if (classGuids == null || classGuids.Count == 0)
+            {
+                return new Dictionary<string, object>
+                {
+                    ["items"] = affected,
+                    ["scanned"] = 0,
+                    ["truncated"] = false
+                };
+            }
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
             {
-                if (scanned >= maxScan)
+                if (scanned >= maxScan || (maxMilliseconds > 0 && stopwatch.ElapsedMilliseconds >= maxMilliseconds))
+                {
+                    truncated = true;
                     break;
+                }
                 EbxAsset asset;
                 try { asset = App.AssetManager.GetEbx(entry); }
                 catch { continue; }
@@ -206,7 +257,14 @@ namespace FrostyMcpPlugin.Bridge
                     ["paths"] = hitPaths
                 });
             }
-            return affected;
+
+            return new Dictionary<string, object>
+            {
+                ["items"] = affected,
+                ["count"] = affected.Count,
+                ["scanned"] = scanned,
+                ["truncated"] = truncated
+            };
         }
 
         private static void CollectMatchingPaths(object obj, Type type, string prefix, Guid fileGuid,
@@ -262,58 +320,104 @@ namespace FrostyMcpPlugin.Bridge
 
             int index = p.Value<int?>("index") ?? -1;
             int sourceIndex = p.Value<int?>("source_index") ?? -1;
-
-            EbxAsset hostAsset = App.AssetManager.GetEbx(entry);
-            object host = hostAsset.RootObject;
             string hostGuid = p.Value<string>("class_guid") ?? p.Value<string>("component_guid") ?? "";
-            if (!string.IsNullOrEmpty(hostGuid))
+            if (!string.IsNullOrEmpty(hostGuid) && !Guid.TryParse(hostGuid, out _))
+                return McpHandlers.Error("class_guid is not a GUID", "INVALID_PARAMS");
+
+            var plan = new Dictionary<string, object>
             {
-                if (!Guid.TryParse(hostGuid, out Guid g))
-                    return McpHandlers.Error("class_guid is not a GUID", "INVALID_PARAMS");
-                object found = FindObjectByGuid(entry, g);
-                if (found == null)
-                    return McpHandlers.Error("host component not found", "NOT_FOUND");
-                host = found;
-            }
-
-            if (!TryResolveList(host, path, out IList list, out string resolvedPath))
-                return McpHandlers.Error("Could not resolve list at path: " + path, "NOT_FOUND");
-
-            Type elementType = list.GetType().IsGenericType ? list.GetType().GetGenericArguments()[0] : typeof(object);
-            if (index < 0) index = list.Count;
-            if (index > list.Count) index = list.Count;
-
-            object item;
-            if (sourceIndex >= 0)
-            {
-                if (sourceIndex >= list.Count)
-                    return McpHandlers.Error("source_index out of range", "INVALID_PARAMS");
-                item = list[sourceIndex];
-            }
-            else
-            {
-                item = DefaultElement(elementType);
-            }
-
-            if (item == null)
-                return McpHandlers.Error("Cannot create an element of type " + elementType.Name, "UNSUPPORTED_TYPE");
-
-            list.Insert(index, item);
-
-            EbxAsset asset = App.AssetManager.GetEbx(entry);
-            asset.Update();
-            App.AssetManager.ModifyEbx(entry.Name, asset);
-
-            return new Dictionary<string, object>
-            {
-                ["success"] = true,
                 ["name"] = entry.Name,
-                ["path"] = resolvedPath,
+                ["path"] = path,
                 ["index"] = index,
-                ["element_type"] = elementType.Name,
-                ["copied_from"] = sourceIndex >= 0 ? sourceIndex : -1,
-                ["count"] = list.Count
+                ["source_index"] = sourceIndex,
+                ["class_guid"] = hostGuid
             };
+
+            return McpCommit.Require("insert_ebx_item", p, plan, () =>
+            {
+            try
+            {
+                // Resolve again inside the commit: preview and execute are two
+                // separate calls and the asset may have changed between them.
+                EbxAsset hostAsset = App.AssetManager.GetEbx(entry);
+                object host = hostAsset.RootObject;
+                if (!string.IsNullOrEmpty(hostGuid))
+                {
+                    object found = FindObjectByGuid(entry, Guid.Parse(hostGuid));
+                    if (found == null)
+                        return McpHandlers.Error("host component not found", "NOT_FOUND");
+                    host = found;
+                }
+
+                if (!TryResolveList(host, path, out IList list, out string resolvedPath))
+                    return McpHandlers.Error("Could not resolve list at path: " + path, "NOT_FOUND");
+
+                Type elementType = list.GetType().IsGenericType ? list.GetType().GetGenericArguments()[0] : typeof(object);
+                int insertAt = index < 0 || index > list.Count ? list.Count : index;
+                int countBefore = list.Count;
+
+                object item;
+                if (sourceIndex >= 0)
+                {
+                    if (sourceIndex >= list.Count)
+                        return McpHandlers.Error("source_index out of range", "INVALID_PARAMS");
+                    item = list[sourceIndex];
+                }
+                else
+                {
+                    item = DefaultElement(elementType);
+                }
+
+                if (item == null)
+                    return McpHandlers.Error("Cannot create an element of type " + elementType.Name, "UNSUPPORTED_TYPE");
+
+                list.Insert(insertAt, item);
+
+                EbxAsset asset = App.AssetManager.GetEbx(entry);
+                asset.Update();
+                App.AssetManager.ModifyEbx(entry.Name, asset);
+
+                var result = new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["name"] = entry.Name,
+                    ["path"] = resolvedPath,
+                    ["index"] = insertAt,
+                    ["element_type"] = elementType.Name,
+                    ["copied_from"] = sourceIndex >= 0 ? sourceIndex : -1,
+                    ["count"] = list.Count
+                };
+
+                // Update() drops elements it cannot re-serialise, so read the list
+                // back rather than trusting the insert to have survived.
+                EbxAssetEntry refreshed = App.AssetManager.GetEbxEntry(entry.Name) ?? entry;
+                EbxAsset after = App.AssetManager.GetEbx(refreshed);
+                object afterHost = after.RootObject;
+                if (!string.IsNullOrEmpty(hostGuid))
+                    afterHost = FindObjectByGuid(refreshed, Guid.Parse(hostGuid));
+
+                if (afterHost == null || !TryResolveList(afterHost, path, out IList afterList, out _))
+                {
+                    result["success"] = false;
+                    result["error"] = "The list could not be read back after the update";
+                    result["error_code"] = "VERIFY_FAILED";
+                }
+                else if (afterList.Count != countBefore + 1)
+                {
+                    result["success"] = false;
+                    result["error"] = "The element did not survive the asset update";
+                    result["error_code"] = "ITEM_DROPPED";
+                    result["count_before"] = countBefore;
+                    result["count_after"] = afterList.Count;
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return McpHandlers.Error(ex.Message, "INSERT_FAILED");
+            }
+            });
         }
 
         private static object DefaultElement(Type elementType)

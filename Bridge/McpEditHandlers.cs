@@ -185,7 +185,7 @@ namespace FrostyMcpPlugin.Bridge
                 AssetImportType importType = new AssetImportType("bin", dataOnly ? "Binary File (Data Only)" : "Binary File");
                 bool ok = def.Import(entry, path, importType);
                 if (!ok)
-                    return McpHandlers.Error("Import failed (asset may use a custom handler)", "IMPORT_FAILED");
+                    return McpHandlers.Error("Import failed", "IMPORT_FAILED");
 
                 // data_only=false takes the file's FileGuid, while AssetManager keeps
                 // entry.Guid as it was. The two must stay equal: every tool that
@@ -197,16 +197,31 @@ namespace FrostyMcpPlugin.Bridge
 
                 if (imported.FileGuid != refreshed.Guid)
                 {
-                    return new Dictionary<string, object>
+                    var mismatch = new Dictionary<string, object>
                     {
                         ["success"] = false,
-                        ["error"] = "Imported file GUID differs from the asset entry GUID; the asset is now inconsistent",
+                        ["error"] = "Imported file GUID differs from the asset entry GUID",
                         ["error_code"] = "GUID_MISMATCH",
                         ["entry_guid"] = refreshed.Guid.ToString(),
                         ["file_guid"] = imported.FileGuid.ToString(),
                         ["file_guid_resolves"] = App.AssetManager.GetEbxEntry(imported.FileGuid) != null,
                         ["data_only"] = dataOnly
                     };
+
+                    // The import already ran, so the asset is in the state reported
+                    // above. Put it back rather than leaving it half imported.
+                    try
+                    {
+                        App.AssetManager.RevertAsset(entry, false);
+                        mismatch["reverted"] = true;
+                    }
+                    catch (Exception revertEx)
+                    {
+                        mismatch["reverted"] = false;
+                        mismatch["revert_error"] = revertEx.Message;
+                    }
+
+                    return mismatch;
                 }
 
                 var result = new Dictionary<string, object>
@@ -229,8 +244,9 @@ namespace FrostyMcpPlugin.Bridge
                 if (changedGuids.Count > 0)
                 {
                     int maxScan = p.Value<int?>("max_scan") ?? 1500;
+                    int maxScanMs = p.Value<int?>("max_scan_ms") ?? 5000;
                     result["affected_assets"] = McpRefHandlers.FindAffectedAssets(
-                        refreshed.Guid, changedGuids, maxScan);
+                        refreshed.Guid, changedGuids, maxScan, maxScanMs);
                 }
                 return result;
             }
@@ -287,9 +303,7 @@ namespace FrostyMcpPlugin.Bridge
 
                 // Source bundles are optional on purpose. Inheriting them puts the
                 // duplicate next to the original, which is wrong when the duplicate
-                // gets its own bundle: the game then installs two bundle definition
-                // assets for the same bundle and crashes while building the mesh
-                // variation database. Pass copy_bundles=true when the duplicate is
+                // gets its own bundle. Pass copy_bundles=true when the duplicate is
                 // meant to live in the source bundle.
                 if (p.Value<bool?>("copy_bundles") ?? false)
                     newEntry.AddedBundles.AddRange(entry.EnumerateBundles());
@@ -1217,9 +1231,13 @@ namespace FrostyMcpPlugin.Bridge
         {
             int id = App.AssetManager.GetSuperBundleId(name);
             if (id >= 0) return id;
+            int index = 0;
             foreach (SuperBundleEntry sb in App.AssetManager.EnumerateSuperBundles())
+            {
+                int currentId = index++;
                 if (string.Equals(sb.Name, name, StringComparison.OrdinalIgnoreCase))
-                    return App.AssetManager.GetSuperBundleId(sb);
+                    return currentId;
+            }
             return -1;
         }
 
@@ -1325,7 +1343,7 @@ namespace FrostyMcpPlugin.Bridge
         {
             // Supports: Foo.Bar[0].Baz
             List<string> parts = new List<string>();
-            string current = "";
+            System.Text.StringBuilder current = new System.Text.StringBuilder();
             for (int i = 0; i < path.Length; i++)
             {
                 char c = path[i];
@@ -1333,16 +1351,16 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     if (current.Length > 0)
                     {
-                        parts.Add(current);
-                        current = "";
+                        parts.Add(current.ToString());
+                        current.Clear();
                     }
                 }
                 else if (c == '[')
                 {
                     if (current.Length > 0)
                     {
-                        parts.Add(current);
-                        current = "";
+                        parts.Add(current.ToString());
+                        current.Clear();
                     }
                     int end = path.IndexOf(']', i);
                     if (end < 0)
@@ -1352,11 +1370,11 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 else
                 {
-                    current += c;
+                    current.Append(c);
                 }
             }
             if (current.Length > 0)
-                parts.Add(current);
+                parts.Add(current.ToString());
             return parts;
         }
 
@@ -2141,16 +2159,23 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     s_meshImportAction = taskWindow => import.Invoke(importer,
                         new object[] { path, meshSet, asset, entry, settings, taskWindow });
+                    s_meshImportRan = false;
+                    s_meshImportError = null;
                     try
                     {
                         McpHandlers.InvokeOnUi(() => show.Invoke(null,
                             new object[] { "Mesh import", path, callback, false, null }));
-                        return;
                     }
                     finally
                     {
                         s_meshImportAction = null;
                     }
+
+                    if (s_meshImportError != null)
+                        throw s_meshImportError;
+                    if (!s_meshImportRan)
+                        throw new InvalidOperationException("The mesh import window closed before the import ran");
+                    return;
                 }
             }
 
@@ -2165,13 +2190,32 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         private static Action<object> s_meshImportAction;
+        private static bool s_meshImportRan;
+        private static Exception s_meshImportError;
 
-        // Entry point for the progress window callback; the body is swapped in per call.
+        // The progress window invokes this from a background task inside an async void
+        // handler, so an escaping exception would terminate the editor. Capture it and
+        // hand it back to the caller instead.
         private static void MeshImportCallback(object task)
         {
             Action<object> action = s_meshImportAction;
-            if (action != null)
+            if (action == null)
+            {
+                s_meshImportError = new InvalidOperationException("Mesh import was not prepared");
+                return;
+            }
+
+            try
+            {
                 action(task);
+                s_meshImportRan = true;
+            }
+            catch (Exception ex)
+            {
+                s_meshImportError = ex is System.Reflection.TargetInvocationException tie && tie.InnerException != null
+                    ? tie.InnerException
+                    : ex;
+            }
         }
 
         private static object CreateStaticDelegate(Type delegateType, string methodName)

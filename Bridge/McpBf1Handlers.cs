@@ -12,12 +12,13 @@ namespace FrostyMcpPlugin.Bridge
 {
     /// <summary>
     /// BF1DevPlugin-aligned helpers: NetworkRegistry, root Flags, safe/map bundles,
-    /// internal→external PointerRef for NetReg lists.
+    /// Converts an internal pointer reference to an external one for NetReg lists.
     /// </summary>
     internal static class McpBf1Handlers
     {
-        // BF1 MpSoldier-aligned map bundles (Core2.AllMapBundleUrlDic values, lowercase paths without win32/ prefix for GetBundleId)
-        // Keep in sync with Tools/BF1DevPlugin/Base/Core2.cs — content paths must stay as content.
+        // BF1 MpSoldier-aligned map bundles (Core2.AllMapBundleUrlDic values, lowercase and without
+    // the win32/ prefix; a win32/ retry follows when the bare name is not found)
+        // Keep in sync with Tools/BF1DevPlugin/Base/Core2.cs; content paths must stay as content.
         private static readonly string[] Bf1MapBundleNames =
         {
             "levels/frontend/soldierpresentationsublevel",
@@ -160,7 +161,7 @@ namespace FrostyMcpPlugin.Bridge
                         ["file_guid"] = entry.Guid.ToString(),
                         ["class_guid"] = classGuid.ToString()
                     },
-                    ["hint"] = "Use add_to_network_registry with this pointer (never register MpSoldierAI root)"
+                    ["hint"] = "Pointer is ready for a NetworkRegistry; never register the MpSoldierAI root"
                 };
             }
             catch (Exception ex)
@@ -178,30 +179,39 @@ namespace FrostyMcpPlugin.Bridge
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 200);
             string query = (p.Value<string>("query") ?? "").Trim();
 
-            var all = new List<object>();
+            // With no query the row is serialized only inside the page window; with a
+            // query the fields are needed to test it, so those rows are built first.
+            int total = 0;
+            var page = new List<object>(limit);
+            string queryLower = query.ToLowerInvariant();
             int i = 0;
             foreach (PointerRef pr in root.Objects)
             {
-                var item = SerializeNetRef(pr, i++);
+                int slot = i++;
+                object item = null;
                 if (!string.IsNullOrEmpty(query))
                 {
-                    item.TryGetValue("file_guid", out object fg);
-                    item.TryGetValue("class_guid", out object cg);
-                    item.TryGetValue("asset_name", out object an);
-                    item.TryGetValue("type", out object ty);
+                    var candidate = SerializeNetRef(pr, slot);
+                    candidate.TryGetValue("file_guid", out object fg);
+                    candidate.TryGetValue("class_guid", out object cg);
+                    candidate.TryGetValue("asset_name", out object an);
+                    candidate.TryGetValue("type", out object ty);
                     string hay = (fg + " " + cg + " " + an + " " + ty).ToLowerInvariant();
-                    if (hay.IndexOf(query.ToLowerInvariant(), StringComparison.Ordinal) < 0)
+                    if (hay.IndexOf(queryLower, StringComparison.Ordinal) < 0)
                         continue;
+                    item = candidate;
                 }
-                all.Add(item);
-            }
 
-            var page = all.Skip(offset).Take(limit).ToList();
+                int index = total++;
+                if (index < offset || page.Count >= limit)
+                    continue;
+                page.Add(item ?? SerializeNetRef(pr, slot));
+            }
             return new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["name"] = entry.Name,
-                ["total"] = all.Count,
+                ["total"] = total,
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
@@ -222,6 +232,7 @@ namespace FrostyMcpPlugin.Bridge
 
             var added = new List<object>();
             var skipped = new List<object>();
+            bool addedMpSoldierAi = false;
 
             try
             {
@@ -239,6 +250,11 @@ namespace FrostyMcpPlugin.Bridge
                     }
                     root.Objects.Add(pr);
                     try { asset.AddDependency(pr.External.FileGuid); } catch { }
+                    EbxAssetEntry addedEntry = App.AssetManager.GetEbxEntry(pr.External.FileGuid);
+                    if (addedEntry != null &&
+                        (addedEntry.Name.IndexOf("mpsoldierai", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         addedEntry.Type.IndexOf("MpSoldierAI", StringComparison.OrdinalIgnoreCase) >= 0))
+                        addedMpSoldierAi = true;
                     added.Add(SerializeNetRef(pr, -1));
                 }
 
@@ -251,8 +267,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["skipped_count"] = skipped.Count,
                     ["added"] = added,
                     ["skipped"] = skipped,
-                    ["warning"] = IsBattlefield1()
-                        ? "Do NOT register MpSoldierAI — causes Giant's Shadow crash"
+                    ["warning"] = addedMpSoldierAi && IsBattlefield1()
+                        ? "Do not register MpSoldierAI; it crashes Giant's Shadow"
                         : null
                 };
             }
@@ -516,7 +532,7 @@ namespace FrostyMcpPlugin.Bridge
             root = asset.RootObject;
             if (!TypeLibraryIsNetworkRegistry(root))
             {
-                // soft warning only — still allow if Objects exists
+                // Not a NetworkRegistryAsset; accept it when it still exposes an Objects list.
                 try { var _ = root.Objects; }
                 catch
                 {
@@ -576,7 +592,7 @@ namespace FrostyMcpPlugin.Bridge
                 list.Add(new PointerRef(new EbxImportReference { FileGuid = fileG, ClassGuid = classG }));
             }
 
-            // asset_name (+ optional class_guid) → resolve
+            // asset_name with an optional class_guid, then resolve
             string assetName = (p.Value<string>("asset") ?? p.Value<string>("asset_name") ?? p.Value<string>("target") ?? "").Trim();
             string assetGuid = p.Value<string>("asset_guid");
             if (!string.IsNullOrEmpty(assetName) || !string.IsNullOrEmpty(assetGuid))

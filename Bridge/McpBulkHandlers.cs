@@ -17,9 +17,9 @@ using System.Text;
 namespace FrostyMcpPlugin.Bridge
 {
     /// <summary>
-    /// Bulk and format-specific export helpers that the editor only exposes as menu
-    /// commands: whole-project EBX text dumps, IES profiles, and the PVZ bundle
-    /// hygiene pass from PVZBundleManagerPlugin.
+    /// Bulk and format-specific helpers the editor only exposes as menu commands:
+    /// whole-project EBX text dumps, IES profiles, the PVZ bundle manager pass, and
+    /// the bundle readiness checks that go with it.
     /// </summary>
     internal static class McpBulkHandlers
     {
@@ -43,7 +43,7 @@ namespace FrostyMcpPlugin.Bridge
             string typeFilter = (p.Value<string>("type") ?? "").Trim();
             int limit = p.Value<int?>("limit") ?? 0;
 
-            Config.Get<int>("ExportTabSize", 2);
+            int tabSize = Config.Get<int>("ExportTabSize", 2);
 
             List<EbxAssetEntry> entries = new List<EbxAssetEntry>();
             foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
@@ -343,6 +343,10 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error(ex.Message, "LOAD_FAILED");
             }
 
+            // Same-bundle membership is stricter than what the engine accepts: a
+            // dependency in a parent or previous bundle loads fine. Ask the bundle
+            // manager when it can answer, and say so when it cannot.
+            Func<EbxAssetEntry, bool> canLoad = BuildLoadabilityCheck(bid, out bool loadabilityKnown);
             var missingDeps = new List<object>();
             foreach (Guid dep in asset.Dependencies)
             {
@@ -352,8 +356,21 @@ namespace FrostyMcpPlugin.Bridge
                     missingDeps.Add(new Dictionary<string, object> { ["dep_guid"] = dep.ToString(), ["missing"] = true });
                     continue;
                 }
+                if (canLoad != null)
+                {
+                    bool loadable;
+                    try { loadable = canLoad(depEntry); }
+                    catch { loadable = depEntry.EnumerateBundles().Contains(bid); }
+                    if (!loadable)
+                        missingDeps.Add(new Dictionary<string, object> { ["dep"] = depEntry.Name });
+                    continue;
+                }
                 if (!depEntry.EnumerateBundles().Contains(bid))
-                    missingDeps.Add(new Dictionary<string, object> { ["dep"] = depEntry.Name });
+                    missingDeps.Add(new Dictionary<string, object>
+                    {
+                        ["dep"] = depEntry.Name,
+                        ["check"] = "direct_membership_only"
+                    });
             }
             if (missingDeps.Count > 0)
                 reasons.Add(new Dictionary<string, object>
@@ -383,6 +400,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["ready"] = reasons.Count == 0,
                 ["issue_count"] = reasons.Count,
                 ["issues"] = reasons,
+                ["dependency_check"] = loadabilityKnown ? "bundle_manager" : "direct_membership_only",
                 ["note"] = "Linked assets are only reported once the editor has loaded them"
             };
         }
@@ -404,7 +422,27 @@ namespace FrostyMcpPlugin.Bridge
                 object[] args = load.GetParameters().Length == 0
                     ? new object[0]
                     : new[] { task };
-                McpHandlers.InvokeOnUi(() => load.Invoke(null, args));
+
+                // The scan reads every MeshVariationDatabase; the task window sends
+                // its own updates through the dispatcher, so run it off the UI thread
+                // instead of freezing the editor for the whole reload.
+                Exception failure = null;
+                System.Threading.Thread worker = new System.Threading.Thread(() =>
+                {
+                    try
+                    {
+                        load.Invoke(null, args);
+                    }
+                    catch (Exception ex)
+                    {
+                        failure = ex;
+                    }
+                });
+                worker.IsBackground = true;
+                worker.Start();
+                worker.Join();
+                if (failure != null)
+                    throw failure;
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -416,6 +454,38 @@ namespace FrostyMcpPlugin.Bridge
                 return McpHandlers.Error(Unwrap(ex), "REFRESH_FAILED");
             }
         }
+        // Returns a per-asset loadability test backed by PVZBundleManagerPlugin, or
+        // null when the plugin is missing or has no parent/prev bundle table yet.
+        private static Func<EbxAssetEntry, bool> BuildLoadabilityCheck(int bundleId, out bool known)
+        {
+            known = false;
+            object manager = GetBundleManager();
+            if (manager == null)
+                return null;
+
+            try
+            {
+                if (ReadBundleCacheCount(manager) == 0)
+                    return null;
+
+                MethodInfo method = manager.GetType().GetMethod("CanBeLoadedByBundle",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null,
+                    new[] { typeof(EbxAssetEntry), typeof(int) }, null);
+                if (method == null)
+                    return null;
+
+                known = true;
+                object instance = manager;
+                int bid = bundleId;
+                return e => (bool)method.Invoke(instance, new object[] { e, bid });
+            }
+            catch
+            {
+                known = false;
+                return null;
+            }
+        }
+
         public static object ManageBundles(JObject p)
         {
             if (App.AssetManager == null)

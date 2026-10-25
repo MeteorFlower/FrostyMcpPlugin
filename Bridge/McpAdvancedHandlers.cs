@@ -380,13 +380,17 @@ namespace FrostyMcpPlugin.Bridge
             if (kind != "ebx" && kind != "res" && kind != "chunk" && kind != "all")
                 return McpHandlers.Error("kind must be ebx, res, chunk or all", "INVALID_PARAMS");
 
-            var all = new List<object>();
+            // Count every match but serialize only the rows inside the page window.
+            int total = 0;
+            var page = new List<object>(limit);
             if (kind == "res" || kind == "all")
             {
                 foreach (ResAssetEntry e in App.AssetManager.EnumerateRes())
                 {
                     if (!e.EnumerateBundles().Contains(bid)) continue;
-                    all.Add(McpHandlers.SerializeResEntry(e));
+                    int index = total++;
+                    if (index < offset || page.Count >= limit) continue;
+                    page.Add(McpHandlers.SerializeResEntry(e));
                 }
             }
             if (kind == "chunk" || kind == "all")
@@ -394,29 +398,33 @@ namespace FrostyMcpPlugin.Bridge
                 foreach (ChunkAssetEntry e in App.AssetManager.EnumerateChunks())
                 {
                     if (!e.EnumerateBundles().Contains(bid)) continue;
-                    all.Add(McpHandlers.SerializeChunkEntry(e));
+                    int index = total++;
+                    if (index < offset || page.Count >= limit) continue;
+                    page.Add(McpHandlers.SerializeChunkEntry(e));
                 }
             }
-            foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
+            if (kind == "ebx" || kind == "all")
             {
-                if (kind == "res" || kind == "chunk") break;
-                if (!e.EnumerateBundles().Contains(bid)) continue;
-                if (modifiedOnly && !e.IsModified) continue;
-                if (!string.IsNullOrEmpty(typeFilter) &&
-                    !string.Equals(e.Type, typeFilter, StringComparison.OrdinalIgnoreCase) &&
-                    !TypeLibrary.IsSubClassOf(e.Type, typeFilter))
-                    continue;
-                all.Add(McpHandlers.SerializeEbxEntry(e));
+                foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
+                {
+                    if (!e.EnumerateBundles().Contains(bid)) continue;
+                    if (modifiedOnly && !e.IsModified) continue;
+                    if (!string.IsNullOrEmpty(typeFilter) &&
+                        !string.Equals(e.Type, typeFilter, StringComparison.OrdinalIgnoreCase) &&
+                        !TypeLibrary.IsSubClassOf(e.Type, typeFilter))
+                        continue;
+                    int index = total++;
+                    if (index < offset || page.Count >= limit) continue;
+                    page.Add(McpHandlers.SerializeEbxEntry(e));
+                }
             }
-
-            var page = all.Skip(offset).Take(limit).ToList();
             return new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["bundle"] = be.Name,
                 ["bundle_type"] = be.Type.ToString(),
                 ["kind"] = kind,
-                ["total"] = all.Count,
+                ["total"] = total,
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
@@ -658,6 +666,7 @@ namespace FrostyMcpPlugin.Bridge
             var scanErrors = new List<object>();
             var seenPropertyConnections = new HashSet<string>(StringComparer.Ordinal);
             int propCount = 0, eventCount = 0, linkCount = 0;
+            int ifaceSeen = 0;
 
             try
             {
@@ -694,8 +703,8 @@ namespace FrostyMcpPlugin.Bridge
                             ["target_field"] = tf
                         });
                     }
-                    CheckInterfaceField(c.Source, sf, "property", i, "source", issues);
-                    CheckInterfaceField(c.Target, tf, "property", i, "target", issues);
+                    ifaceSeen += CheckInterfaceField(c.Source, sf, "property", i, "source", issues) ? 1 : 0;
+                    ifaceSeen += CheckInterfaceField(c.Target, tf, "property", i, "target", issues) ? 1 : 0;
                 }
             }
             catch (Exception ex)
@@ -744,6 +753,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["property_count"] = propCount,
                 ["event_count"] = eventCount,
                 ["link_count"] = linkCount,
+                ["interface_ports_checked"] = ifaceSeen,
                 ["issue_count"] = issues.Count,
                 ["issues"] = issues,
                 ["scan_error_count"] = scanErrors.Count,
@@ -805,18 +815,21 @@ namespace FrostyMcpPlugin.Bridge
 
         private static void RecurseDependencies(EbxAssetEntry root, Action<EbxAssetEntry> action)
         {
-            var queue = new List<Guid> { root.Guid };
-            queue.AddRange(root.EnumerateDependencies());
+            var queue = new Queue<Guid>();
+            queue.Enqueue(root.Guid);
+            foreach (Guid g in root.EnumerateDependencies())
+                queue.Enqueue(g);
+
             var seen = new HashSet<Guid>();
             while (queue.Count > 0)
             {
-                Guid g = queue[0];
-                queue.RemoveAt(0);
+                Guid g = queue.Dequeue();
                 if (!seen.Add(g)) continue;
                 EbxAssetEntry e = App.AssetManager.GetEbxEntry(g);
                 if (e == null) continue;
                 action(e);
-                queue.AddRange(e.EnumerateDependencies());
+                foreach (Guid dep in e.EnumerateDependencies())
+                    queue.Enqueue(dep);
             }
         }
 
@@ -861,58 +874,82 @@ namespace FrostyMcpPlugin.Bridge
             if (pr.Type == FrostySdk.IO.PointerRefType.External)
                 return pr.External.FileGuid.ToString() + "/" + pr.External.ClassGuid.ToString();
             if (pr.Type == FrostySdk.IO.PointerRefType.Internal && pr.Internal != null)
-                return "internal/" + pr.Internal.GetType().Name;
+                return "internal/" + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(pr.Internal);
             return "null";
         }
 
-        // Only flags a field the source object cannot serve: when the object has an
-        // InterfaceDescriptor, the port must be listed in it.
-        private static void CheckInterfaceField(PointerRef pr, string fieldName, string kind, int index,
+        // Only flags a field the object cannot serve: when the object has an
+        // InterfaceDescriptor, the port must be listed in it. Returns false when the
+        // object has no readable descriptor, so the caller can report how much of the
+        // blueprint this check could actually see.
+        private static bool CheckInterfaceField(PointerRef pr, string fieldName, string kind, int index,
             string side, List<object> issues)
         {
             if (string.IsNullOrEmpty(fieldName))
-                return;
+                return false;
             if (pr.Type != FrostySdk.IO.PointerRefType.Internal || pr.Internal == null)
-                return;
+                return false;
 
             try
             {
                 System.Reflection.PropertyInfo ifaceProp = pr.Internal.GetType().GetProperty("Interface");
                 if (ifaceProp == null)
-                    return;
+                    return false;
                 PointerRef ifaceRef = (PointerRef)ifaceProp.GetValue(pr.Internal);
                 if (ifaceRef.Type != FrostySdk.IO.PointerRefType.Internal || ifaceRef.Internal == null)
-                    return;
+                    return false;
 
                 dynamic iface = ifaceRef.Internal;
+                bool matched = false;
                 foreach (dynamic dataField in iface.Fields)
                 {
                     if (string.Equals((string)(FrostySdk.Ebx.CString)dataField.Name, fieldName, StringComparison.OrdinalIgnoreCase))
-                        return;
+                    {
+                        matched = true;
+                        break;
+                    }
                 }
-                foreach (dynamic ev in iface.OutputEvents)
+                if (!matched)
                 {
-                    if (string.Equals((string)(FrostySdk.Ebx.CString)ev.Name, fieldName, StringComparison.OrdinalIgnoreCase))
-                        return;
+                    foreach (dynamic ev in iface.OutputEvents)
+                    {
+                        if (string.Equals((string)(FrostySdk.Ebx.CString)ev.Name, fieldName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            matched = true;
+                            break;
+                        }
+                    }
                 }
-                foreach (dynamic ev in iface.InputEvents)
+                if (!matched)
                 {
-                    if (string.Equals((string)(FrostySdk.Ebx.CString)ev.Name, fieldName, StringComparison.OrdinalIgnoreCase))
-                        return;
+                    foreach (dynamic ev in iface.InputEvents)
+                    {
+                        if (string.Equals((string)(FrostySdk.Ebx.CString)ev.Name, fieldName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            matched = true;
+                            break;
+                        }
+                    }
                 }
 
-                issues.Add(new Dictionary<string, object>
+                if (!matched)
                 {
-                    ["kind"] = kind,
-                    ["index"] = index,
-                    ["side"] = side,
-                    ["issue"] = "field_not_in_interface",
-                    ["field"] = fieldName
-                });
+                    issues.Add(new Dictionary<string, object>
+                    {
+                        ["kind"] = kind,
+                        ["index"] = index,
+                        ["side"] = side,
+                        ["issue"] = "field_not_in_interface",
+                        ["field"] = fieldName
+                    });
+                }
+
+                return true;
             }
             catch
             {
                 // An object without a readable interface is not a failure.
+                return false;
             }
         }
         private static bool HasConnectionArrays(dynamic root)

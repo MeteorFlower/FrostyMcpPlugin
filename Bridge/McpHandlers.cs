@@ -235,10 +235,11 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     if (xml)
                     {
-                        // Virjoinga fork: EbxXmlWriter 改成 (EbxAsset, Stream, AssetManager,
-                        // tabSize, writeOffsets), 且 WriteObjects() 不再收参数
-                        // (内部用 asset.Objects)。官方 1.0.6.3 的旧签名是
-                        // (Stream, AssetManager) + WriteObjects(IEnumerable<object>)。
+                        // This fork's writer takes (EbxAsset, Stream, AssetManager,
+                        // tabSize, writeOffsets) and WriteObjects() has no arguments,
+                        // reading asset.Objects instead.
+                        // Official 1.0.6.3 uses (Stream, AssetManager) plus
+                        // WriteObjects(IEnumerable<object>), so its examples do not port.
                         // Frosty 1.0.6.3: EbxXmlWriter is (Stream, AssetManager) and
                         // WriteObjects takes the object list. asset.Objects (not
                         // RootObjects) so PointerRef-referenced components appear too.
@@ -350,7 +351,17 @@ namespace FrostyMcpPlugin.Bridge
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
 
-            List<object> all = new List<object>();
+            // The page window is decided first; entries outside it are counted but
+            // never serialized.
+            int total = 0;
+            List<object> page = new List<object>(limit);
+            Action<Func<object>> take = serialize =>
+            {
+                int index = total++;
+                if (index < offset || page.Count >= limit)
+                    return;
+                page.Add(serialize());
+            };
 
             if (kind == "all" || kind == "ebx")
             {
@@ -359,24 +370,31 @@ namespace FrostyMcpPlugin.Bridge
                 // see the indirect ones anyway.
                 bool includeLinked = p.Value<bool?>("include_linked") ?? false;
                 foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx(modifiedOnly: true, includeLinked: includeLinked))
-                    all.Add(SerializeEbxEntry(e));
+                {
+                    EbxAssetEntry captured = e;
+                    take(() => SerializeEbxEntry(captured));
+                }
             }
             if (kind == "all" || kind == "res")
             {
                 foreach (ResAssetEntry e in App.AssetManager.EnumerateRes(modifiedOnly: true))
-                    all.Add(SerializeResEntry(e));
+                {
+                    ResAssetEntry captured = e;
+                    take(() => SerializeResEntry(captured));
+                }
             }
             if (kind == "all" || kind == "chunk")
             {
                 foreach (ChunkAssetEntry e in App.AssetManager.EnumerateChunks(modifiedOnly: true))
-                    all.Add(SerializeChunkEntry(e));
+                {
+                    ChunkAssetEntry captured = e;
+                    take(() => SerializeChunkEntry(captured));
+                }
             }
-
-            List<object> page = all.Skip(offset).Take(limit).ToList();
             return new Dictionary<string, object>
             {
                 ["success"] = true,
-                ["total"] = all.Count,
+                ["total"] = total,
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
@@ -506,16 +524,21 @@ namespace FrostyMcpPlugin.Bridge
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
 
+            // EnumerateBundles walks m_bundles in order and GetBundleEntry(id) is
+            // m_bundles[id], so the loop position is the bundle id. Looking it up by
+            // name for every bundle made this quadratic.
             List<object> all = new List<object>();
+            int bundleId = 0;
             foreach (BundleEntry be in App.AssetManager.EnumerateBundles())
             {
+                int currentId = bundleId++;
                 if (!string.IsNullOrEmpty(query) &&
                     (be.Name == null || be.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0))
                     continue;
 
                 all.Add(new Dictionary<string, object>
                 {
-                    ["bundle_id"] = App.AssetManager.GetBundleId(be.Name),
+                    ["bundle_id"] = currentId,
                     ["name"] = be.Name,
                     ["type"] = be.Type.ToString(),
                     ["added"] = be.Added,
@@ -551,25 +574,46 @@ namespace FrostyMcpPlugin.Bridge
 
             BundleEntry be = App.AssetManager.GetBundleEntry(bundleId);
 
-            // EnumerateRes/EnumerateChunks(BundleEntry) only test entry.Bundles and
-            // ignore AddedBundles, so assets added to a bundle through the editor
-            // vanish from the listing even though the mod writer exports them.
-            // Filter by the effective bundle list instead.
-            List<object> ebx = App.AssetManager.EnumerateEbx()
-                .Where(e => e.EnumerateBundles().Contains(bundleId))
-                .Select(SerializeEbxEntry).Cast<object>().ToList();
-            List<object> res = App.AssetManager.EnumerateRes()
-                .Where(e => e.EnumerateBundles().Contains(bundleId))
-                .Select(SerializeResEntry).Cast<object>().ToList();
-            List<object> chunks = App.AssetManager.EnumerateChunks()
-                .Where(e => e.EnumerateBundles().Contains(bundleId))
-                .Select(SerializeChunkEntry).Cast<object>().ToList();
-
+            // EnumerateEbx and EnumerateRes match Bundles or AddedBundles but ignore
+            // RemBundles; EnumerateChunks matches Bundles only and misses AddedBundles.
+            // Filter through EnumerateBundles() so the listing matches what the mod
+            // writer exports.
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = ClampLimit(p.Value<int?>("limit") ?? DefaultLimit);
-            List<object> ebxPage = ebx.Skip(offset).Take(limit).ToList();
-            List<object> resPage = res.Skip(offset).Take(limit).ToList();
-            List<object> chunkPage = chunks.Skip(offset).Take(limit).ToList();
+
+            // Count first, serialize only the rows inside the page window.
+            int ebxCount = 0, resCount = 0, chunkCount = 0;
+            List<object> ebxPage = new List<object>(limit);
+            List<object> resPage = new List<object>(limit);
+            List<object> chunkPage = new List<object>(limit);
+
+            foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
+            {
+                if (!e.EnumerateBundles().Contains(bundleId))
+                    continue;
+                int index = ebxCount++;
+                if (index < offset || ebxPage.Count >= limit)
+                    continue;
+                ebxPage.Add(SerializeEbxEntry(e));
+            }
+            foreach (ResAssetEntry e in App.AssetManager.EnumerateRes())
+            {
+                if (!e.EnumerateBundles().Contains(bundleId))
+                    continue;
+                int index = resCount++;
+                if (index < offset || resPage.Count >= limit)
+                    continue;
+                resPage.Add(SerializeResEntry(e));
+            }
+            foreach (ChunkAssetEntry e in App.AssetManager.EnumerateChunks())
+            {
+                if (!e.EnumerateBundles().Contains(bundleId))
+                    continue;
+                int index = chunkCount++;
+                if (index < offset || chunkPage.Count >= limit)
+                    continue;
+                chunkPage.Add(SerializeChunkEntry(e));
+            }
 
             return new Dictionary<string, object>
             {
@@ -577,17 +621,17 @@ namespace FrostyMcpPlugin.Bridge
                 ["name"] = be.Name,
                 ["type"] = be.Type.ToString(),
                 ["super_bundle"] = App.AssetManager.GetSuperBundle(be.SuperBundleId)?.Name,
-                ["ebx_count"] = ebx.Count,
-                ["res_count"] = res.Count,
-                ["chunk_count"] = chunks.Count,
+                ["ebx_count"] = ebxCount,
+                ["res_count"] = resCount,
+                ["chunk_count"] = chunkCount,
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["ebx_returned"] = ebxPage.Count,
                 ["res_returned"] = resPage.Count,
                 ["chunks_returned"] = chunkPage.Count,
-                ["truncated"] = ebx.Count > offset + ebxPage.Count
-                    || res.Count > offset + resPage.Count
-                    || chunks.Count > offset + chunkPage.Count,
+                ["truncated"] = ebxCount > offset + ebxPage.Count
+                    || resCount > offset + resPage.Count
+                    || chunkCount > offset + chunkPage.Count,
                 ["ebx"] = ebxPage,
                 ["res"] = resPage,
                 ["chunks"] = chunkPage
@@ -736,10 +780,12 @@ namespace FrostyMcpPlugin.Bridge
             if (bid >= 0)
                 return bid;
 
+            int index = 0;
             foreach (BundleEntry be in App.AssetManager.EnumerateBundles())
             {
+                int currentId = index++;
                 if (string.Equals(be.Name, name, StringComparison.OrdinalIgnoreCase))
-                    return App.AssetManager.GetBundleId(be.Name);
+                    return currentId;
             }
 
             return -1;

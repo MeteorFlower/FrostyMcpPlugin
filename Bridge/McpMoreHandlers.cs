@@ -503,7 +503,7 @@ namespace FrostyMcpPlugin.Bridge
             try
             {
                 short[] samples = ReadWavPcm16(path, out int channels, out int sampleRate);
-                // Mono → duplicate to stereo (BF1 preference)
+                // Mono is duplicated to stereo, which BF1 prefers
                 if (channels == 1)
                 {
                     short[] stereo = new short[samples.Length * 2];

@@ -146,7 +146,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["create_schematic_channel_asset"] = McpMoreHandlers.CreateSchematicChannelAsset,
                 ["create_schematic_channel_entity"] = McpMoreHandlers.CreateSchematicChannelEntity,
 
-                // Advanced Bundle Editor + Blueprint utilities (v1.10)
+                // Advanced Bundle Editor + Blueprint utilities
                 ["advanced_add_to_bundle"] = McpAdvancedHandlers.AdvancedAddToBundle,
                 ["advanced_remove_from_bundle"] = McpAdvancedHandlers.AdvancedRemoveFromBundle,
                 ["completely_add_to_bundle"] = McpAdvancedHandlers.CompletelyAddToBundle,
@@ -185,7 +185,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["list_registered_node_types"] = McpAdvancedHandlers.ListRegisteredNodeTypes,
                 ["validate_connections"] = McpAdvancedHandlers.ValidateConnections,
 
-                // BF1 DevPlugin helpers (v1.11)
+                // BF1 DevPlugin helpers
                 ["set_root_flags"] = McpBf1Handlers.SetRootFlags,
                 ["get_internal_pointer_ref"] = McpBf1Handlers.GetInternalPointerRef,
                 ["list_network_registry"] = McpBf1Handlers.ListNetworkRegistry,

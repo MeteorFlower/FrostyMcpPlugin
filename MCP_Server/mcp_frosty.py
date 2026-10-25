@@ -15,11 +15,11 @@ def _json_arg(value, name):
     return value
 
 # ============================================================================
-# CRITICAL: WINDOWS LINE ENDING FIX FOR MCP (MONKEY-PATCH)
+# WINDOWS LINE ENDING FIX FOR MCP (MONKEY-PATCH)
 # The MCP SDK's stdio_server uses TextIOWrapper without newline='\n', causing
 # Windows to output CRLF (\r\n) instead of LF (\n). This causes the error:
 # "invalid trailing data at the end of stream"
-# We MUST patch the MCP SDK BEFORE importing FastMCP.
+# The patch must be installed before FastMCP is imported.
 # ============================================================================
 
 if sys.platform == "win32":
@@ -84,6 +84,8 @@ if sys.platform == "win32":
 
 # ============================================================================
 # STDOUT PROTECTION FOR MCP
+# Tools and diagnostics must never write to stdout: stdout carries the
+# JSON-RPC stream. Point it at stderr for the imports below, then restore it.
 # ============================================================================
 
 _mcp_stdout = sys.stdout
@@ -154,6 +156,32 @@ def _load_pipe_profiles():
     return profiles
 
 
+def _detect_running_pipe():
+    """Find the open bridge pipe when no profile was requested.
+
+    One editor is the normal case, so the only pipe wins. Several editors need
+    FROSTY_MCP_PROFILE, because picking one of them silently would talk to the
+    wrong game.
+    """
+    prefix = "Frosty_MCP_Bridge_v1_"
+    pipe_root = "\\\\.\\pipe\\"
+    try:
+        names = os.listdir(pipe_root)
+    except OSError:
+        return None
+
+    matches = [n for n in names if n.startswith(prefix)]
+    if len(matches) == 1:
+        debug_log("using the only open bridge pipe: " + matches[0])
+        return PIPE_PREFIX + "_" + matches[0][len(prefix):]
+    if len(matches) > 1:
+        debug_log(
+            "several bridge pipes are open; set FROSTY_MCP_PROFILE to choose one: "
+            + ", ".join(sorted(n[len(prefix):] for n in matches))
+        )
+    return None
+
+
 def _resolve_pipe_name():
     explicit = os.environ.get("FROSTY_MCP_PIPE")
     if explicit:
@@ -161,6 +189,9 @@ def _resolve_pipe_name():
 
     wanted = os.environ.get("FROSTY_MCP_PROFILE", "").strip()
     if not wanted:
+        detected = _detect_running_pipe()
+        if detected:
+            return detected
         return PIPE_PREFIX
 
     profiles = _load_pipe_profiles()
@@ -218,9 +249,14 @@ class FrostyNamedPipeBridgeClient:
     def __init__(self):
         self.handle = None
         self.timeout_seconds = FROSTY_MCP_TIMEOUT_SECONDS
-        # Tools now run in worker threads; two of them must not interleave
+        # Tools run in worker threads; two of them must not interleave
         # writes/reads on the same pipe handle.
         self._lock = threading.RLock()
+        # Handles left behind by a timed-out request. They are closed by the
+        # worker that owns the read, or by the next close() if the worker lost
+        # the race, so a timed-out pipe never stays open for good.
+        self._orphan_lock = threading.Lock()
+        self._orphans = set()
         if win32file is None or pywintypes is None:
             raise RuntimeError(
                 "Named pipe transport requires Windows and pywin32. "
@@ -232,19 +268,23 @@ class FrostyNamedPipeBridgeClient:
         return self.handle is not None
 
     def connect(self):
-        try:
-            self.handle = win32file.CreateFile(
-                PIPE_NAME,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None,
-            )
-            return True
-        except pywintypes.error:
-            return False
+        with self._lock:
+            # Another worker may have connected while this one waited for the lock.
+            if self.handle is not None:
+                return True
+            try:
+                self.handle = win32file.CreateFile(
+                    PIPE_NAME,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                return True
+            except pywintypes.error:
+                return False
 
     def _read_exact(self, size):
         chunks = []
@@ -301,9 +341,13 @@ class FrostyNamedPipeBridgeClient:
                 # Closing that handle here, rather than from the timing thread,
                 # stops Windows from handing the same handle value to a new
                 # connection while this read is still in flight.
-                if state["orphaned"]:
+                handle = state["handle"]
+                with self._orphan_lock:
+                    orphaned = state["orphaned"] or handle in self._orphans
+                    self._orphans.discard(handle)
+                if orphaned:
                     try:
-                        win32file.CloseHandle(state["handle"])
+                        win32file.CloseHandle(handle)
                     except Exception:
                         pass
 
@@ -312,7 +356,11 @@ class FrostyNamedPipeBridgeClient:
         worker.join(timeout)
 
         if worker.is_alive():
-            state["orphaned"] = True
+            with self._orphan_lock:
+                state["orphaned"] = True
+                # Keep the handle on the orphan list as well: if the worker is
+                # already past its check, close() still closes it later.
+                self._orphans.add(state["handle"])
             # Detach the handle so this client opens a fresh pipe next time; the
             # worker closes the old one when the editor finally replies.
             self.handle = None
@@ -373,12 +421,17 @@ class FrostyNamedPipeBridgeClient:
         return response
 
     def close(self):
-        if self.handle:
+        with self._lock:
+            handle = self.handle
+            self.handle = None
+        with self._orphan_lock:
+            orphans = list(self._orphans)
+            self._orphans.clear()
+        for h in ([handle] if handle else []) + orphans:
             try:
-                win32file.CloseHandle(self.handle)
+                win32file.CloseHandle(h)
             except Exception:
                 pass
-            self.handle = None
 
 
 frosty_client = FrostyNamedPipeBridgeClient()
@@ -392,9 +445,10 @@ mcp = FastMCP(
     instructions=(
         "Frosty Editor MCP bridge v"
         + os.environ.get("FROSTY_MCP_VERSION", "2.1.1")
-        + ". Destructive tools are two-phase: call once to get would_change + plan, then "
-        "repeat the identical call with commit=true to execute. Run capabilities() first to "
-        "see which optional plugins are loaded."
+        + ". Tools that take a commit parameter are two-phase: the first call "
+        "returns would_change + plan, and repeating the identical call with "
+        "commit=true executes it. Tools without commit apply immediately. "
+        "Run capabilities() first to see which optional plugins are loaded."
     ),
 )
 
@@ -572,6 +626,7 @@ async def search_ebx(
 
     Args:
         query: Case-insensitive substring matched against name/type.
+        name: Alias for query, used when query is empty.
         type: Frostbite type filter (subclass match), e.g. "TextureAsset".
         modified_only: Only return modified assets.
         offset: Pagination start index.
@@ -592,7 +647,7 @@ async def search_ebx(
 async def get_ebx_entry(name: str = "", guid: str = "", linked_limit: int = 200) -> str:
     """Get EBX metadata, linked assets, and bundle membership.
 
-    `bundles` is the effective list (vanilla minus removed, plus editor-added),
+    bundles is the effective list (vanilla minus removed, plus editor-added),
     matching the Frosty Bundles tab. Also returns original_bundles, added_bundles
     (new memberships like a duplicated MpSoldier2), and removed_bundles.
     """
@@ -1663,13 +1718,13 @@ async def create_ebx_class(
 ) -> str:
     """Create a new class inside an EBX (Frosty property-grid 'Create Class' on PointerRef).
 
-    Mirrors FrostyPointerRefEditor: TypeLibrary.CreateObject → SetInstanceGuid →
-    DataBusPeer Flags seed → asset.AddObject → assign PointerRef to host.path.
+    Mirrors FrostyPointerRefEditor: TypeLibrary.CreateObject, SetInstanceGuid,
+    DataBusPeer Flags seed, asset.AddObject, then assign the PointerRef to host.path.
 
     Args:
         type: SDK class name to create (from list_ebx_class_types).
         path: Field on host component, e.g. 'Object', 'Components', 'Components[0]', 'Health'.
-              Bare list property → append; PointerRef / list[i] → set.
+              A bare list property appends; a PointerRef or list[i] sets.
         class_guid / index: Host component (omit = root object).
         mode: 'set' | 'append' (default auto-inferred from path).
         reuse_guid: When replacing an existing Internal PointerRef, keep its GUID (Frosty default).
@@ -1948,7 +2003,9 @@ async def research_component_usage(
 @mcp.tool()
 async def hash_string(text: str = "", lowercase: bool = False, float_value: str = "",
                 value: str = "") -> str:
-    """Compute FNV1 / localized hash (and optional float→hex). text may be '0x...' to parse hex.
+    """Compute the FNV1 / localized hash, and optionally the float value as hex.
+
+    text may be '0x...' to parse hex.
 
     value is accepted as an alias for text.
     """
@@ -2466,15 +2523,18 @@ async def advanced_add_to_bundle(
     netreg: bool = False,
     mvdb: bool = False,
     unlock_table: bool = False,
+    allow_fallback: bool = False,
 ) -> str:
     """Add EBX via AdvancedBundleEditorPlugin.BundleEditors (with RES/Chunk extensions).
 
     Optional: also add to NetworkRegistry / MeshVariationDb / UnlockIdTable.
-    Falls back to add_to_bundle_smart if Advanced Bundle plugin is not loaded.
+    Without the plugin this returns PLUGIN_MISSING; allow_fallback=True switches
+    to add_to_bundle_smart instead.
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "advanced_add_to_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
         "netreg": netreg, "mvdb": mvdb, "unlock_table": unlock_table,
+        "allow_fallback": allow_fallback,
     }))
 
 
@@ -2486,10 +2546,16 @@ async def advanced_remove_from_bundle(
     netreg: bool = False,
     mvdb: bool = False,
     unlock_table: bool = False,
+    allow_fallback: bool = False,
 ) -> str:
-    """Remove EBX via AdvancedBundleEditorPlugin (optionally NetReg/MVDB/Unlock table)."""
+    """Remove EBX via AdvancedBundleEditorPlugin (optionally NetReg/MVDB/Unlock table).
+
+    Without the plugin this returns PLUGIN_MISSING; allow_fallback=True switches
+    to remove_from_bundle_smart instead.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "advanced_remove_from_bundle", {
         "name": name, "guid": guid, "bundle": bundle,
+        "allow_fallback": allow_fallback,
         "netreg": netreg, "mvdb": mvdb, "unlock_table": unlock_table,
     }))
 
@@ -2548,10 +2614,15 @@ async def create_advanced_bundle(
 
 
 @mcp.tool()
-async def set_bundle_super(bundle: str = "", super_bundle: str = "") -> str:
-    """Repoint an existing (added) bundle to a different super bundle. Frosty's AddBundle returns the existing bundle unchanged, so this is the only way to fix a bundle's super bundle after creation."""
+async def set_bundle_super(bundle: str = "", super_bundle: str = "", force: bool = False) -> str:
+    """Repoint a bundle at a different super bundle.
+
+    Only editor-added bundles reach a .fbmod, so a vanilla bundle is refused with
+    NOT_EXPORTED unless force=True, in which case the editor changes and the mod
+    does not.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "set_bundle_super", {
-        "bundle": bundle, "super_bundle": super_bundle,
+        "bundle": bundle, "super_bundle": super_bundle, "force": force,
     }))
 
 
@@ -2588,7 +2659,8 @@ async def create_asset(name: str = "", type: str = "", based_on: str = "", based
                       commit: bool = False) -> str:
     """Create a resource-backed asset (EBX+RES+Chunk) via PVZBundleManagerPlugin handlers.
 
-    Use this instead of create_ebx for Texture/Mesh/Sound/Atlas assets.
+    The EBX, RES and Chunk are built and linked together, which a plain EBX
+    create does not do.
     First call returns would_change; call again with commit=True to execute.
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "create_asset", {
@@ -2725,7 +2797,12 @@ async def set_mod_settings(title: str = "", author: str = "", category: str = ""
                            version: str = "", description: str = "", link: str = "",
                            selected_category: int = -1, icon_path: str = "",
                            screenshot_paths_json: str = "[]") -> str:
-    """Update ModSettings fields. icon_path and screenshot_paths_json (up to 4 paths) are optional."""
+    """Update ModSettings fields.
+
+    selected_category is an index into the editor's category list (0 = Custom);
+    leave it at -1 to keep the current value. icon_path and screenshot_paths_json
+    (up to 4 paths) are optional.
+    """
     import json as _json
     params = {
         "title": title, "author": author, "category": category,
@@ -2746,10 +2823,13 @@ async def set_mod_settings(title: str = "", author: str = "", category: str = ""
 @mcp.tool()
 async def export_mod(path: str = "", overwrite: bool = False, title: str = "", author: str = "",
                      category: str = "", version: str = "", description: str = "",
-                     link: str = "", icon_path: str = "", allow_empty: bool = False) -> str:
+                     link: str = "", icon_path: str = "", allow_empty: bool = False,
+                     selected_category: int = -1) -> str:
     """Write a .fbmod from the current project. This never runs automatically.
 
-    A project with no modifications is refused unless allow_empty=True.
+    A project with no modifications is refused unless allow_empty=True. The
+    metadata arguments override ModSettings for this export only; the project's
+    settings are left unchanged.
     """
     params = {"path": path, "overwrite": overwrite, "allow_empty": allow_empty}
     for key, value in (("title", title), ("author", author), ("category", category),
@@ -2757,6 +2837,8 @@ async def export_mod(path: str = "", overwrite: bool = False, title: str = "", a
                        ("link", link), ("icon_path", icon_path)):
         if value:
             params[key] = value
+    if selected_category >= 0:
+        params["selected_category"] = selected_category
     return format_result(await asyncio.to_thread(frosty_client.send_command, "export_mod", params))
 
 
@@ -2863,11 +2945,15 @@ async def list_bundle_contents(
     modified_only: bool = False,
     offset: int = 0,
     limit: int = 200,
+    kind: str = "ebx",
 ) -> str:
-    """List EBX assets inside a bundle (optional type filter / modified_only)."""
+    """List the members of a bundle.
+
+    kind is ebx (default), res, chunk or all; type/modified_only only apply to EBX.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "list_bundle_contents", {
         "bundle": bundle, "type": type, "modified_only": modified_only,
-        "offset": offset, "limit": limit,
+        "offset": offset, "limit": limit, "kind": kind,
     }))
 
 
