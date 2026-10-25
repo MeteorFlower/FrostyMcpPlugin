@@ -173,6 +173,80 @@ namespace FrostyMcpPlugin.Bridge
             return classGuid == Guid.Empty || pr.External.ClassGuid == classGuid;
         }
 
+        // Lists the assets whose External PointerRefs still address the given
+        // component GUIDs of one file. Bounded so a big project stays responsive.
+        internal static List<object> FindAffectedAssets(Guid fileGuid, ICollection<Guid> classGuids, int maxScan)
+        {
+            var affected = new List<object>();
+            if (classGuids == null || classGuids.Count == 0)
+                return affected;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int scanned = 0;
+
+            foreach (EbxAssetEntry entry in App.AssetManager.EnumerateEbx())
+            {
+                if (scanned >= maxScan)
+                    break;
+                EbxAsset asset;
+                try { asset = App.AssetManager.GetEbx(entry); }
+                catch { continue; }
+                if (asset == null)
+                    continue;
+                scanned++;
+
+                var hitPaths = new List<string>();
+                foreach (object obj in asset.Objects)
+                    CollectMatchingPaths(obj, obj.GetType(), "", fileGuid, classGuids, hitPaths, 20);
+
+                if (hitPaths.Count == 0 || !seen.Add(entry.Name))
+                    continue;
+                affected.Add(new Dictionary<string, object>
+                {
+                    ["asset"] = entry.Name,
+                    ["paths"] = hitPaths
+                });
+            }
+            return affected;
+        }
+
+        private static void CollectMatchingPaths(object obj, Type type, string prefix, Guid fileGuid,
+            ICollection<Guid> classGuids, List<string> hits, int cap)
+        {
+            if (obj == null || hits.Count >= cap)
+                return;
+
+            foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!pi.CanRead || pi.GetIndexParameters().Length != 0)
+                    continue;
+                object value;
+                try { value = pi.GetValue(obj); }
+                catch { continue; }
+                if (value == null)
+                    continue;
+
+                string path = string.IsNullOrEmpty(prefix) ? pi.Name : prefix + "." + pi.Name;
+
+                if (value is PointerRef pr)
+                {
+                    if (pr.Type == FrostySdk.IO.PointerRefType.External &&
+                        pr.External.FileGuid == fileGuid && classGuids.Contains(pr.External.ClassGuid))
+                        hits.Add(path);
+                    continue;
+                }
+
+                if (value is IList list && !(value is string))
+                {
+                    for (int i = 0; i < list.Count && hits.Count < cap; i++)
+                    {
+                        if (list[i] is PointerRef itemRef &&
+                            itemRef.Type == FrostySdk.IO.PointerRefType.External &&
+                            itemRef.External.FileGuid == fileGuid && classGuids.Contains(itemRef.External.ClassGuid))
+                            hits.Add(path + "[" + i + "]");
+                    }
+                }
+            }
+        }
         public static object InsertEbxItem(JObject p)
         {
             if (App.AssetManager == null)

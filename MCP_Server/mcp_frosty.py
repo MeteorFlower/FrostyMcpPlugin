@@ -909,15 +909,17 @@ async def export_ebx_bin(name: str = "", guid: str = "", path: str = "") -> str:
 
 @mcp.tool()
 async def import_ebx_bin(name: str = "", guid: str = "", path: str = "", data_only: bool = True,
-                        commit: bool = False) -> str:
+                        commit: bool = False, max_scan: int = 1500) -> str:
     """Import a .bin file into an existing EBX asset.
 
     data_only=True keeps the asset's file GUID and root class GUID; internal object
-    GUIDs come from the file. data_only=False adopts the file's GUID and requires a
-    preview call first, then the same call with commit=True.
+    GUIDs come from the file, and the reply lists the component GUIDs that changed
+    plus the assets whose pointers still address the old ones. data_only=False adopts
+    the file's GUID and requires a preview call first, then commit=True.
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "import_ebx_bin", {
         "name": name, "guid": guid, "path": path, "data_only": data_only, "commit": commit,
+        "max_scan": max_scan,
     }))
 
 
