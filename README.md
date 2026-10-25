@@ -17,6 +17,31 @@ This plugin talks to **whatever profile Frosty has loaded**. Battlefield 1 helpe
 - Texture, mesh, Lua, sound, atlas, and schematic helpers (when the matching Frosty plugins are loaded)
 - Optional Battlefield 1 helpers: NetworkRegistry, map bundles, root Flags
 
+## What's new
+
+- An agent skill ships with the repository at `skills/frosty-mcp/SKILL.md`, next to a Claude
+  Code plugin manifest at `.claude-plugin/plugin.json`. Installing the repository as a plugin
+  loads the MCP server and the usage notes in one step. Cursor, Claude Desktop and Codex keep
+  using the per-client JSON below.
+- `mcp_frosty.py` uses the only open bridge pipe when `FROSTY_MCP_PROFILE` is unset, so a
+  single running editor needs no environment at all. Two editors at once still need the
+  variable, or the full `FROSTY_MCP_PIPE`.
+- Tools that take `commit` are two-phase, and the preview reports `success: false` with
+  `PREVIEW_ONLY` instead of looking like a completed call. Tools without `commit` apply
+  immediately.
+- New tools: `find_pointer_references`, `insert_ebx_item`, `check_asset_ready` and
+  `refresh_mesh_variations`, plus `kind` on `list_bundle_contents`, `force` on
+  `set_bundle_super`, `allow_fallback` on the advanced bundle pair, and `assets_json` on
+  `research_component_usage`.
+- Failure paths report failure: mesh import returns `IMPORT_FAILED` instead of letting the
+  exception reach the editor's dispatcher, `import_sound` refuses with `CODEC_UNKNOWN` when
+  the sample header cannot be read, a `GUID_MISMATCH` bin import is reverted, `insert_ebx_item`
+  reports `ITEM_DROPPED` when `Update()` discards the element, and `export_mod` replaces an
+  existing `.fbmod` atomically.
+- `set_root_flags` requires `flags`; the Python wrapper no longer defaults the word to 15.
+- Listing tools count first and serialize only the requested page, and `EbxYamlWriter` caches
+  the property table per type, which matters on large assets.
+
 ## Architecture
 
 ```
@@ -62,6 +87,10 @@ pip install -r MCP_Server/requirements.txt
 
 ## 3. Connect an MCP client
 
+Two ways to install. The Claude Code plugin route brings the MCP server and the bundled
+skill together; see Bundled skill and plugin manifest under Claude Code below. Every
+other client points at the stdio server itself, as described here.
+
 The Python process is a **stdio** MCP server. Point every client at the same `command` / `args` (use an **absolute** path to `mcp_frosty.py`). Prefer the `python.exe` you used for `pip install` if `python` is not on PATH.
 
 Shared stdio launch:
@@ -71,7 +100,7 @@ Shared stdio launch:
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
 | `env` | `FROSTY_MCP_VERSION=2.1.1` (optional; bump it when tool schemas change so clients reload) |
-| `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix) |
+| `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix. Leave it unset when one editor is running: the server then uses the only open bridge pipe) |
 | `env` | `FROSTY_MCP_PIPE=\\.\pipe\...` (optional; full pipe path override, wins over `FROSTY_MCP_PROFILE`) |
 
 After changing tools, bump `FROSTY_MCP_VERSION` and restart the MCP server in that client. Call `ping` first; it should return `profile_loaded: true` once Frosty has a profile open.
@@ -121,6 +150,19 @@ claude mcp add frosty --scope user -- python D:/path/to/FrostyMcpPlugin/MCP_Serv
 ```
 
 If you already configured Claude Desktop, you can import with `claude mcp add-from-claude-desktop`. Then `claude mcp list` and restart Claude Code.
+
+### Bundled skill and plugin manifest
+
+The repository ships an agent skill and a plugin manifest, so a Claude Code installation can load the tools and their usage notes together:
+
+| Path | Purpose |
+|------|---------|
+| `skills/frosty-mcp/SKILL.md` | The skill. Claude Code exposes it as `frosty-mcp:frosty-mcp` when the repository is installed as a plugin |
+| `.claude-plugin/plugin.json` | Declares the `frosty` stdio server (`${CLAUDE_PLUGIN_ROOT}/MCP_Server/mcp_frosty.py`) and points at `./skills/` |
+
+Install it as a plugin from a marketplace entry that points at this repository, or keep using the per-client JSON above. The skill file is plain Markdown; other clients can read it as documentation.
+
+The skill covers the two-phase commit protocol, all tool groups, the error codes, pitfalls that produce a wrong result without an error, and the tools that need an optional Frosty plugin.
 
 ### OpenAI Codex (CLI, IDE extension, ChatGPT desktop Codex)
 
