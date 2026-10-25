@@ -779,13 +779,15 @@ namespace FrostyMcpPlugin.Bridge
                 "SvgImagePlugin.SvgImage",
                 "IesResourcePlugin.IesResource",
                 "DuplicationPlugin.DuplicateAssetExtension",
-                "PvZBundleManagerPlugin.Plugin",
                 "AdvancedBundleEditorPlugin.BundleEditors",
                 "BlueprintEditorPlugin.ExtensionsManager",
                 "Frosty.Core.Windows.FrostyTaskWindow"
             };
             foreach (string typeName in required)
                 plugins[typeName] = TypeExists(typeName);
+            // The plugin assembly has shipped as both PVZBundleManagerPlugin and
+            // PvZBundleManagerPlugin, so one lookup decides this entry.
+            plugins["PVZBundleManagerPlugin.Plugin"] = McpBulkHandlers.FindBundleManagerPluginType() != null;
 
             bool pvz = ProfilesLibrary.ProfileName != null &&
                 (ProfilesLibrary.ProfileName.IndexOf("PVZ", StringComparison.OrdinalIgnoreCase) >= 0 ||
