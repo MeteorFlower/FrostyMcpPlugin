@@ -220,6 +220,13 @@ def _resolve_pipe_name():
 
 
 PIPE_NAME = _resolve_pipe_name()
+# True when the pipe was not pinned by an environment variable. The name is then
+# resolved again on every connect, so a server started before the editor still
+# finds the pipe once the editor is up.
+PIPE_NAME_IS_AUTO = (
+    not os.environ.get("FROSTY_MCP_PIPE")
+    and not os.environ.get("FROSTY_MCP_PROFILE", "").strip()
+)
 MCP_SERVER_NAME = "frosty"
 MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
 
@@ -268,10 +275,16 @@ class FrostyNamedPipeBridgeClient:
         return self.handle is not None
 
     def connect(self):
+        global PIPE_NAME
         with self._lock:
             # Another worker may have connected while this one waited for the lock.
             if self.handle is not None:
                 return True
+
+            if PIPE_NAME_IS_AUTO:
+                detected = _detect_running_pipe()
+                if detected:
+                    PIPE_NAME = detected
             try:
                 self.handle = win32file.CreateFile(
                     PIPE_NAME,
