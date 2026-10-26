@@ -85,7 +85,7 @@ Build `FrostyMcpPlugin.sln` as **Developer - Debug | x64**. A PostBuild step cop
 Start Frosty, load a profile, and check the editor log:
 
 ```
-[MCP v2.3.20] Listening on: Frosty_MCP_Bridge_v1_<profile>
+[MCP v2.3.22] Listening on: Frosty_MCP_Bridge_v1_<profile>
 ```
 
 Menu: **Tools → MCP Bridge Status**
@@ -112,7 +112,7 @@ Shared stdio launch:
 |-------|--------|
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
-| `env` | `FROSTY_MCP_VERSION=2.3.20` (optional; bump it when tool schemas change so clients reload) |
+| `env` | `FROSTY_MCP_VERSION=2.3.22` (optional; bump it when tool schemas change so clients reload) |
 | `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix. Leave it unset when one editor is running: the server then uses the only open bridge pipe) |
 | `env` | `FROSTY_MCP_PIPE=\\.\pipe\...` (optional; full pipe path override, wins over `FROSTY_MCP_PROFILE`) |
 
@@ -140,7 +140,7 @@ Or: Cursor Settings → MCP.
     "frosty": {
       "command": "python",
       "args": ["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"],
-      "env": { "FROSTY_MCP_VERSION": "2.3.20" }
+      "env": { "FROSTY_MCP_VERSION": "2.3.22" }
     }
   }
 }
@@ -199,7 +199,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 
 [mcp_servers.frosty.env]
-FROSTY_MCP_VERSION = "2.3.20"
+FROSTY_MCP_VERSION = "2.3.22"
 ```
 
 CLI equivalent:
@@ -219,6 +219,24 @@ Pasting a JSON `mcpServers` block into `config.toml` will be ignored.
 3. In your MCP client, `ping` → `get_editor_info`.
 4. `search_ebx` / `open_asset` / `list_components` / `list_connections` before editing.
 5. Mutate with `set_ebx_field`, `create_component`, `add_property_connection`, `safe_add_to_bundle`, etc.
+
+## Tool log in the Frosty Editor
+
+Every MCP command is mirrored into the Frosty log pane, so you can watch what the AI is doing while it works:
+
+```
+[20:41:07]: [Frosty MCP Bridge] [MCP] >> [READ] search_ebx query="ger_base" type="SkeletonAsset"
+[20:41:07]: [Frosty MCP Bridge] [MCP] << [READ] search_ebx 4ms OK total=0 returned=0
+[20:41:12]: [Frosty MCP Bridge] [MCP] >> [WRITE] set_component_property name="Gameplay/Characters/Soldiers/MpSoldier" path="VelocityDrag" value="100"
+[20:41:12]: [Frosty MCP Bridge] [MCP] << [WRITE] set_component_property 2ms OK value=100
+[20:41:19]: [Frosty MCP Bridge] [MCP] << [WRITE] export_mesh 12ms FAIL code=EXPORT_FAILED error="..."
+```
+
+- `>>` = tool call with its arguments (truncated), `<<` = result + duration, `!!` = exception / unknown method, `--` = bridge event.
+- `[READ]` = query/export tools, `[WRITE]` = anything that can modify the project.
+- Toggle it with **Tools ▸ MCP Tool Log (On/Off)**; the state is shown in `Tools ▸ MCP Bridge Status`.
+- Arguments and results are one-lined and length-capped, so large payloads (Lua source, XML dumps) do not flood the pane.
+
 
 Example (blueprint delay node):
 

@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace FrostyMcpPlugin.Bridge
 {
@@ -198,8 +199,11 @@ namespace FrostyMcpPlugin.Bridge
 
         public static object Dispatch(string method, JObject paramsObj)
         {
+            long started = Stopwatch.GetTimestamp();
+
             if (!Handlers.TryGetValue(method, out Func<JObject, object> handler))
             {
+                McpLog.Warn("unknown method: " + method);
                 return new Dictionary<string, object>
                 {
                     ["success"] = false,
@@ -208,7 +212,23 @@ namespace FrostyMcpPlugin.Bridge
                 };
             }
 
-            return handler(paramsObj);
+            McpLog.ToolBegin(method, paramsObj);
+            try
+            {
+                object result = handler(paramsObj);
+                McpLog.ToolEnd(method, result, ElapsedMs(started));
+                return result;
+            }
+            catch (Exception ex)
+            {
+                McpLog.ToolException(method, ex, ElapsedMs(started));
+                throw;
+            }
+        }
+
+        private static long ElapsedMs(long startedTimestamp)
+        {
+            return (long)Math.Round((Stopwatch.GetTimestamp() - startedTimestamp) * 1000.0 / Stopwatch.Frequency);
         }
     }
 }

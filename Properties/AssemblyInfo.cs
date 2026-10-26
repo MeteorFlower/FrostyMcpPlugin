@@ -18,3 +18,4 @@ using System.Windows;
 
 [assembly: RegisterStartupAction(typeof(McpStartupAction))]
 [assembly: RegisterMenuExtension(typeof(McpStatusMenuExtension))]
+[assembly: RegisterMenuExtension(typeof(McpToolLogMenuExtension))]
