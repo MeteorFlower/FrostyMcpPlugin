@@ -68,6 +68,8 @@ namespace FrostyMcpPlugin.Bridge
                     TaskCreationOptions.LongRunning,
                     TaskScheduler.Default);
             }
+
+            McpLog.Event("bridge listening on \\\\.\\pipe\\" + PipeName + " (v" + Version + ", tool log " + (McpLog.Enabled ? "on" : "off") + ")");
         }
 
         public void Stop()
@@ -112,7 +114,9 @@ namespace FrostyMcpPlugin.Bridge
                         continue;
 
                     long connectionId = Interlocked.Increment(ref _clientsServed);
+                    McpLog.Event("client connected (#" + connectionId + ")");
                     HandleClient(pipe, token, connectionId);
+                    McpLog.Event("client disconnected (#" + connectionId + ")");
                 }
                 catch (OperationCanceledException)
                 {
@@ -202,6 +206,7 @@ namespace FrostyMcpPlugin.Bridge
             }
             catch
             {
+                McpLog.Warn("malformed request JSON (" + requestJson.Length + " bytes)");
                 return JsonConvert.SerializeObject(new
                 {
                     jsonrpc = "2.0",

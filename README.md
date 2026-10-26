@@ -218,6 +218,24 @@ Pasting a JSON `mcpServers` block into `config.toml` will be ignored.
 4. `search_ebx` / `open_asset` / `list_components` / `list_connections` before editing.
 5. Mutate with `set_ebx_field`, `create_component`, `add_property_connection`, `safe_add_to_bundle`, etc.
 
+## Tool log in the Frosty Editor
+
+Every MCP command is mirrored into the Frosty log pane, so you can watch what the AI is doing while it works:
+
+```
+[20:41:07]: [Frosty MCP Bridge] [MCP] >> [READ] search_ebx query="ger_base" type="SkeletonAsset"
+[20:41:07]: [Frosty MCP Bridge] [MCP] << [READ] search_ebx 4ms OK total=0 returned=0
+[20:41:12]: [Frosty MCP Bridge] [MCP] >> [WRITE] set_component_property name="Gameplay/Characters/Soldiers/MpSoldier" path="VelocityDrag" value="100"
+[20:41:12]: [Frosty MCP Bridge] [MCP] << [WRITE] set_component_property 2ms OK value=100
+[20:41:19]: [Frosty MCP Bridge] [MCP] << [WRITE] export_mesh 12ms FAIL code=EXPORT_FAILED error="..."
+```
+
+- `>>` = tool call with its arguments (truncated), `<<` = result + duration, `!!` = exception / unknown method, `--` = bridge event.
+- `[READ]` = query/export tools, `[WRITE]` = anything that can modify the project.
+- Toggle it with **Tools ▸ MCP Tool Log (On/Off)**; the state is shown in `Tools ▸ MCP Bridge Status`.
+- Arguments and results are one-lined and length-capped, so large payloads (Lua source, XML dumps) do not flood the pane.
+
+
 Example (blueprint delay node):
 
 ```

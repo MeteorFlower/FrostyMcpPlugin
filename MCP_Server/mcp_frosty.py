@@ -520,7 +520,10 @@ mcp = FastMCP(
         + ". Tools that take a commit parameter are two-phase: the first call "
         "returns would_change + plan, and repeating the identical call with "
         "commit=true executes it. Tools without commit apply immediately. "
-        "Run capabilities() first to see which optional plugins are loaded."
+        "Run capabilities() first to see which optional plugins are loaded. "
+        "Includes Type Explorer (search_types, get_type_info, get_type_field, "
+        "list_type_namespaces) and BF1 helpers: set_root_flags, add_to_network_registry, "
+        "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles."
     ),
 )
 
