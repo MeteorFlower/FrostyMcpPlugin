@@ -14,7 +14,7 @@ namespace FrostyMcpPlugin.Extensions
         public override RelayCommand MenuItemClicked => new RelayCommand((o) =>
         {
             string status = McpBridgeServer.Instance.IsRunning
-                ? $"Running\nPipe: \\\\.\\pipe\\{McpBridgeServer.PipeName}\nVersion: {McpBridgeServer.Version}\nClients served: {McpBridgeServer.Instance.ClientsServed}"
+                ? $"Running\nPipe: \\\\.\\pipe\\{McpBridgeServer.PipeName}\nVersion: {McpBridgeServer.Version}\nClients served: {McpBridgeServer.Instance.ClientsServed}\nTool log: {(McpLog.Enabled ? "on" : "off")}"
                 : "Not running";
 
             FrostyMessageBox.Show(status, "Frosty MCP Bridge", MessageBoxButton.OK);

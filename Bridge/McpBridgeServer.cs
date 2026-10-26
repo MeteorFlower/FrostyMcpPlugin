@@ -18,7 +18,7 @@ namespace FrostyMcpPlugin.Bridge
     public sealed class McpBridgeServer
     {
         public const string PipeName = "Frosty_MCP_Bridge_v1";
-        public const string Version = "1.13.0";
+        public const string Version = "1.14.0";
         public const int MaxRequestBytes = 32 * 1024 * 1024;
 
         public static McpBridgeServer Instance { get; } = new McpBridgeServer();
@@ -54,6 +54,8 @@ namespace FrostyMcpPlugin.Bridge
                     TaskCreationOptions.LongRunning,
                     TaskScheduler.Default);
             }
+
+            McpLog.Event("bridge listening on \\\\.\\pipe\\" + PipeName + " (v" + Version + ", tool log " + (McpLog.Enabled ? "on" : "off") + ")");
         }
 
         public void Stop()
@@ -98,7 +100,9 @@ namespace FrostyMcpPlugin.Bridge
                         continue;
 
                     Interlocked.Increment(ref _clientsServed);
+                    McpLog.Event("client connected (#" + ClientsServed + ")");
                     HandleClient(pipe, token);
+                    McpLog.Event("client disconnected (#" + ClientsServed + ")");
                 }
                 catch (OperationCanceledException)
                 {
@@ -178,6 +182,7 @@ namespace FrostyMcpPlugin.Bridge
             }
             catch
             {
+                McpLog.Warn("malformed request JSON (" + requestJson.Length + " bytes)");
                 return JsonConvert.SerializeObject(new
                 {
                     jsonrpc = "2.0",
