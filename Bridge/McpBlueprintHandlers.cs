@@ -3794,10 +3794,16 @@ namespace FrostyMcpPlugin.Bridge
                     if (item == null)
                         continue;
 
-                    // Direct string-like list items
+                    // Direct string-like list items. Until 2026-10-27 this reported a
+                    // value hit for every item without ever comparing it to the query,
+                    // so any numeric list (RandomEventWeight, OutputProperties, ...)
+                    // matched everything, including a nonsense query.
                     if (IsStringLike(item, out string itemText))
                     {
-                        MaybeAddMatch(itemPath, objectIndex, classGuid, objectType, item.GetType().Name, itemText, false, true, query, scope, cmp, matches, ref total, maxCollect);
+                        bool itemHit = (scope == "value" || scope == "both") &&
+                                       ValueTextMatches(item, itemText, query, cmp);
+                        if (itemHit)
+                            MaybeAddMatch(itemPath, objectIndex, classGuid, objectType, item.GetType().Name, itemText, false, true, query, scope, cmp, matches, ref total, maxCollect);
                     }
                     else
                     {
@@ -3833,7 +3839,7 @@ namespace FrostyMcpPlugin.Bridge
                 if (IsStringLike(value, out string text))
                 {
                     bool valueHit = (scope == "value" || scope == "both") &&
-                                    text != null && text.IndexOf(query, cmp) >= 0;
+                                    ValueTextMatches(value, text, query, cmp);
                     if (nameHit || valueHit)
                         MaybeAddMatch(childPath, objectIndex, classGuid, objectType, value.GetType().Name, text, nameHit, valueHit, query, scope, cmp, matches, ref total, maxCollect);
                     continue;
@@ -3914,6 +3920,37 @@ namespace FrostyMcpPlugin.Bridge
                 ["value_type"] = "CString",
                 ["match_in"] = nameHit && valueHit ? "both" : nameHit ? "name" : "value"
             });
+        }
+
+        // Value matching for one field: plain text first, then a 0x-hex interpretation
+        // for integer types. Without the hex path an EBX hash id (stored as a decimal
+        // UInt32) can never be found by the 0xXXXXXXXX form people actually read.
+        private static bool ValueTextMatches(object value, string text, string query, StringComparison cmp)
+        {
+            if (text != null && text.IndexOf(query, cmp) >= 0)
+                return true;
+
+            string q = query.Trim();
+            if (q.Length <= 2 || !q.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            ulong want;
+            if (!ulong.TryParse(q.Substring(2), System.Globalization.NumberStyles.HexNumber,
+                                System.Globalization.CultureInfo.InvariantCulture, out want))
+                return false;
+
+            switch (value)
+            {
+                case byte v: return v == want;
+                case sbyte v: return (ulong)(long)v == want;
+                case ushort v: return v == want;
+                case short v: return (ulong)(long)v == want;
+                case uint v: return v == want;
+                case int v: return (ulong)(long)v == want;
+                case ulong v: return v == want;
+                case long v: return (ulong)v == want;
+                default: return false;
+            }
         }
 
         private static void MaybeAddMatch(
