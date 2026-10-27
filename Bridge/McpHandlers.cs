@@ -285,12 +285,30 @@ namespace FrostyMcpPlugin.Bridge
 
                 if (!string.IsNullOrEmpty(filter))
                 {
+                    int filterContext = p.Value<int?>("filter_context") ?? 1;
+                    if (filterContext < 0)
+                        filterContext = 0;
+                    if (filterContext > 20)
+                        filterContext = 20;
+
                     string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                    List<string> hits = lines
-                        .Where(l => l.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
-                        .ToList();
-                    string filtered = string.Join("\n", hits);
-                    if (charOffset > filtered.Length)
+
+                    // YAML puts a key and its value on separate lines, so returning only
+                    // the matching line drops the value the caller is looking for.
+                    // Keep the hit plus filterContext following lines, in order and
+                    // without duplicates when hits are adjacent.
+                    var keep = new SortedSet<int>();
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        if (lines[i].IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+                        int last = Math.Min(lines.Length - 1, i + filterContext);
+                        for (int k = i; k <= last; k++)
+                            keep.Add(k);
+                    }
+                    string filtered = string.Join("\n", keep.Select(i => lines[i]));
+                    bool offsetClamped = charOffset > filtered.Length;
+                    if (offsetClamped)
                         charOffset = filtered.Length;
                     string slice = filtered.Substring(charOffset);
                     bool cut = slice.Length > maxChars;
@@ -304,8 +322,10 @@ namespace FrostyMcpPlugin.Bridge
                         ["guid"] = entry.Guid.ToString(),
                         ["format"] = xml ? "xml" : "yaml",
                         ["filter"] = filter,
-                        ["match_count"] = hits.Count,
+                        ["filter_context"] = filterContext,
+                        ["match_count"] = keep.Count,
                         ["truncated"] = cut,
+                        ["offset_clamped"] = offsetClamped,
                         ["char_offset"] = charOffset,
                         ["next_offset"] = cut ? charOffset + maxChars : -1,
                         ["total_length"] = filtered.Length,

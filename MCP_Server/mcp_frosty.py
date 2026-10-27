@@ -493,7 +493,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "2.2.2")
+        + os.environ.get("FROSTY_MCP_VERSION", "2.2.3")
         + ". Tools that take a commit parameter are two-phase: the first call "
         "returns would_change + plan, and repeating the identical call with "
         "commit=true executes it. Tools without commit apply immediately. "
@@ -761,7 +761,8 @@ async def get_ebx_entry(name: str = "", guid: str = "", linked_limit: int = 200)
 
 @mcp.tool()
 async def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 60000,
-                summary: bool = False, filter: str = "", char_offset: int = 0) -> str:
+                summary: bool = False, filter: str = "", char_offset: int = 0,
+                filter_context: int = 1) -> str:
     """Export an EBX asset as XML text (truncated if larger than max_chars).
 
     Args:
@@ -769,8 +770,10 @@ async def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 60000,
         guid: EBX file GUID.
         max_chars: Maximum characters to return (default 60000).
         summary: return tag counts instead of the full text.
-        filter: return only lines containing this text.
-        char_offset: start reading at this character when continuing a truncated export.
+        filter: return only matching lines, each followed by filter_context lines.
+        char_offset: start reading at this character when continuing a truncated
+            export. With a filter this offset indexes the FILTERED text.
+        filter_context: lines kept after each match (default 1).
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_xml", {
         "name": name,
@@ -778,13 +781,15 @@ async def get_ebx_xml(name: str = "", guid: str = "", max_chars: int = 60000,
         "max_chars": max_chars,
         "summary": summary,
         "filter": filter,
+        "filter_context": filter_context,
         "char_offset": char_offset,
     }))
 
 
 @mcp.tool()
 async def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 60000,
-                 summary: bool = False, filter: str = "", char_offset: int = 0) -> str:
+                 summary: bool = False, filter: str = "", char_offset: int = 0,
+                 filter_context: int = 1) -> str:
     """Export an EBX asset as YAML text (truncated if larger than max_chars).
 
     Args:
@@ -792,8 +797,13 @@ async def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 60000,
         guid: EBX file GUID.
         max_chars: Maximum characters to return (default 60000).
         summary: return type counts instead of the full text.
-        filter: return only lines containing this text.
-        char_offset: start reading at this character when continuing a truncated export.
+        filter: return only matching lines, each followed by filter_context lines.
+            Use filter_context=0 for matching lines only.
+        char_offset: start reading at this character when continuing a truncated
+            export. With a filter this offset indexes the FILTERED text, so do not
+            mix it with offsets taken from an unfiltered call.
+        filter_context: lines kept after each match (default 1). YAML puts a key and
+            its value on separate lines, so 0 drops the values.
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_yaml", {
         "name": name,
@@ -801,6 +811,7 @@ async def get_ebx_yaml(name: str = "", guid: str = "", max_chars: int = 60000,
         "max_chars": max_chars,
         "summary": summary,
         "filter": filter,
+        "filter_context": filter_context,
         "char_offset": char_offset,
     }))
 
@@ -2894,21 +2905,28 @@ async def get_mod_settings() -> str:
 
 
 @mcp.tool()
-async def set_mod_settings(title: str = "", author: str = "", category: str = "",
-                           version: str = "", description: str = "", link: str = "",
+async def set_mod_settings(title: str | None = None, author: str | None = None,
+                           category: str | None = None, version: str | None = None,
+                           description: str | None = None, link: str | None = None,
                            selected_category: int = -1, icon_path: str = "",
                            screenshot_paths_json: str = "[]") -> str:
     """Update ModSettings fields.
+
+    Only the fields you pass are changed; anything left out keeps its current value.
+    Pass an empty string explicitly to clear a field.
 
     selected_category is an index into the editor's category list (0 = Custom);
     leave it at -1 to keep the current value. icon_path and screenshot_paths_json
     (up to 4 paths) are optional.
     """
     import json as _json
-    params = {
-        "title": title, "author": author, "category": category,
-        "version": version, "description": description, "link": link,
-    }
+    # Until 2026-10-27 every field was sent unconditionally with "" defaults, so a
+    # call that only set the version wiped title/author/category as well.
+    params = {}
+    for key, value in (("title", title), ("author", author), ("category", category),
+                       ("version", version), ("description", description), ("link", link)):
+        if value is not None:
+            params[key] = value
     if selected_category >= 0:
         params["selected_category"] = selected_category
     if icon_path:
