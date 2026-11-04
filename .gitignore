@@ -149,3 +149,5 @@ agent-tools/
 
 # 本机临时备份
 *.sdkstyle.bak
+/MCP_Server/_fake_editor.py
+/MCP_Server/_test_multiinstance.py
