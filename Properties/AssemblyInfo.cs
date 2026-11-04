@@ -14,7 +14,7 @@ using System.Windows;
 
 [assembly: PluginDisplayName("Frosty MCP Bridge")]
 [assembly: PluginAuthor("Frosty2000")]
-[assembly: PluginVersion("1.14.0.0")]
+[assembly: PluginVersion("1.15.0.0")]
 
 [assembly: RegisterStartupAction(typeof(McpStartupAction))]
 [assembly: RegisterMenuExtension(typeof(McpStatusMenuExtension))]

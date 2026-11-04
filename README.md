@@ -23,8 +23,41 @@ Cursor / Claude / Codex  --stdio-->  mcp_frosty.py  --Named Pipe-->  FrostyMcpPl
 
 Wire protocol: `uint32_le(payload_length)` + UTF-8 JSON-RPC (same layout as the Cheat Engine MCP bridge).
 
-Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1`  
-Plugin version: **1.14.0**
+Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1_<profile>_<pid>` (one per editor instance; the plain
+`Frosty_MCP_Bridge_v1` is only a legacy fallback)  
+Plugin version: **1.15.1**
+
+### Several editors at once (BF1 + BFV, or two BF1 windows)
+
+Each editor publishes `%LOCALAPPDATA%\FrostyMcp\instances\frosty_<profile>_<pid>.json` and listens on
+its own pipe, so instances no longer steal each other's client. One MCP entry covers all of them
+(like IDA's multi-instance server): **no second `mcp.json` entry is needed.**
+
+```json
+"frosty": { "command": "python", "args": [".../mcp_frosty.py"] }
+```
+
+At runtime:
+
+- `list_instances` — every open editor with `profile`, `display_name`, `pid`, `pipe`, plus the current target
+- `select_instance("bf1" | "bfv" | "<pid>" | "<index>" | "<game name>")` — pin the target
+- `select_instance("auto")` — stop pinning, follow the newest live editor
+- `ping` — echoes the served `profile`/`pid`/`pipe`, the target mode, and any automatic re-target
+
+**Selection is remembered as intent, not as a pipe.** A pipe name embeds the editor PID, so it goes
+stale whenever the editor restarts. What the server tracks is the *game*:
+
+| situation | behaviour |
+|---|---|
+| the same editor is still running | used as-is |
+| it was closed and a new editor of the **same game** was started | reconnects to the new PID/pige automatically, reports `reconnected` |
+| its game is gone and the mode is `auto` | follows the newest live editor, reports `retargeted_from` |
+| its game is gone and the mode is `pinned` | raises a clear error naming the missing game — never silently edits a different game — and tells you to start it again or call `select_instance("auto")` |
+
+A crashed editor's leftover instance file is ignored automatically (its pipe no longer exists).
+The legacy shared pipe is still used for pre-1.15 plugin builds. Optional env vars
+(`FROSTY_MCP_PROFILE`, `FROSTY_MCP_PID`, `FROSTY_MCP_PIPE`) only seed the first target.
+
 
 # Usage
 
@@ -42,7 +75,7 @@ Build `FrostyMcpPlugin.sln` as **Developer - Debug | x64**. A PostBuild step cop
 Start Frosty, load a profile, and check the editor log:
 
 ```
-[MCP v1.14.0] Listening on: Frosty_MCP_Bridge_v1
+[MCP v1.15.0] Listening on: Frosty_MCP_Bridge_v1_bf1_48712
 ```
 
 Menu: **Tools → MCP Bridge Status**
@@ -65,7 +98,7 @@ Shared stdio launch:
 |-------|--------|
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
-| `env` | `FROSTY_MCP_VERSION=1.14.0` (optional; bump it when tool schemas change so clients reload) |
+| `env` | `FROSTY_MCP_VERSION=1.15.0` (optional; bump it when tool schemas change so clients reload) |
 
 After changing tools, bump `FROSTY_MCP_VERSION` and restart the MCP server in that client. Call `ping` first; it should return `profile_loaded: true` once Frosty has a profile open.
 
@@ -81,7 +114,7 @@ Or: Cursor Settings → MCP.
     "frosty": {
       "command": "python",
       "args": ["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"],
-      "env": { "FROSTY_MCP_VERSION": "1.14.0" }
+      "env": { "FROSTY_MCP_VERSION": "1.15.0" }
     }
   }
 }
@@ -123,7 +156,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 
 [mcp_servers.frosty.env]
-FROSTY_MCP_VERSION = "1.14.0"
+FROSTY_MCP_VERSION = "1.15.0"
 ```
 
 CLI equivalent:

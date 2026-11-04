@@ -21,14 +21,19 @@ namespace FrostyMcpPlugin.Bridge
 
         public static object Ping(JObject _)
         {
+            string display = "";
+            try { display = ProfilesLibrary.DisplayName ?? ""; } catch { }
+
             return new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["pong"] = true,
                 ["version"] = McpBridgeServer.Version,
-                ["pipe"] = McpBridgeServer.PipeName,
+                ["pipe"] = McpBridgeServer.Instance.PipeName,
+                ["pid"] = System.Diagnostics.Process.GetCurrentProcess().Id,
                 ["profile_loaded"] = App.AssetManager != null,
                 ["profile"] = ProfilesLibrary.ProfileName ?? "",
+                ["display_name"] = display,
                 ["selected_asset"] = App.SelectedAsset?.Name
             };
         }

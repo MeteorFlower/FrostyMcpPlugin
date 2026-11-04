@@ -12,7 +12,7 @@ namespace FrostyMcpPlugin.Extensions
             try
             {
                 McpBridgeServer.Instance.Start();
-                logger.Log($"[MCP v{McpBridgeServer.Version}] Listening on: {McpBridgeServer.PipeName}");
+                logger.Log($"[MCP v{McpBridgeServer.Version}] Listening on: {McpBridgeServer.Instance.PipeName}");
             }
             catch (Exception ex)
             {

@@ -79,6 +79,7 @@ sys.stdout = sys.stderr
 import json
 import struct
 import time
+import re
 import math
 import threading
 import traceback
@@ -96,9 +97,11 @@ except ImportError as e:
 
 try:
     import win32file
+    import win32pipe
     import pywintypes
 except ImportError:
     win32file = None
+    win32pipe = None
     pywintypes = None
 
 sys.stdout = _mcp_stdout
@@ -121,9 +124,340 @@ def format_result(result):
 # CONFIGURATION
 # ============================================================================
 
-PIPE_NAME = r"\\.\pipe\Frosty_MCP_Bridge_v1"
+PIPE_PREFIX = r"\\.\pipe\Frosty_MCP_Bridge_v1"
+PIPE_NAME = PIPE_PREFIX  # legacy shared pipe written by plugin builds <= 1.14
 MCP_SERVER_NAME = "frosty"
 MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
+
+# One MCP entry, many editors (IDA-style): each Frosty publishes its own pipe under
+# %LOCALAPPDATA%\FrostyMcp\instances and this server keeps a single "current" target.
+# Switch with the select_instance tool at runtime; these env vars only choose the
+# starting target (FROSTY_MCP_PROFILE=bf1/bfv, FROSTY_MCP_PID=1234, FROSTY_MCP_PIPE=...).
+FROSTY_MCP_PROFILE = (os.environ.get("FROSTY_MCP_PROFILE") or "").strip().lower()
+FROSTY_MCP_PID = (os.environ.get("FROSTY_MCP_PID") or "").strip()
+FROSTY_MCP_PIPE = (os.environ.get("FROSTY_MCP_PIPE") or "").strip()
+
+_registry_dir = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "FrostyMcp",
+    "instances",
+)
+
+# ---------------------------------------------------------------------------
+# Target selection (one MCP entry, many editors, like the IDA multi-instance proxy)
+# ---------------------------------------------------------------------------
+# The target is remembered as *intent*, never as a pipe: a pipe name embeds the
+# editor's PID, so pinning it goes stale the moment the editor is restarted.
+#   mode "auto"   follow the game we last talked to; if that game is gone, follow
+#                 the newest live editor
+#   mode "pinned" the editor the user picked with select_instance(); if that game
+#                 is gone we fail loudly instead of silently editing another game
+_target_lock = threading.RLock()
+_target = {"mode": "auto", "profile": "", "pid": None, "pipe": ""}
+_env_seeded = False
+# Details about the most recent automatic re-target (editor restarted, game vanished).
+_rebind = {}
+
+
+def _pipe_path(name):
+    if name.startswith("\\\\.\\pipe\\") or name.startswith("//./pipe/"):
+        return name
+    if name.startswith("Frosty_MCP_Bridge_v1"):
+        return "\\\\.\\pipe\\" + name
+    return PIPE_PREFIX + "_" + name
+
+
+def _pipe_name_of(path):
+    return path.rsplit("\\", 1)[-1].lower()
+
+
+ERROR_FILE_NOT_FOUND = 2
+ERROR_PATH_NOT_FOUND = 3
+ERROR_PIPE_BUSY = 231
+
+
+def pipe_exists(pipe):
+    """True if the named pipe is published by a live server.
+
+    os.path.exists() is always False for \\\\.\\pipe\\... paths and OpenProcess() is
+    denied when Frosty runs elevated, so a zero-timeout WaitNamedPipe is used:
+    success or ERROR_PIPE_BUSY both prove the pipe exists, and it does not consume
+    the server's single instance.
+    """
+    if win32pipe is None:
+        return True  # cannot probe; trust the published file
+    try:
+        win32pipe.WaitNamedPipe(pipe, 0)
+        return True
+    except Exception as exc:
+        code = getattr(exc, "winerror", None)
+        if code in (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND):
+            return False
+        return True  # busy / not connected / unknown: the pipe is registered
+
+
+STALE_FILE_GRACE_SECONDS = 10
+
+
+def _prune_stale(path):
+    """Best-effort removal of an instance file whose editor is gone.
+
+    Only files older than the grace window are removed: Frosty creates its pipe
+    just before publishing the file, so a fresh file may briefly have no pipe.
+    """
+    try:
+        if time.time() - os.path.getmtime(path) < STALE_FILE_GRACE_SECONDS:
+            return
+        os.remove(path)
+        debug_log("pruned stale instance file " + os.path.basename(path))
+    except OSError:
+        pass
+
+
+def discover_instances():
+    """Return live Frosty editors published in %LOCALAPPDATA%\\FrostyMcp\\instances."""
+    found = []
+    try:
+        names = sorted(os.listdir(_registry_dir))
+    except OSError:
+        return found
+
+    for filename in names:
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(_registry_dir, filename)
+        try:
+            # C# File.WriteAllText(Encoding.UTF8) emits a BOM: utf-8-sig tolerates both.
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+
+        pipe = _pipe_path(data.get("pipe") or "")
+        if not pipe:
+            continue
+        # Stale file from a crashed editor: nothing is listening on that pipe.
+        if not pipe_exists(pipe):
+            _prune_stale(path)
+            continue
+
+        found.append(
+            {
+                "pipe": pipe,
+                "profile": (data.get("profile") or "").lower(),
+                "display_name": data.get("display_name") or "",
+                "pid": data.get("pid"),
+                "version": data.get("version") or "",
+                "process_path": data.get("process_path") or "",
+                "started": data.get("started") or "",
+            }
+        )
+
+    found.sort(key=lambda item: item.get("started") or "")
+    return found
+
+
+def describe_instances(instances=None):
+    instances = discover_instances() if instances is None else instances
+    if not instances:
+        return "none"
+    return ", ".join(
+        f"{i.get('profile') or '?'} (pid {i.get('pid')}, {i.get('display_name') or 'unknown game'})"
+        for i in instances
+    )
+
+
+def _match_instance(inst, query):
+    q = str(query).strip().lower()
+    if not q:
+        return False
+    return (
+        str(inst.get("pid")) == q
+        or (inst.get("profile") or "") == q
+        or q in (inst.get("display_name") or "").lower()
+        or q in (inst.get("pipe") or "").lower()
+        or q in (inst.get("process_path") or "").lower()
+    )
+
+
+def _newest(instances, profile=""):
+    pool = [i for i in instances if (i.get("profile") or "") == profile] if profile else list(instances)
+    return pool[-1] if pool else None
+
+
+def _match_query(instances, query):
+    """Resolve a select_instance() query to exactly one live instance."""
+    q = str(query).strip()
+    ql = q.lower()
+
+    by_pid = [i for i in instances if str(i.get("pid")) == q]
+    if len(by_pid) == 1:
+        return by_pid[0]
+
+    # A bare number that is not a live pid is a discovery index (0-based).
+    if ql.isdigit():
+        idx = int(ql)
+        if 0 <= idx < len(instances):
+            return instances[idx]
+        raise RuntimeError(
+            f"Index {idx} is out of range; {len(instances)} live editor(s). "
+            "Call list_instances() to see the live targets."
+        )
+
+    matches = [i for i in instances if _match_instance(i, ql)]
+    if len(matches) > 1:
+        # "bf1" also appears inside a pipe name, so prefer a real profile match.
+        same = [m for m in matches if (m.get("profile") or "") == ql]
+        if len(same) == 1:
+            return same[0]
+        detail = ", ".join(f"{m.get('profile') or '?'} (pid {m.get('pid')})" for m in matches)
+        raise RuntimeError(
+            f"Ambiguous instance {query!r}; matches: {detail}. "
+            "Pass the pid instead: select_instance('<pid>')."
+        )
+    if len(matches) == 1:
+        return matches[0]
+
+    raise RuntimeError(
+        f"No Frosty editor matched {query!r}. Running: {describe_instances(instances)}. "
+        "Call list_instances() to see the live targets."
+    )
+
+
+def _seed_from_env(instances):
+    """Pick the starting target from FROSTY_MCP_PID / FROSTY_MCP_PROFILE once."""
+    global _env_seeded
+    if _env_seeded:
+        return
+    _env_seeded = True
+    if not instances:
+        _env_seeded = False  # no editor up yet; decide when one appears
+        return
+
+    if FROSTY_MCP_PID:
+        matches = [i for i in instances if str(i.get("pid")) == FROSTY_MCP_PID]
+        if matches:
+            _target.update(profile=matches[-1].get("profile") or "", pid=matches[-1].get("pid"))
+            return
+    if FROSTY_MCP_PROFILE:
+        matches = [i for i in instances if i.get("profile") == FROSTY_MCP_PROFILE]
+        if matches:
+            # Track the game, not the pid: the editor may be restarted later.
+            _target.update(profile=FROSTY_MCP_PROFILE, pid=matches[-1].get("pid"))
+
+
+def resolve_instance(query=None):
+    """Return the live instance to talk to, honouring the remembered target.
+
+    A restarted editor is followed automatically (same game, new pid). An explicitly
+    selected game that is no longer running raises an actionable error rather than
+    quietly moving the session to another game.
+    """
+    with _target_lock:
+        instances = discover_instances()
+        q = "" if query is None else str(query).strip()
+
+        if q:
+            inst = _match_query(instances, q)
+            _target.update(
+                mode="pinned",
+                profile=inst.get("profile") or "",
+                pid=inst.get("pid"),
+                pipe=inst["pipe"],
+            )
+            _rebind.clear()
+            return inst
+
+        if not instances:
+            # Nothing published: fall back to the legacy shared pipe so pre-1.15
+            # plugin builds still work. connect() reports a clear error if it is absent.
+            legacy = _pipe_path(FROSTY_MCP_PIPE) if FROSTY_MCP_PIPE else (_target.get("pipe") or PIPE_NAME)
+            return {"pipe": legacy, "profile": "", "pid": None, "legacy": True}
+
+        _seed_from_env(instances)
+
+        # 1) The exact editor we were talking to is still alive.
+        if _target.get("pid"):
+            want_profile = _target.get("profile") or ""
+            for inst in instances:
+                if inst.get("pid") != _target["pid"]:
+                    continue
+                # Guard against a recycled PID belonging to another game.
+                if want_profile and (inst.get("profile") or "") != want_profile:
+                    continue
+                _target["pipe"] = inst["pipe"]
+                _target["profile"] = inst.get("profile") or want_profile
+                return inst
+
+        # 2) That editor was closed and reopened: same game, new pid -> follow it.
+        profile = _target.get("profile") or ""
+        inst = _newest(instances, profile)
+        if inst:
+            if _target.get("pid") and profile:
+                _rebind.update(
+                    reason="editor-restarted",
+                    profile=profile,
+                    from_pid=_target["pid"],
+                    to_pid=inst.get("pid"),
+                )
+            _target.update(pid=inst.get("pid"), pipe=inst["pipe"])
+            return inst
+
+        # 3) An explicitly selected game is gone: never silently switch games.
+        if _target.get("mode") == "pinned" and profile:
+            if _target.get("pid"):
+                why = (
+                    f"The {profile} editor you selected is no longer running (its pipe is gone) "
+                    f"and no other {profile} editor is open."
+                )
+            else:
+                why = f"No {profile} editor is running yet."
+            raise RuntimeError(
+                f"{why} Live now: {describe_instances(instances)}. "
+                f"Start that game again (this session attaches to it automatically), or call "
+                f"select_instance('auto') / select_instance('<pid>') to move to another editor."
+            )
+
+        # 4) Auto mode and the previous game is gone: follow the newest live editor.
+        inst = instances[-1]
+        if profile:
+            _rebind.update(
+                reason="game-closed",
+                from_pid=_target.get("pid"),
+                to_pid=inst.get("pid"),
+                from_profile=profile,
+                to_profile=inst.get("profile"),
+            )
+        _target.update(profile=inst.get("profile") or "", pid=inst.get("pid"), pipe=inst["pipe"])
+        return inst
+
+
+def reset_target():
+    """Clear an explicit selection and go back to automatic following."""
+    with _target_lock:
+        _target["mode"] = "auto"
+        _rebind.clear()
+
+
+def take_rebind():
+    """Return (and clear) the last automatic re-target, so it is reported once."""
+    with _target_lock:
+        if not _rebind:
+            return None
+        info = dict(_rebind)
+        _rebind.clear()
+        return info
+
+
+def target_snapshot():
+    with _target_lock:
+        return {
+            "mode": _target.get("mode") or "auto",
+            "profile": _target.get("profile") or "",
+            "pid": _target.get("pid"),
+            "pipe": _target.get("pipe") or "",
+        }
+
 
 
 def _parse_timeout_seconds(raw_value):
@@ -150,6 +484,10 @@ FROSTY_MCP_TIMEOUT_SECONDS = _parse_timeout_seconds(os.environ.get("FROSTY_MCP_T
 class FrostyNamedPipeBridgeClient:
     def __init__(self):
         self.handle = None
+        self.pipe_name = None
+        self.target = None
+        self.rebind_note = ""
+        self.last_error = None
         self.timeout_seconds = FROSTY_MCP_TIMEOUT_SECONDS
         if win32file is None or pywintypes is None:
             raise RuntimeError(
@@ -161,20 +499,72 @@ class FrostyNamedPipeBridgeClient:
     def connected(self):
         return self.handle is not None
 
+    def _open_pipe(self, pipe_name):
+        return win32file.CreateFile(
+            pipe_name,
+            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+            0,
+            None,
+            win32file.OPEN_EXISTING,
+            0,
+            None,
+        )
+
     def connect(self):
-        try:
-            self.handle = win32file.CreateFile(
-                PIPE_NAME,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None,
-            )
+        """Open the pipe of the resolved target, re-binding when it was restarted.
+
+        Never refuses a target just because it differs from the previous one: the
+        resolution step already decided which editor is intended, and a restart
+        (BF1 closed then reopened) necessarily means a new pipe name.
+        """
+        with _target_lock:
+            if self.handle:
+                self.close()
+
+            try:
+                target = resolve_instance()
+            except RuntimeError as exc:
+                self.last_error = str(exc)
+                return False
+
+            pipe_name = target["pipe"]
+            previous = self.pipe_name
+            self.rebind_note = ""
+
+            try:
+                self.handle = self._open_pipe(pipe_name)
+            except pywintypes.error as exc:
+                # ERROR_PIPE_BUSY: the editor exists but is not ready (or another
+                # client is momentarily attached). Wait briefly, then retry once.
+                if getattr(exc, "winerror", None) == ERROR_PIPE_BUSY and win32pipe is not None:
+                    try:
+                        win32pipe.WaitNamedPipe(pipe_name, 1500)
+                        self.handle = self._open_pipe(pipe_name)
+                        exc = None
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                if exc is not None or self.handle is None:
+                    self.handle = None
+                    live = len(discover_instances())
+                    if live == 0:
+                        hint = "No Frosty editor is published right now; start one and retry."
+                    else:
+                        hint = (
+                            f"{live} other editor(s) are running; use list_instances and "
+                            "select_instance to target one of them."
+                        )
+                    self.last_error = f"Cannot open {pipe_name}: {exc}. {hint}"
+                    return False
+
+            self.pipe_name = pipe_name
+            self.target = target
+            self.last_error = None
+            if previous and previous != pipe_name:
+                self.rebind_note = (
+                    f"reconnected to {target.get('display_name') or target.get('profile')} "
+                    f"(pid {target.get('pid')}); the previous pipe is gone"
+                )
             return True
-        except pywintypes.error:
-            return False
 
     def _read_exact(self, size):
         chunks = []
@@ -244,10 +634,19 @@ class FrostyNamedPipeBridgeClient:
         for attempt in range(max_retries):
             if not self.connected:
                 if not self.connect():
-                    raise ConnectionError(
+                    last_error = ConnectionError(
                         "Frosty MCP Bridge is not reachable. "
-                        "Start Frosty Editor with FrostyMcpPlugin loaded first."
+                        + (self.last_error + " " if self.last_error else "")
+                        + "Open Frosty Editor with FrostyMcpPlugin loaded (a closed editor "
+                        "cannot be followed; a reopened one of the same game is picked up "
+                        "automatically on the next call). Use list_instances to see what is "
+                        "running and select_instance to switch."
                     )
+                    if attempt < max_retries - 1:
+                        # The previous editor may still be tearing down its pipe.
+                        time.sleep(0.3)
+                        continue
+                    raise last_error
 
             request = {
                 "jsonrpc": "2.0",
@@ -284,6 +683,17 @@ class FrostyNamedPipeBridgeClient:
                 pass
             self.handle = None
 
+    def retarget(self):
+        """Drop the live connection if the resolved target is no longer the one held."""
+        with _target_lock:
+            try:
+                target = resolve_instance()
+            except RuntimeError:
+                self.close()
+                return
+            if self.handle and target.get("pipe") != self.pipe_name:
+                self.close()
+
 
 frosty_client = FrostyNamedPipeBridgeClient()
 
@@ -295,18 +705,170 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "1.14.0")
+        + os.environ.get("FROSTY_MCP_VERSION", "1.15.0")
         + ". Includes Type Explorer (search_types, get_type_info, get_type_field, "
         "list_type_namespaces) and BF1 helpers: set_root_flags, add_to_network_registry, "
-        "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles."
+        "get_internal_pointer_ref, list_network_registry, safe_add_to_bundle, add_to_bf1_map_bundles. "
+        "Several Frosty editors (e.g. BF1 and BFV) may run at once: call list_instances to see them, "
+        "select_instance('bf1'|'bfv'|pid) to switch, and ping to confirm the active profile/pid. "
+        "A selected editor that is closed and reopened under the same game is followed automatically; "
+        "select_instance('auto') returns to following the newest live editor."
     ),
 )
 
 
 @mcp.tool()
 def ping() -> str:
-    """Check connectivity with the Frosty Editor MCP bridge. Call this first."""
-    return format_result(frosty_client.send_command("ping"))
+    """Check connectivity with the Frosty Editor MCP bridge. Call this first.
+
+    Returns the served profile, pid and pipe, so you can confirm which of several
+    open Frosty editors (e.g. BF1 and BFV) you are talking to.
+    """
+    result = frosty_client.send_command("ping")
+    if isinstance(result, dict) and result.get("success"):
+        result["client_pipe"] = frosty_client.pipe_name
+        result["target"] = target_snapshot()
+        if frosty_client.rebind_note:
+            result["reconnected"] = frosty_client.rebind_note
+        rebound = take_rebind()
+        if rebound:
+            result["retargeted_from"] = rebound
+        others = [i for i in discover_instances() if i.get("pipe") != frosty_client.pipe_name]
+        if others:
+            result["other_instances"] = [
+                {"profile": i.get("profile"), "display_name": i.get("display_name"), "pid": i.get("pid")}
+                for i in others
+            ]
+            result["note"] = (
+                "Other Frosty editors are open. Confirm profile/pid is the intended game; "
+                "switch with select_instance('bf1'|'bfv'|pid)."
+            )
+    return format_result(result)
+
+
+@mcp.tool()
+def list_instances() -> str:
+    """List all running Frosty editors (multiple GUIs supported) and show the current target.
+
+    Frosty publishes one pipe per editor, so BF1 and BFV can be open at once.
+    Call this when a tool result looks like it came from the wrong game.
+    """
+    instances = discover_instances()
+    try:
+        selected = resolve_instance()
+    except RuntimeError as exc:
+        selected = {"error": str(exc)}
+
+    rows = []
+    for index, inst in enumerate(instances):
+        rows.append(
+            {
+                "index": index,
+                "profile": inst.get("profile"),
+                "display_name": inst.get("display_name"),
+                "pid": inst.get("pid"),
+                "pipe": inst.get("pipe"),
+                "version": inst.get("version"),
+                "started": inst.get("started"),
+                "selected": inst.get("pipe") == selected.get("pipe"),
+            }
+        )
+
+    payload = {
+        "success": True,
+        "count": len(rows),
+        "target": target_snapshot(),
+        "selected": selected,
+        "instances": rows,
+        "hint": "Use select_instance(query) to switch (index, pid, profile like 'bf1', or game name); "
+        "select_instance('auto') to follow the newest live editor. "
+        "Calls are logged in that editor's Frosty log pane.",
+    }
+    if _rebind:
+        payload["retargeted_from"] = take_rebind()
+    return format_result(payload)
+
+
+@mcp.tool()
+def select_instance(query: str = "") -> str:
+    """Select the Frosty editor that subsequent tool calls go to.
+
+    query: discovery index ('0'/'1'), pid, profile ('bf1'/'bfv'), game name
+    ('battlefield 1'), or pipe substring. Empty or 'auto' = follow automatically.
+
+    Pinning is by game profile, not by pipe, so closing this editor and opening a
+    new one of the same game keeps the session working. If a pinned game stops
+    running entirely, calls fail with an actionable message instead of silently
+    editing a different game.
+    """
+    if not query or str(query).strip().lower() in ("auto", "any", "*"):
+        reset_target()
+        try:
+            inst = resolve_instance()
+        except RuntimeError as exc:
+            return format_result(
+                {
+                    "success": False,
+                    "error": str(exc),
+                    "error_code": "NOT_FOUND",
+                    "instances": discover_instances(),
+                }
+            )
+        frosty_client.retarget()
+        live = bool(inst.get("pid"))
+        return format_result(
+            {
+                "success": True,
+                "mode": "auto",
+                "selected": inst,
+                "message": (
+                    f"Following automatically: {inst.get('display_name') or inst.get('profile')} "
+                    f"(pid {inst.get('pid')})."
+                    if live
+                    else "No Frosty editor is running yet; the first one that starts will be used."
+                ),
+            }
+        )
+
+    try:
+        inst = resolve_instance(query)
+    except RuntimeError as exc:
+        token = str(query).strip().lower()
+        # Allow pre-selecting a game before its editor is started: any short
+        # profile-like token (bf1, bfv, ...) pins the game and attaches later.
+        if not token.isdigit() and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", token):
+            with _target_lock:
+                _target.update(mode="pinned", profile=token, pid=None, pipe="")
+                _rebind.clear()
+            return format_result(
+                {
+                    "success": True,
+                    "mode": "pinned",
+                    "selected": {"profile": token, "pending": True},
+                    "message": f"No {token} editor is running yet. This session will attach to the "
+                    f"next {token} editor that starts; call select_instance('auto') to stop waiting.",
+                }
+            )
+        return format_result(
+            {
+                "success": False,
+                "error": str(exc),
+                "error_code": "NOT_FOUND",
+                "instances": discover_instances(),
+            }
+        )
+
+    frosty_client.retarget()
+    return format_result(
+        {
+            "success": True,
+            "mode": "pinned",
+            "selected": inst,
+            "message": f"Now talking to {inst.get('display_name') or inst.get('profile')} "
+            f"(pid {inst.get('pid')}). If that editor is restarted, this session follows the "
+            f"new {inst.get('profile')} editor automatically.",
+        }
+    )
 
 
 @mcp.tool()
@@ -788,11 +1350,17 @@ def export_res(name: str = "", res_rid: str = "", path: str = "") -> str:
 
 
 @mcp.tool()
-def import_res(name: str = "", res_rid: str = "", path: str = "") -> str:
-    """Import raw bytes into an existing RES asset."""
+def import_res(name: str = "", res_rid: str = "", path: str = "", meta: str = "") -> str:
+    """Import raw bytes into an existing RES asset.
+
+    For Havok physics RES the 16-byte resMeta is recomputed from the payload
+    automatically; pass `meta` (hex) only to force a specific value.
+    """
     params = {"name": name, "path": path}
     if res_rid:
         params["res_rid"] = res_rid
+    if meta:
+        params["meta"] = meta
     return format_result(frosty_client.send_command("import_res", params))
 
 

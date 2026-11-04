@@ -1,6 +1,8 @@
+using FrostySdk;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Text;
@@ -17,11 +19,22 @@ namespace FrostyMcpPlugin.Bridge
     /// </summary>
     public sealed class McpBridgeServer
     {
-        public const string PipeName = "Frosty_MCP_Bridge_v1";
-        public const string Version = "1.14.0";
+        public const string BasePipeName = "Frosty_MCP_Bridge_v1";
+        public const string Version = "1.15.1";
         public const int MaxRequestBytes = 32 * 1024 * 1024;
 
         public static McpBridgeServer Instance { get; } = new McpBridgeServer();
+
+        /// <summary>
+        /// Per-process pipe: "Frosty_MCP_Bridge_v1_&lt;profile&gt;_&lt;pid&gt;".
+        /// Several Frosty builds (BF1 + BFV, or two BF1 windows) can therefore listen
+        /// at the same time without stealing each other's MCP client.
+        /// </summary>
+        public string PipeName { get; private set; } = BasePipeName;
+
+        public string InstanceProfile { get; private set; } = "";
+
+        private string InstanceFile { get; set; }
 
         private readonly object _stateLock = new object();
         private CancellationTokenSource _cts;
@@ -46,16 +59,113 @@ namespace FrostyMcpPlugin.Bridge
                 if (_cts != null)
                     return;
 
+                PipeName = BuildPipeName();
                 _cts = new CancellationTokenSource();
                 CancellationToken token = _cts.Token;
+                string pipeName = PipeName;
                 _listenTask = Task.Factory.StartNew(
-                    () => ListenLoop(token),
+                    () => ListenLoop(pipeName, token),
                     token,
                     TaskCreationOptions.LongRunning,
                     TaskScheduler.Default);
             }
 
-            McpLog.Event("bridge listening on \\\\.\\pipe\\" + PipeName + " (v" + Version + ", tool log " + (McpLog.Enabled ? "on" : "off") + ")");
+            WriteInstanceFile();
+            McpLog.Event("bridge listening on \\\\.\\pipe\\" + PipeName
+                + " (v" + Version + ", profile " + (InstanceProfile == "" ? "none" : InstanceProfile)
+                + ", pid " + Process.GetCurrentProcess().Id
+                + ", tool log " + (McpLog.Enabled ? "on" : "off") + ")");
+        }
+
+        private string BuildPipeName()
+        {
+            string profile = "";
+            try { profile = ProfilesLibrary.ProfileName ?? ""; } catch { }
+
+            InstanceProfile = Slug(profile);
+            if (InstanceProfile.Length == 0)
+                InstanceProfile = "noprofile";
+
+            return BasePipeName + "_" + InstanceProfile + "_" + Process.GetCurrentProcess().Id;
+        }
+
+        private static string Slug(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return "";
+
+            StringBuilder sb = new StringBuilder(text.Length);
+            foreach (char c in text.Trim().ToLowerInvariant())
+            {
+                if (char.IsLetterOrDigit(c) || c == '_' || c == '-')
+                    sb.Append(c);
+                else if (c == ' ' || c == '.')
+                    sb.Append('_');
+            }
+            return sb.ToString();
+        }
+
+        internal static string InstancesDir
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "FrostyMcp", "instances");
+            }
+        }
+
+        /// <summary>
+        /// Publishes this editor's pipe so the MCP client can discover every running
+        /// instance instead of guessing one. Removed on Stop().
+        /// </summary>
+        private void WriteInstanceFile()
+        {
+            try
+            {
+                string dir = InstancesDir;
+                Directory.CreateDirectory(dir);
+
+                string pid = Process.GetCurrentProcess().Id.ToString();
+                InstanceFile = Path.Combine(dir, "frosty_" + InstanceProfile + "_" + pid + ".json");
+
+                string display = "";
+                try { display = ProfilesLibrary.DisplayName ?? ""; } catch { }
+
+                string exe = "";
+                try { exe = Process.GetCurrentProcess().MainModule?.FileName ?? ""; } catch { }
+
+                JObject info = new JObject
+                {
+                    ["pipe"] = "\\\\.\\pipe\\" + PipeName,
+                    ["profile"] = InstanceProfile,
+                    ["display_name"] = display,
+                    ["pid"] = Process.GetCurrentProcess().Id,
+                    ["version"] = Version,
+                    ["process_path"] = exe,
+                    ["started"] = DateTime.UtcNow.ToString("o")
+                };
+
+                // UTF8Encoding(false): no BOM, so non-.NET clients can parse the JSON directly.
+                File.WriteAllText(InstanceFile, info.ToString(Formatting.Indented), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn("could not publish instance file: " + ex.Message);
+            }
+        }
+
+        private void RemoveInstanceFile()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(InstanceFile) && File.Exists(InstanceFile))
+                    File.Delete(InstanceFile);
+            }
+            catch
+            {
+                // best effort
+            }
         }
 
         public void Stop()
@@ -69,9 +179,11 @@ namespace FrostyMcpPlugin.Bridge
                 _cts.Dispose();
                 _cts = null;
             }
+
+            RemoveInstanceFile();
         }
 
-        private void ListenLoop(CancellationToken token)
+        private void ListenLoop(string pipeName, CancellationToken token)
         {
             while (!token.IsCancellationRequested)
             {
@@ -79,7 +191,7 @@ namespace FrostyMcpPlugin.Bridge
                 try
                 {
                     pipe = new NamedPipeServerStream(
-                        PipeName,
+                        pipeName,
                         PipeDirection.InOut,
                         NamedPipeServerStream.MaxAllowedServerInstances,
                         PipeTransmissionMode.Byte,

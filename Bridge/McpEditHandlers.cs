@@ -376,18 +376,122 @@ namespace FrostyMcpPlugin.Bridge
             try
             {
                 byte[] data = File.ReadAllBytes(path);
-                App.AssetManager.ModifyRes(entry.Name, data);
+
+                // ResMeta must describe the payload we are about to install, otherwise the
+                // engine computes wrong packfile / relocation-table offsets and crashes.
+                byte[] meta = null;
+                string metaHex = p.Value<string>("meta");
+                if (!string.IsNullOrWhiteSpace(metaHex))
+                {
+                    meta = ParseHexBytes(metaHex);
+                    if (meta == null)
+                        return McpHandlers.Error("meta must be a hex byte string", "INVALID_PARAMS");
+                }
+                else
+                {
+                    meta = ComputeResMeta(entry.ResType, data);
+                }
+
+                if (meta != null)
+                {
+                    App.AssetManager.ModifyRes(entry.Name, data, meta);
+
+                    // AssetManager.WriteToCache (project save) persists entry.ResMeta, not
+                    // ModifiedEntry.ResMeta, so mirror it to keep the saved project valid.
+                    entry.ResMeta = meta;
+                    if (entry.ModifiedEntry != null)
+                        entry.ModifiedEntry.ResMeta = meta;
+                }
+                else
+                {
+                    App.AssetManager.ModifyRes(entry.Name, data);
+                }
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["asset"] = McpHandlers.SerializeResEntry(App.AssetManager.GetResEntry(entry.Name)),
-                    ["bytes"] = data.Length
+                    ["bytes"] = data.Length,
+                    ["resMeta"] = meta == null ? null : ToHex(meta),
+                    ["resMetaComputed"] = meta != null && string.IsNullOrWhiteSpace(metaHex)
                 };
             }
             catch (Exception ex)
             {
                 return McpHandlers.Error(ex.Message, "IMPORT_FAILED");
             }
+        }
+
+        private static byte[] ParseHexBytes(string hex)
+        {
+            string s = new string(hex.Replace("0x", "").Replace("0X", "").Where(Uri.IsHexDigit).ToArray());
+            if (s.Length == 0 || (s.Length & 1) != 0)
+                return null;
+            byte[] outBytes = new byte[s.Length / 2];
+            for (int i = 0; i < outBytes.Length; i++)
+                outBytes[i] = byte.Parse(s.Substring(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+            return outBytes;
+        }
+
+        private static string ToHex(byte[] b)
+        {
+            return b == null ? null : string.Join(" ", b.Select(x => x.ToString("x2")));
+        }
+
+        // HavokPhysicsData resType (0x91050005-ish; verified 2432974693 for BF1/BFV).
+        private const uint HavokPhysicsDataType = 2432974693u;
+
+        /// <summary>
+        /// Build the 16-byte Frostbite resMeta for a Havok RES payload:
+        ///   u16 headerOffset  u16 flags(0x0100)  u32 inst32Size  u32 inst64Size  u32 fixupSize
+        /// where headerOffset + inst32Size + inst64Size + fixupSize == payload length.
+        /// Layout: [outer part tables][packfile32 layout 04010001][packfile64 layout 08010001][u32 reloc table].
+        /// </summary>
+        internal static byte[] ComputeResMeta(uint resType, byte[] d)
+        {
+            if (resType != HavokPhysicsDataType || d == null || d.Length < 0x100)
+                return null;
+
+            List<int> pks = new List<int>();
+            for (int i = 0; i + 8 <= d.Length; i++)
+            {
+                if (d[i] == 0x57 && d[i + 1] == 0xE0 && d[i + 2] == 0xE0 && d[i + 3] == 0x57 &&
+                    d[i + 4] == 0x10 && d[i + 5] == 0xC0 && d[i + 6] == 0xC0 && d[i + 7] == 0x10)
+                    pks.Add(i);
+            }
+            if (pks.Count < 2)
+                return null;
+
+            int pk32 = pks[0];
+            int pk64 = pks[1];
+
+            long declaredEnd = -1;
+            for (int k = 0; k < 16; k++)
+            {
+                int o = pk64 + 0x50 + k * 0x40;
+                if (o + 0x30 > d.Length)
+                    break;
+                string name = System.Text.Encoding.ASCII.GetString(d, o, 0x13).Split('\0')[0];
+                if (name.Length == 0)
+                    break;
+                if (name == "__data__")
+                {
+                    uint dataStart = BitConverter.ToUInt32(d, o + 0x14);
+                    uint endOffset = BitConverter.ToUInt32(d, o + 0x14 + 24);
+                    declaredEnd = (long)pk64 + dataStart + endOffset;
+                    break;
+                }
+            }
+            if (declaredEnd <= pk64 || declaredEnd > d.Length)
+                return null;
+
+            byte[] meta = new byte[16];
+            BitConverter.GetBytes((ushort)pk32).CopyTo(meta, 0);
+            BitConverter.GetBytes((ushort)0x0100).CopyTo(meta, 2);
+            BitConverter.GetBytes((uint)(pk64 - pk32)).CopyTo(meta, 4);
+            BitConverter.GetBytes((uint)(declaredEnd - pk64)).CopyTo(meta, 8);
+            BitConverter.GetBytes((uint)(d.Length - declaredEnd)).CopyTo(meta, 12);
+            return meta;
         }
 
         public static object ExportChunk(JObject p)
