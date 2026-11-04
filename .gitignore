@@ -146,3 +146,5 @@ venv/
 # Local MCP / agent leftovers
 *.jsonl
 agent-tools/
+/MCP_Server/_fake_editor.py
+/MCP_Server/_test_multiinstance.py
