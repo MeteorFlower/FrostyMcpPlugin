@@ -493,7 +493,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "2.2.3")
+        + os.environ.get("FROSTY_MCP_VERSION", "2.3.11")
         + ". Tools that take a commit parameter are two-phase: the first call "
         "returns would_change + plan, and repeating the identical call with "
         "commit=true executes it. Tools without commit apply immediately. "
@@ -611,7 +611,12 @@ async def list_network_registry(
     offset: int = 0,
     limit: int = 200,
 ) -> str:
-    """List Objects in a NetworkRegistryAsset (*_networkregistry_Win32)."""
+    """List Objects in a NetworkRegistryAsset (*_networkregistry_Win32).
+
+    registry (alias: name) selects WHICH registry to read; query filters the rows
+    inside it. Passing an asset name as registry/name will not find rows - use
+    query for that.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "list_network_registry", {
         "registry": registry or name, "name": name, "query": query,
         "offset": offset, "limit": limit,
@@ -751,6 +756,9 @@ async def get_ebx_entry(name: str = "", guid: str = "", linked_limit: int = 200)
     bundles is the effective list (vanilla minus removed, plus editor-added),
     matching the Frosty Bundles tab. Also returns original_bundles, added_bundles
     (new memberships like a duplicated MpSoldier2), and removed_bundles.
+
+    size is null for assets this project added: they have no original resource
+    entry, so a plain 0 there would read as "empty asset".
     """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "get_ebx_entry", {
         "name": name,
@@ -927,13 +935,19 @@ async def find_pointer_references(name: str = "", file_guid: str = "", class_gui
 
 @mcp.tool()
 async def insert_ebx_item(name: str = "", guid: str = "", path: str = "", class_guid: str = "",
-                          index: int = -1, source_index: int = -1) -> str:
+                          component_type: str = "", type_index: int = 0,
+                          index: int = -1, source_index: int = -1, commit: bool = False) -> str:
     """Insert an element into an EBX array, mirroring the property grid's Insert item.
 
     With source_index the element at that position is reused; otherwise a default
     value is inserted (a null PointerRef for PointerRef lists).
+
+    First call returns would_change; call again with commit=True to execute.
     """
-    params = {"name": name, "guid": guid, "path": path, "class_guid": class_guid}
+    params = {"name": name, "guid": guid, "path": path, "class_guid": class_guid, "commit": commit}
+    if component_type:
+        params["component_type"] = component_type
+        params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
     if source_index >= 0:
@@ -1021,14 +1035,26 @@ async def list_type_namespaces(query: str = "", offset: int = 0, limit: int = 10
 
 
 @mcp.tool()
-async def find_references(name: str = "", guid: str = "", offset: int = 0, limit: int = 100) -> str:
-    """Find EBX assets that reference the given asset GUID."""
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "find_references", {
+async def find_references(name: str = "", guid: str = "", offset: int = 0, limit: int = 100,
+                          mode: str = "", class_guid: str = "", query: str = "",
+                          max_scan: int = 0) -> str:
+    """Find EBX assets that reference the given asset GUID.
+
+    mode="pointer" sweeps pointer fields instead of the dependency graph and
+    returns the field path of each hit, which tells a real reference apart from
+    a guid that merely appears in an exclusion or whitelist array.
+    """
+    params = {
         "name": name,
         "guid": guid,
         "offset": offset,
         "limit": limit,
-    }))
+    }
+    for key, value in (("mode", mode), ("class_guid", class_guid),
+                       ("query", query), ("max_scan", max_scan)):
+        if value:
+            params[key] = value
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "find_references", params))
 
 
 @mcp.tool()
@@ -1563,6 +1589,8 @@ async def create_component(
     properties_json: object = "",
     at_index: int = -1,
     array_host_guid: str = "",
+    client_index: int = -1,
+    server_index: int = -1,
 ) -> str:
     """Create a new internal component from Frostbite SDK type (e.g. DelayEntityData).
 
@@ -1574,6 +1602,9 @@ async def create_component(
         properties_json: JSON object of initial property values (string or object).
         array_host_guid: class GUID of a nested host when the target array is not on the
             root object; available_arrays in the error reply lists valid names.
+        client_index / server_index: runtime slot on that side; 255 means the component
+            is absent there. Leave at -1 to let the tool decide from a reference
+            instance. The reply always reports the result in index_sides.
     """
     params = {"name": name, "guid": guid, "type": type}
     if array:
@@ -1586,6 +1617,10 @@ async def create_component(
         params["flag_preset"] = flag_preset
     if realm:
         params["realm"] = realm
+    if client_index >= 0:
+        params["client_index"] = client_index
+    if server_index >= 0:
+        params["server_index"] = server_index
     props = _json_arg(properties_json, "properties_json")
     if props is not None:
         params["properties"] = props
@@ -1603,8 +1638,14 @@ async def duplicate_component(
     component_type: str = "",
     type_index: int = 0,
     at_index: int = -1,
+    client_index: int = -1,
+    server_index: int = -1,
 ) -> str:
-    """Duplicate an internal component (new GUIDs via FrostyClipboard DeepCopy)."""
+    """Duplicate an internal component (new GUIDs via FrostyClipboard DeepCopy).
+
+    The copy keeps the source's ClientIndex/ServerIndex sides (255 = absent); the
+    slot number itself is reallocated. Pass client_index / server_index to override.
+    """
     params = {"name": name, "guid": guid, "class_guid": class_guid}
     if array:
         params["array"] = array
@@ -1615,6 +1656,10 @@ async def duplicate_component(
         params["type_index"] = type_index
     if index >= 0:
         params["index"] = index
+    if client_index >= 0:
+        params["client_index"] = client_index
+    if server_index >= 0:
+        params["server_index"] = server_index
     props = _json_arg(properties_json, "properties_json")
     if props is not None:
         params["properties"] = props
@@ -1824,6 +1869,7 @@ async def create_ebx_class(
     mode: str = "",
     reuse_guid: bool = True,
     create_only: bool = False,
+    export_object: bool = False,
     flag_preset: str = "",
     realm: str = "",
     properties_json: object = "",
@@ -1841,12 +1887,17 @@ async def create_ebx_class(
         mode: 'set' | 'append' (default auto-inferred from path).
         reuse_guid: When replacing an existing Internal PointerRef, keep its GUID (Frosty default).
         create_only: Only AddObject; do not assign to a path.
+        export_object: Keep the object exported (real GUID) instead of turning it into an
+              internal one. Use this for objects another asset addresses through an external
+              PointerRef, such as UIObjectTag tree nodes. Components listed inside an asset
+              must stay internal, so leave it false for those.
         flag_preset / realm / properties_json: Same as create_component.
     """
     params = {
         "name": name, "guid": guid, "type": type, "path": path,
         "class_guid": class_guid, "mode": mode,
         "reuse_guid": reuse_guid, "create_only": create_only,
+        "export_object": export_object,
     }
     if index >= 0:
         params["index"] = index
@@ -1882,12 +1933,20 @@ async def add_interface_field(
     guid: str = "",
     field_name: str = "",
     value: str = "",
+    value_type: str = "",
+    value_ref: str = "",
     access_type: str = "FieldAccessType_Target",
 ) -> str:
-    """Add an Interface DataField (BF1 CreateFields)."""
+    """Add an Interface DataField (BF1 CreateFields).
+
+    Pass value_type (e.g. TextureAsset) and value_ref (asset path) for a field
+    that carries an asset; a value that resolves to an existing EBX is treated
+    as a reference automatically.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "add_interface_field", {
         "name": name, "guid": guid, "field_name": field_name,
-        "value": value, "access_type": access_type,
+        "value": value, "value_type": value_type, "value_ref": value_ref,
+        "access_type": access_type,
     }))
 
 
@@ -2525,7 +2584,7 @@ async def get_sound_info(name: str = "", guid: str = "") -> str:
 
 @mcp.tool()
 async def export_sound_wav(name: str = "", guid: str = "", path: str = "", variation: int = 0) -> str:
-    """Export SoundWave variation to WAV (Pcm16Big codec only)."""
+    """Export a SoundWave variation to WAV. Old-style SoundWave assets use the Pcm16Big (0x12) decoder; BFN NewWaveAsset chunks are decoded through the sound plugin's bundled vgmstream. NewWave chunks with IsSeekable=true are not supported: their per-block frame headers hide the codec header, and the failure reply reports is_seekable=true."""
     return format_result(await asyncio.to_thread(frosty_client.send_command, "export_sound_wav", {
         "name": name, "guid": guid, "path": path, "variation": variation,
     }))
@@ -2989,11 +3048,19 @@ async def link_asset(kind: str = "ebx", name: str = "", guid: str = "",
 
 @mcp.tool()
 async def unlink_asset(kind: str = "ebx", name: str = "", guid: str = "",
-                       linked_kind: str = "res", linked_name: str = "", linked_guid: str = "") -> str:
-    """Remove a LinkedAsset link between two asset entries."""
+                       linked_kind: str = "res", linked_name: str = "", linked_guid: str = "",
+                       prune_dangling: bool = False) -> str:
+    """Remove a LinkedAsset link between two asset entries.
+
+    Targets that no longer exist in the asset manager (a chunk reverted after it
+    was linked) are still recorded in the link list, so the target is matched
+    against the recorded entries instead of being resolved. Pass
+    prune_dangling=True to drop every link on this asset whose target is gone.
+    """
     return format_result(await asyncio.to_thread(frosty_client.send_command, "unlink_asset", {
         "kind": kind, "name": name, "guid": guid,
         "linked_kind": linked_kind, "linked_name": linked_name, "linked_guid": linked_guid,
+        "prune_dangling": prune_dangling,
     }))
 
 
@@ -3018,7 +3085,19 @@ async def check_guid_invariants(limit: int = 100, max_scan: int = 5000, query: s
 @mcp.tool()
 async def batch_set_field(items: list = []) -> str:
     """Apply many field writes in one call. items entries use the same params as set_ebx_field, or set_component_property when index/component_type is present."""
-    return format_result(await asyncio.to_thread(frosty_client.send_command, "batch_set_field", {"items": items}))
+    import json as _json
+    # set_ebx_field parses its value before sending; batch items arrive as raw
+    # strings, which wrote a literal quoted string instead of the JSON value.
+    normalized = []
+    for item in items:
+        entry = dict(item) if isinstance(item, dict) else item
+        if isinstance(entry, dict) and isinstance(entry.get("value"), str):
+            try:
+                entry["value"] = _json.loads(entry["value"])
+            except Exception:
+                pass
+        normalized.append(entry)
+    return format_result(await asyncio.to_thread(frosty_client.send_command, "batch_set_field", {"items": normalized}))
 
 
 @mcp.tool()

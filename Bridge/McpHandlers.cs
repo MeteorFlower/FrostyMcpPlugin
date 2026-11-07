@@ -288,8 +288,8 @@ namespace FrostyMcpPlugin.Bridge
                     int filterContext = p.Value<int?>("filter_context") ?? 1;
                     if (filterContext < 0)
                         filterContext = 0;
-                    if (filterContext > 20)
-                        filterContext = 20;
+                    if (filterContext > 500)
+                        filterContext = 500;
 
                     string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
 
@@ -298,10 +298,12 @@ namespace FrostyMcpPlugin.Bridge
                     // Keep the hit plus filterContext following lines, in order and
                     // without duplicates when hits are adjacent.
                     var keep = new SortedSet<int>();
+                    int matchLines = 0;
                     for (int i = 0; i < lines.Length; i++)
                     {
                         if (lines[i].IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
                             continue;
+                        matchLines++;
                         int last = Math.Min(lines.Length - 1, i + filterContext);
                         for (int k = i; k <= last; k++)
                             keep.Add(k);
@@ -323,7 +325,11 @@ namespace FrostyMcpPlugin.Bridge
                         ["format"] = xml ? "xml" : "yaml",
                         ["filter"] = filter,
                         ["filter_context"] = filterContext,
-                        ["match_count"] = keep.Count,
+                        // Matching lines only. Counting the context lines as matches
+                        // made the number disagree with the hits a reader could see
+                        // and with a plain grep of the same filter.
+                        ["match_count"] = matchLines,
+                        ["line_count"] = keep.Count,
                         ["truncated"] = cut,
                         ["offset_clamped"] = offsetClamped,
                         ["char_offset"] = charOffset,
@@ -852,7 +858,9 @@ namespace FrostyMcpPlugin.Bridge
                 ["guid"] = entry.Guid.ToString(),
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
-                ["size"] = entry.Size
+                // Added assets have no original ResourceEntry, so Size reads 0 and
+                // looks like an empty asset. Report null instead of a misleading 0.
+                ["size"] = entry.IsAdded ? (object)null : entry.Size
             };
         }
 
@@ -870,7 +878,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["res_type"] = entry.ResType,
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
-                ["size"] = entry.Size
+                ["size"] = entry.IsAdded ? (object)null : entry.Size
             };
         }
 
@@ -886,7 +894,7 @@ namespace FrostyMcpPlugin.Bridge
                 ["id"] = entry.Id.ToString(),
                 ["is_dirty"] = entry.IsDirty,
                 ["is_added"] = entry.IsAdded,
-                ["size"] = entry.Size,
+                ["size"] = entry.IsAdded ? (object)null : entry.Size,
                 ["logical_offset"] = entry.LogicalOffset,
                 ["logical_size"] = entry.LogicalSize
             };

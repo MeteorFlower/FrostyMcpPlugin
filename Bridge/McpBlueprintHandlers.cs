@@ -95,6 +95,15 @@ namespace FrostyMcpPlugin.Bridge
                 conn.TargetField = (CString)targetField;
                 conn.Flags = flags;
 
+                // The editor recomputes the endpoints' DataBus flags from the
+                // connection; without this a freshly created entity keeps all-zero
+                // flags and never evaluates at runtime.
+                string realmText = p.Value<string>("realm") ?? "ClientAndServer";
+                bool connServer = realmText.IndexOf("Server", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool connClient = realmText.IndexOf("Client", StringComparison.OrdinalIgnoreCase) >= 0 || !connServer;
+                SetConnectionEndpointFlag(source, false, connClient, connServer);
+                SetConnectionEndpointFlag(target, false, connClient, connServer);
+
                 dynamic root = asset.RootObject;
                 root.PropertyConnections.Add(conn);
                 SaveAsset(entry, asset);
@@ -133,6 +142,13 @@ namespace FrostyMcpPlugin.Bridge
                 conn.SourceEvent.Name = (CString)sourceEvent;
                 conn.TargetEvent.Name = (CString)targetEvent;
                 SetEnumProperty(conn, "TargetType", targetType);
+
+                bool evServer = targetType.IndexOf("Server", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool evClient = targetType.IndexOf("Client", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!evServer && !evClient)
+                    evClient = true;
+                SetConnectionEndpointFlag(source, true, evClient, evServer);
+                SetConnectionEndpointFlag(target, true, evClient, evServer);
 
                 dynamic root = asset.RootObject;
                 root.EventConnections.Add(conn);
@@ -352,7 +368,13 @@ namespace FrostyMcpPlugin.Bridge
                     catch (Exception ex)
                     {
                         list.Insert(index, removed);
-                        return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                        // Surface the inner exception: the outer one is always the
+                        // same bare null reference and names no object, which made
+                        // this failure impossible to diagnose from the tool result.
+                        string detail = ex.InnerException == null
+                            ? ex.ToString()
+                            : ex.Message + " <- " + ex.InnerException.Message;
+                        return McpHandlers.Error(detail + " (change rolled back)", "REMOVE_FAILED");
                     }
                     return new Dictionary<string, object>
                     {
@@ -481,6 +503,7 @@ namespace FrostyMcpPlugin.Bridge
 
             try
             {
+                List<object> preexisting = asset.Objects.ToList();
                 object newObject = TypeLibrary.CreateObject(typeName);
                 AssetClassGuid classGuid = new AssetClassGuid(
                     Utils.GenerateDeterministicGuid(asset.Objects, typeName, asset.FileGuid), -1);
@@ -508,6 +531,25 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 asset.AddObject(newObject);
+                MakeCreatedObjectInternal(newObject);
+                RepairInternalIdCollisions(asset, preexisting);
+                // Slot numbering runs after the pointer is in its array: the pass walks the
+                // finished tree, and an object that nothing points at yet would be treated as
+                // unreachable and park at the end of the numbering instead of its real place.
+                string indexSides = null;
+                if (!IsContainedInObjects(asset, newObject))
+                {
+                    return McpHandlers.Error(
+                        "asset.AddObject did not register the new object (the serializer cannot write this type): " + typeName,
+                        "OBJECT_NOT_PERSISTED");
+                }
+                if (!IsClassGuidUnique(asset, GetClassGuid(newObject)))
+                {
+                    asset.RemoveObject(newObject);
+                    return McpHandlers.Error(
+                        "Generated object GUID collides with an existing object: " + GetClassGuid(newObject),
+                        "GUID_COLLISION");
+                }
                 PointerRef pref = new PointerRef(newObject);
 
                 // Target array lives on the root object unless a host component is named
@@ -525,9 +567,10 @@ namespace FrostyMcpPlugin.Bridge
                 string arrayName = p.Value<string>("array") ?? "Objects";
                 bool explicitName = !string.IsNullOrEmpty(p.Value<string>("array"));
                 int atIndex = p.Value<int?>("at_index") ?? -1;
+                int addedIndex = atIndex;
                 string usedArray = atIndex >= 0
                     ? (TryInsertPointerToArray(arrayHost, arrayName, pref, atIndex) ? arrayName : null)
-                    : TryAddPointerToArrays(arrayHost, pref, arrayName, explicitName: explicitName);
+                    : TryAddPointerToArrays(arrayHost, pref, arrayName, explicitName: explicitName, out addedIndex);
 
                 if (usedArray == null)
                 {
@@ -543,14 +586,93 @@ namespace FrostyMcpPlugin.Bridge
                     };
                 }
 
+                // The new node must actually resolve from the array it was written
+                // into. Some graph object types (SoundGraph nodes, BehaviorTree
+                // nodes) are dropped by the serializer; before this check the call
+                // returned success while the array kept a Null pointer.
+                IList usedList = GetListMember(arrayHost, usedArray) as IList;
+                if (usedList == null || FindPointerIndex(usedList, newObject) < 0)
+                {
+                    if (usedList != null && usedList.Count > 0 && IsNullPointerSlot(usedList[usedList.Count - 1]))
+                        usedList.RemoveAt(usedList.Count - 1);
+                    asset.RemoveObject(newObject);
+                    SaveAsset(entry, asset);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Object was created but did not persist in '" + usedArray + "'; the serializer dropped it. Rolled back.",
+                        ["error_code"] = "OBJECT_NOT_PERSISTED"
+                    };
+                }
+
+                string spawnerHost = null;
+                string entityHost = null;
+                if (usedArray == "Objects" && ReferenceEquals(arrayHost, asset.RootObject))
+                {
+                    spawnerHost = RegisterIntoWidgetSpawner(asset, pref);
+                    entityHost = RegisterIntoCharacterEntity(asset, pref);
+                }
+                string graphHost = RegisterIntoSoundGraph(asset, pref);
+
+                indexSides = AssignComponentIndices(asset, newObject, null, p);
+
                 SaveAsset(entry, asset);
+
+                // Re-read the saved asset: object types the serializer cannot write
+                // (SoundGraph / BehaviorTree nodes) come back as a Null slot. This is
+                // the check that turns the old phantom success into an explicit error.
+                if (addedIndex >= 0 && ReferenceEquals(arrayHost, asset.RootObject))
+                {
+                    EbxAsset reloaded = App.AssetManager.GetEbx(entry);
+                    IList reloadedList = reloaded == null ? null : GetListMember(reloaded.RootObject, usedArray) as IList;
+                    object reloadedItem = reloadedList != null && addedIndex < reloadedList.Count
+                        ? UnwrapPointer(reloadedList[addedIndex])
+                        : null;
+                    if (reloadedItem == null || reloadedItem.GetType().Name != newObject.GetType().Name)
+                    {
+                        if (reloadedList != null && addedIndex < reloadedList.Count && IsNullPointerSlot(reloadedList[addedIndex]))
+                        {
+                            reloadedList.RemoveAt(addedIndex);
+                            SaveAsset(entry, reloaded);
+                        }
+                        return new Dictionary<string, object>
+                        {
+                            ["success"] = false,
+                            ["error"] = "Object was created but the serializer dropped it (array slot reads back as null); rolled back.",
+                            ["error_code"] = "OBJECT_NOT_PERSISTED"
+                        };
+                    }
+                }
+
+                // A component belongs to the entity, not to the blueprint root.
+                // Every vanilla character blueprint keeps the root Objects array
+                // empty, and the editor's component path does the same
+                // (ComponentNodeWrangler.cs:43-46 appends to a Components list).
+                // Leaving the pointer in the root array as well makes the loader
+                // treat the component as a child object of the blueprint, and the
+                // component table it builds then carries an entry with no
+                // instance behind it.
+                if (entityHost != null && ReferenceEquals(arrayHost, asset.RootObject))
+                {
+                    IList rootObjects = GetListMember(asset.RootObject, "Objects") as IList;
+                    int rootPos = FindPointerIndex(rootObjects, newObject);
+                    if (rootPos >= 0)
+                    {
+                        rootObjects.RemoveAt(rootPos);
+                        SaveAsset(entry, asset);
+                    }
+                }
 
                 int index = IndexOfObject(asset, newObject);
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["added_to_array"] = usedArray,
+                    ["registered_in"] = spawnerHost,
+                    ["registered_in_entity"] = entityHost,
+                    ["registered_in_graph"] = graphHost,
                     ["array_host"] = arrayHost.GetType().Name,
+                    ["index_sides"] = indexSides,
                     ["component"] = SerializeComponent(newObject, index, asset),
                     ["pointer"] = SerializePointerRef(pref)
                 };
@@ -584,19 +706,39 @@ namespace FrostyMcpPlugin.Bridge
                 // ensure top-level object is registered.
                 if (!asset.Objects.Contains(copy) && !IsContainedInObjects(asset, copy))
                     asset.AddObject(copy);
+                if (!IsContainedInObjects(asset, copy))
+                {
+                    return McpHandlers.Error(
+                        "asset.AddObject did not register the duplicate (the serializer cannot write this type): " + copy.GetType().Name,
+                        "OBJECT_NOT_PERSISTED");
+                }
+                if (!IsClassGuidUnique(asset, GetClassGuid(copy)))
+                {
+                    asset.RemoveObject(copy);
+                    return McpHandlers.Error(
+                        "Duplicated object GUID collides with an existing object: " + GetClassGuid(copy),
+                        "GUID_COLLISION");
+                }
 
                 // DeepCopy hands the objects over with InternalId = -1 and AddObject
                 // assigns max+1, so this guards against ids that still collide or are
                 // negative. Renumber only the objects this duplicate added.
                 RepairInternalIdCollisions(asset, preexisting);
 
+                // A duplicate carries the source's ClientIndex/ServerIndex; leaving them
+                // alone makes two components claim the same runtime slot and the asset
+                // crashes when the game instantiates it. The pass runs after the copy is
+                // in its array, because it walks the finished tree.
+                string indexSides = null;
+
                 PointerRef pref = new PointerRef(copy);
                 string arrayName = p.Value<string>("array") ?? "Objects";
                 bool explicitName = !string.IsNullOrEmpty(p.Value<string>("array"));
                 int atIndex = p.Value<int?>("at_index") ?? -1;
+                int addedIndex = atIndex;
                 string usedArray = atIndex >= 0
                     ? (TryInsertPointerToArray(asset.RootObject, arrayName, pref, atIndex) ? arrayName : null)
-                    : TryAddPointerToArrays(asset.RootObject, pref, arrayName, explicitName: explicitName);
+                    : TryAddPointerToArrays(asset.RootObject, pref, arrayName, explicitName: explicitName, out addedIndex);
 
                 if (usedArray == null)
                 {
@@ -615,13 +757,68 @@ namespace FrostyMcpPlugin.Bridge
                     };
                 }
 
+                // Same persistence check as CreateComponent: a duplicate that the
+                // serializer drops must not be reported as success.
+                IList usedList = GetListMember(asset.RootObject, usedArray) as IList;
+                if (usedList == null || FindPointerIndex(usedList, copy) < 0)
+                {
+                    if (usedList != null && usedList.Count > 0 && IsNullPointerSlot(usedList[usedList.Count - 1]))
+                        usedList.RemoveAt(usedList.Count - 1);
+                    foreach (object addedObj in asset.Objects.ToList())
+                    {
+                        if (!preexisting.Contains(addedObj))
+                            asset.RemoveObject(addedObj);
+                    }
+                    SaveAsset(entry, asset);
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "Duplicate did not persist in '" + usedArray + "'; rolled back.",
+                        ["error_code"] = "OBJECT_NOT_PERSISTED"
+                    };
+                }
+
+                string spawnerHost = null;
+                if (usedArray == "Objects")
+                    spawnerHost = RegisterIntoWidgetSpawner(asset, pref);
+                string graphHost = RegisterIntoSoundGraph(asset, pref);
+
                 if (p["properties"] is JObject props)
                 {
                     foreach (JProperty prop in props.Properties())
                         SetMemberValue(copy, prop.Name, prop.Value);
                 }
 
+                foreach (object addedObj in asset.Objects.ToList())
+                {
+                    if (!preexisting.Contains(addedObj))
+                        indexSides = AssignComponentIndices(asset, addedObj, source, p);
+                }
+
                 SaveAsset(entry, asset);
+
+                if (addedIndex >= 0)
+                {
+                    EbxAsset reloaded = App.AssetManager.GetEbx(entry);
+                    IList reloadedList = reloaded == null ? null : GetListMember(reloaded.RootObject, usedArray) as IList;
+                    object reloadedItem = reloadedList != null && addedIndex < reloadedList.Count
+                        ? UnwrapPointer(reloadedList[addedIndex])
+                        : null;
+                    if (reloadedItem == null || reloadedItem.GetType().Name != copy.GetType().Name)
+                    {
+                        if (reloadedList != null && addedIndex < reloadedList.Count && IsNullPointerSlot(reloadedList[addedIndex]))
+                        {
+                            reloadedList.RemoveAt(addedIndex);
+                            SaveAsset(entry, reloaded);
+                        }
+                        return new Dictionary<string, object>
+                        {
+                            ["success"] = false,
+                            ["error"] = "Duplicate was created but the serializer dropped it (array slot reads back as null); rolled back.",
+                            ["error_code"] = "OBJECT_NOT_PERSISTED"
+                        };
+                    }
+                }
 
                 int index = IndexOfObject(asset, copy);
                 return new Dictionary<string, object>
@@ -629,6 +826,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["success"] = true,
                     ["source_index"] = srcIndex,
                     ["added_to_array"] = usedArray,
+                    ["registered_in"] = spawnerHost,
+                    ["registered_in_graph"] = graphHost,
+                    ["index_sides"] = indexSides,
                     ["component"] = SerializeComponent(copy, index, asset),
                     ["pointer"] = SerializePointerRef(pref)
                 };
@@ -671,8 +871,19 @@ namespace FrostyMcpPlugin.Bridge
                 return err;
 
             object comp = ResolveComponent(asset, p, out int index);
+            bool usedRootFallback = false;
             if (comp == null)
-                return McpHandlers.Error("Component not found", "NOT_FOUND");
+            {
+                // The root object is not a component. Reading a plain struct path on a
+                // non-blueprint asset used to die with "Component not found"; fall back
+                // to the asset root instead and say so in the reply.
+                object rootFallback = asset?.RootObjects == null ? null : asset.RootObjects.FirstOrDefault();
+                if (rootFallback == null)
+                    return McpHandlers.Error("Component not found", "NOT_FOUND");
+                comp = rootFallback;
+                index = -1;
+                usedRootFallback = true;
+            }
 
             string path = p.Value<string>("path");
             if (string.IsNullOrWhiteSpace(path))
@@ -690,7 +901,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["type"] = comp.GetType().Name,
                     ["path"] = path,
                     ["value_type"] = typeName,
-                    ["value"] = SerializeAny(value)
+                    ["value"] = SerializeAny(value),
+                    ["used_root_fallback"] = usedRootFallback
                 };
             }
             catch (Exception ex)
@@ -719,17 +931,34 @@ namespace FrostyMcpPlugin.Bridge
                 SetPath(comp, path, p["value"], asset);
                 SaveAsset(entry, asset);
 
-                object value = ResolvePath(comp, path, out string typeName);
-                return new Dictionary<string, object>
+                // Same as set_ebx_field: the value is saved, so a failing readback
+                // must not turn into a reported failure.
+                string typeName = null;
+                object value = null;
+                string readbackError = null;
+                try
+                {
+                    value = ResolvePath(comp, path, out typeName);
+                }
+                catch (Exception readback)
+                {
+                    readbackError = readback.Message;
+                }
+
+                Dictionary<string, object> result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["index"] = index,
                     ["class_guid"] = GetClassGuid(comp).ToString(),
                     ["type"] = comp.GetType().Name,
                     ["path"] = path,
+                    ["applied"] = true,
                     ["value_type"] = typeName,
-                    ["value"] = SerializeAny(value)
+                    ["value"] = readbackError == null ? SerializeAny(value) : null
                 };
+                if (readbackError != null)
+                    result["readback_error"] = readbackError;
+                return result;
             }
             catch (Exception ex)
             {
@@ -785,6 +1014,11 @@ namespace FrostyMcpPlugin.Bridge
                     if (removeObject)
                         asset.RemoveObject(comp);
 
+                    // Removing a component leaves its slot number unused. Slot ids are
+                    // dense per side and the loader walks the whole table, so the gap
+                    // becomes a null entry it dereferences while initialising the entity.
+                    string renumber = RenumberComponentSlots(asset, null, false, false);
+
                     SaveAsset(entry, asset);
                     return new Dictionary<string, object>
                     {
@@ -793,7 +1027,8 @@ namespace FrostyMcpPlugin.Bridge
                         ["class_guid"] = classGuid.ToString(),
                         ["removed_from_objects"] = removeObject,
                         ["cleared_paths"] = clearedPaths,
-                        ["cleared_count"] = clearedPaths.Count
+                        ["cleared_count"] = clearedPaths.Count,
+                        ["index_sides"] = renumber
                     };
                 }
                 catch (Exception ex)
@@ -907,6 +1142,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                 List<object> removed = new List<object>();
                 var clearedPaths = new List<string>();
+                var keptObjects = new List<object>();
                 foreach (int idx in toRemove)
                 {
                     object item = list[idx];
@@ -939,6 +1175,13 @@ namespace FrostyMcpPlugin.Bridge
                             asset.RemoveObject(unwrapped);
                             didRemoveObject = true;
                         }
+                        else if (!removeObject)
+                        {
+                            // remove_object=false promises the object survives. It needs
+                            // a remaining reference or the serializer drops it; keep the
+                            // candidate list and re-home them below.
+                            keptObjects.Add(unwrapped);
+                        }
                     }
 
                     removed.Add(new Dictionary<string, object>
@@ -951,6 +1194,33 @@ namespace FrostyMcpPlugin.Bridge
                     });
                 }
 
+                // Re-home objects that remove_object=false asked to keep: append them
+                // to the root Objects array (when the asset has one) so the serializer
+                // still writes them instead of dropping the now-unreferenced object.
+                var keptVia = new List<object>();
+                if (keptObjects.Count > 0)
+                {
+                    IList rootObjects = GetListMember(asset.RootObject, "Objects") as IList;
+                    foreach (object keepObj in keptObjects)
+                    {
+                        if (keepObj == null || ReferenceEquals(keepObj, asset.RootObject))
+                            continue;
+                        if (rootObjects != null && FindPointerIndex(rootObjects, keepObj) < 0)
+                        {
+                            rootObjects.Add(new PointerRef(keepObj));
+                            keptVia.Add(new Dictionary<string, object>
+                            {
+                                ["class_guid"] = TryGetClassGuid(keepObj).ToString(),
+                                ["kept_via"] = "Objects"
+                            });
+                        }
+                    }
+                }
+
+                // Deleting a component this way also leaves a slot unused, with the same
+                // null-table-entry consequence as remove_component.
+                string renumber = RenumberComponentSlots(asset, null, false, false);
+
                 SaveAsset(entry, asset);
                 return new Dictionary<string, object>
                 {
@@ -961,8 +1231,10 @@ namespace FrostyMcpPlugin.Bridge
                     ["remaining"] = list.Count,
                     ["removed_count"] = removed.Count,
                     ["removed"] = removed,
+                    ["kept"] = keptVia,
                     ["cleared_paths"] = clearedPaths,
-                    ["cleared_count"] = clearedPaths.Count
+                    ["cleared_count"] = clearedPaths.Count,
+                    ["index_sides"] = renumber
                 };
                 });
             }
@@ -1072,9 +1344,46 @@ namespace FrostyMcpPlugin.Bridge
                 dynamic iface = TryGetInterfaceInternal(asset, createIfMissing: true);
                 dynamic dataField = TypeLibrary.CreateObject("DataField");
                 dataField.Name = (CString)fieldName;
+
                 string value = p.Value<string>("value") ?? "";
+                string valueType = p.Value<string>("value_type") ?? "";
+                string valueRef = p.Value<string>("value_ref") ?? "";
+
+                // A path that resolves to a real EBX is a reference, not the
+                // DataField's CString Value. The wrapper does not forward
+                // value_type/value_ref in every build, so the path form has to
+                // stand on its own.
+                if (string.IsNullOrWhiteSpace(valueRef) && !string.IsNullOrWhiteSpace(value))
+                {
+                    string candidate = value.Trim();
+                    EbxAssetEntry target = App.AssetManager.GetEbxEntry(candidate)
+                        ?? App.AssetManager.GetEbxEntry(candidate.ToLowerInvariant());
+                    if (target != null)
+                    {
+                        valueRef = candidate;
+                        if (string.IsNullOrWhiteSpace(valueType))
+                            valueType = App.AssetManager.GetEbx(target).RootObject.GetType().Name;
+                        value = "";
+                    }
+                }
+
                 if (!string.IsNullOrWhiteSpace(value))
                     dataField.Value = (CString)value;
+
+                // A field that carries a real asset needs ValueType plus ValueRef;
+                // leaving those out produced a field whose ValueRef read back as
+                // Null while the reply still echoed the path.
+                if (!string.IsNullOrWhiteSpace(valueType))
+                {
+                    string trimmed = valueType.Trim();
+                    JToken typeToken = trimmed.StartsWith("{")
+                        ? (JToken)JToken.Parse(trimmed)
+                        : new JValue("TypeRef '" + trimmed + "'");
+                    SetMemberValue(dataField, "ValueType", typeToken, asset);
+                }
+
+                if (!string.IsNullOrWhiteSpace(valueRef))
+                    SetMemberValue(dataField, "ValueRef", new JObject { ["asset"] = valueRef.Trim() }, asset);
 
                 string access = p.Value<string>("access_type") ?? "FieldAccessType_Target";
                 SetEnumProperty((object)dataField, "AccessType", access);
@@ -1278,7 +1587,13 @@ namespace FrostyMcpPlugin.Bridge
                     catch (Exception ex)
                     {
                         list.Insert(index, removed);
-                        return McpHandlers.Error(ex.Message + " (change rolled back)", "REMOVE_FAILED");
+                        // Surface the inner exception: the outer one is always the
+                        // same bare null reference and names no object, which made
+                        // this failure impossible to diagnose from the tool result.
+                        string detail = ex.InnerException == null
+                            ? ex.ToString()
+                            : ex.Message + " <- " + ex.InnerException.Message;
+                        return McpHandlers.Error(detail + " (change rolled back)", "REMOVE_FAILED");
                     }
                     return new Dictionary<string, object>
                     {
@@ -1514,7 +1829,12 @@ namespace FrostyMcpPlugin.Bridge
                     ["type"] = entry.Type,
                     ["guid"] = entry.Guid.ToString(),
                     ["instance_count"] = matches.Count,
-                    ["connection_count"] = assetConnections.Count
+                    // This counts connections that touch the matched components in
+                    // this asset, not the asset's connection total. Reading it as
+                    // the asset total made "0" look like "no connections at all".
+                    ["component_connection_count"] = assetConnections.Count,
+                    ["connection_count"] = assetConnections.Count,
+                    ["connection_count_scope"] = "connections touching the matched components, not the whole asset"
                 });
 
                 if (examples.Count < maxExamples)
@@ -1576,6 +1896,12 @@ namespace FrostyMcpPlugin.Bridge
                 ["assets_with_type"] = assetsWithType,
                 ["instance_count"] = instanceCount,
                 ["max_scan"] = maxScan,
+                // A scan stopped at max_scan must not read as "this type is unused":
+                // the caller has no other way to tell the two apart.
+                ["scan_truncated"] = scanned >= maxScan,
+                ["note"] = scanned >= maxScan
+                    ? "SCAN INCOMPLETE: stopped at max_scan before covering the project, so a low or zero instance_count does NOT mean the type is unused. Raise max_scan or narrow with name_query."
+                    : null,
                 ["sdk"] = new Dictionary<string, object>
                 {
                     ["type"] = typeName,
@@ -1943,6 +2269,7 @@ namespace FrostyMcpPlugin.Bridge
                         Utils.GenerateDeterministicGuid(asset.Objects, selectedType, entry.Guid), -1);
                 }
 
+                List<object> preexisting = asset.Objects.ToList();
                 object newObject = TypeLibrary.CreateObject(typeName);
                 if (newObject == null)
                     return McpHandlers.Error("TypeLibrary.CreateObject returned null for " + typeName, "CREATE_FAILED");
@@ -1968,6 +2295,31 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 asset.AddObject(newObject);
+                // Components listed inside the asset must be internal, otherwise the
+                // saved-component loader resolves them to null. Objects that other
+                // assets address by GUID (UIObjectTag tree nodes, and anything else
+                // reached through an external PointerRef) must stay exported: an
+                // internal GUID of the form 00000000-...-XXXXXXXX cannot be referenced
+                // across files.
+                bool keepExported = p.Value<bool?>("export_object") ?? false;
+                if (!keepExported)
+                    MakeCreatedObjectInternal(newObject);
+                RepairInternalIdCollisions(asset, preexisting);
+                // Numbered after the pointer is assigned; the pass walks the finished tree.
+                string indexSides = null;
+                if (!IsContainedInObjects(asset, newObject))
+                {
+                    return McpHandlers.Error(
+                        "asset.AddObject did not register the new object (the serializer cannot write this type): " + typeName,
+                        "OBJECT_NOT_PERSISTED");
+                }
+                if (!IsClassGuidUnique(asset, GetClassGuid(newObject)))
+                {
+                    asset.RemoveObject(newObject);
+                    return McpHandlers.Error(
+                        "Generated object GUID collides with an existing object: " + GetClassGuid(newObject),
+                        "GUID_COLLISION");
+                }
                 PointerRef pref = new PointerRef(newObject);
 
                 string assignedPath = null;
@@ -1977,7 +2329,114 @@ namespace FrostyMcpPlugin.Bridge
                     AssignPointerAtPath(host, path, pref, assignMode, out assignedPath, out listIndex);
                 }
 
+                string graphHost = null;
+                if (!createOnly && ReferenceEquals(host, asset.RootObject))
+                    graphHost = RegisterIntoSoundGraph(asset, pref);
+
+                indexSides = AssignComponentIndices(asset, newObject, null, p);
+
+                // Verify the new object is actually reachable through the assigned
+                // path. BehaviorTree nodes were reported as created while the asset
+                // kept nothing; fail loudly and roll back instead.
+                if (!createOnly && !string.IsNullOrEmpty(assignedPath))
+                {
+                    bool persisted;
+                    try
+                    {
+                        object resolved = ResolvePath(host, assignedPath, out _);
+                        persisted = ReferenceEquals(UnwrapPointer(resolved), newObject);
+                    }
+                    catch
+                    {
+                        persisted = false;
+                    }
+
+                    if (!persisted)
+                    {
+                        if (listIndex >= 0)
+                        {
+                            try
+                            {
+                                string listPath = assignedPath.Substring(0, assignedPath.LastIndexOf('['));
+                                object listObj = ResolvePath(host, listPath, out _);
+                                if (listObj is IList l && listIndex <= l.Count - 1 && IsNullPointerSlot(l[listIndex]))
+                                    l.RemoveAt(listIndex);
+                            }
+                            catch { }
+                        }
+                        asset.RemoveObject(newObject);
+                        SaveAsset(entry, asset);
+                        return new Dictionary<string, object>
+                        {
+                            ["success"] = false,
+                            ["error"] = "Object did not persist after assignment; rolled back.",
+                            ["error_code"] = "OBJECT_NOT_PERSISTED"
+                        };
+                    }
+                }
+
                 SaveAsset(entry, asset);
+
+                // create_only leaves the object unreferenced; checking the in-memory
+                // list is not enough because the serializer drops it on re-read.
+                if (createOnly)
+                {
+                    EbxAsset reloadedOnly = App.AssetManager.GetEbx(entry);
+                    bool presentOnly = false;
+                    if (reloadedOnly != null)
+                    {
+                        Guid onlyGuid = GetClassGuid(newObject);
+                        foreach (object o in reloadedOnly.Objects)
+                        {
+                            if (GetClassGuid(o) == onlyGuid)
+                            {
+                                presentOnly = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!presentOnly)
+                    {
+                        return new Dictionary<string, object>
+                        {
+                            ["success"] = false,
+                            ["error"] = "create_only object was dropped because nothing references it; pass a path to assign it.",
+                            ["error_code"] = "OBJECT_NOT_PERSISTED"
+                        };
+                    }
+                }
+
+                // Re-read the saved asset and confirm the object survived. BehaviorTree
+                // nodes used to report success while nothing was written.
+                if (!createOnly && listIndex >= 0 && ReferenceEquals(host, asset.RootObject))
+                {
+                    EbxAsset reloaded = App.AssetManager.GetEbx(entry);
+                    string listPath = assignedPath.Substring(0, assignedPath.LastIndexOf('['));
+                    IList reloadedList = null;
+                    try
+                    {
+                        reloadedList = reloaded == null ? null : ResolvePath(reloaded.RootObject, listPath, out _) as IList;
+                    }
+                    catch { }
+
+                    object reloadedItem = reloadedList != null && listIndex < reloadedList.Count
+                        ? UnwrapPointer(reloadedList[listIndex])
+                        : null;
+                    if (reloadedItem == null || reloadedItem.GetType().Name != newObject.GetType().Name)
+                    {
+                        if (reloadedList != null && listIndex < reloadedList.Count && IsNullPointerSlot(reloadedList[listIndex]))
+                        {
+                            reloadedList.RemoveAt(listIndex);
+                            SaveAsset(entry, reloaded);
+                        }
+                        return new Dictionary<string, object>
+                        {
+                            ["success"] = false,
+                            ["error"] = "Object was created but the serializer dropped it (array slot reads back as null); rolled back.",
+                            ["error_code"] = "OBJECT_NOT_PERSISTED"
+                        };
+                    }
+                }
 
                 int newIndex = IndexOfObject(asset, newObject);
                 return new Dictionary<string, object>
@@ -1989,6 +2448,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["path"] = assignedPath ?? path,
                     ["list_index"] = listIndex >= 0 ? (object)listIndex : null,
                     ["mode"] = createOnly ? "create_only" : assignMode,
+                    ["registered_in_graph"] = graphHost,
+                    ["index_sides"] = indexSides,
                     ["component"] = SerializeComponent(newObject, newIndex, asset),
                     ["pointer"] = SerializePointerRef(pref)
                 };
@@ -2241,7 +2702,7 @@ namespace FrostyMcpPlugin.Bridge
             return d;
         }
 
-        private static PointerRef ResolvePointerRef(EbxAsset asset, JObject p, string prefix)
+        private static PointerRef ResolvePointerRef(EbxAsset asset, JObject p, string prefix, Type expectedBaseType = null)
         {
             // Accept nested object {class_guid|asset|file_guid|null} or prefixed flat keys
             string classGuidStr = p.Value<string>("class_guid") ?? p.Value<string>(prefix + "guid") ?? p.Value<string>(prefix + "class_guid");
@@ -2261,22 +2722,29 @@ namespace FrostyMcpPlugin.Bridge
                 EbxAsset a = App.AssetManager.GetEbx(e);
                 if (a.FileGuid != e.Guid)
                     throw new InvalidOperationException("GUID_INCONSISTENT: entry " + e.Guid + ", file " + a.FileGuid);
-                Guid cg = Guid.Empty;
-                if (!string.IsNullOrEmpty(classGuidStr))
-                    cg = Guid.Parse(classGuidStr);
-                else
-                    cg = a.RootInstanceGuid;
+                Guid cg = !string.IsNullOrEmpty(classGuidStr)
+                    ? Guid.Parse(classGuidStr)
+                    : ResolveExternalClassGuid(a, expectedBaseType);
                 return new PointerRef(new EbxImportReference { FileGuid = e.Guid, ClassGuid = cg });
             }
 
             // External by file_guid
             if (!string.IsNullOrEmpty(fileGuidStr))
             {
-                return new PointerRef(new EbxImportReference
+                Guid fileGuid = Guid.Parse(fileGuidStr);
+                Guid cg;
+                if (!string.IsNullOrEmpty(classGuidStr))
+                    cg = Guid.Parse(classGuidStr);
+                else if (expectedBaseType != null)
                 {
-                    FileGuid = Guid.Parse(fileGuidStr),
-                    ClassGuid = string.IsNullOrEmpty(classGuidStr) ? Guid.Empty : Guid.Parse(classGuidStr)
-                });
+                    EbxAssetEntry fileEntry = App.AssetManager.GetEbxEntry(fileGuid);
+                    cg = fileEntry != null
+                        ? ResolveExternalClassGuid(App.AssetManager.GetEbx(fileEntry), expectedBaseType)
+                        : Guid.Empty;
+                }
+                else
+                    cg = Guid.Empty;
+                return new PointerRef(new EbxImportReference { FileGuid = fileGuid, ClassGuid = cg });
             }
 
             // Internal by class_guid
@@ -2292,7 +2760,103 @@ namespace FrostyMcpPlugin.Bridge
             throw new InvalidOperationException("PointerRef requires class_guid (internal), asset/file_guid (external), or null=true");
         }
 
-        private static object ResolveComponent(EbxAsset asset, JObject p, out int index)
+        /// <summary>
+        /// External PointerRefs name a target object inside another asset. When the
+        /// caller passes only the asset, the previous default was the asset root,
+        /// which silently produced a wrong-typed pointer for fields such as
+        /// DataContainerAsset.SkeletonCollisionData. Resolve the declared field
+        /// base type against the asset's objects instead, and refuse when the
+        /// choice is ambiguous.
+        /// </summary>
+        private static Guid ResolveExternalClassGuid(EbxAsset target, Type expectedBaseType)
+        {
+            if (target == null)
+                return Guid.Empty;
+            if (expectedBaseType == null || expectedBaseType == typeof(object) || expectedBaseType.IsValueType)
+                return target.RootInstanceGuid;
+
+            // BT node lists declare BTNodeData, and BehaviorTreeData is not a
+            // BTNodeData subclass. Vanilla data links those slots to the tree's
+            // Root node, not to the BehaviorTreeData object, so resolve Root.
+            // A field typed as the tree itself (AISpawnData.BehaviorTreeOverride)
+            // still takes the tree object.
+            if (target.RootObject.GetType().Name == "BehaviorTreeData")
+            {
+                if (expectedBaseType.IsAssignableFrom(target.RootObject.GetType()))
+                    return target.RootInstanceGuid;
+
+                object rootNode = GetBehaviorTreeRootNode(target.RootObject);
+                if (rootNode == null)
+                    throw new InvalidOperationException(
+                        "BT_ROOT_MISSING: asset " + target.FileGuid +
+                        " has no internal Root node; pass class_guid explicitly");
+                return GetClassGuid(rootNode);
+            }
+
+            var candidates = new List<object>();
+            foreach (object obj in target.Objects)
+            {
+                if (expectedBaseType.IsAssignableFrom(obj.GetType()))
+                    candidates.Add(obj);
+            }
+
+            if (candidates.Count == 0)
+            {
+                if (expectedBaseType.IsAssignableFrom(target.RootObject.GetType()))
+                    return target.RootInstanceGuid;
+                throw new InvalidOperationException(
+                    "POINTER_BASE_TYPE_MISMATCH: field expects '" + expectedBaseType.Name +
+                    "', asset root is '" + target.RootObject.GetType().Name +
+                    "', and no contained object matches; pass class_guid explicitly");
+            }
+
+            if (candidates.Count == 1)
+                return GetClassGuid(candidates[0]);
+
+            // A base type can match several subclasses; an exact type match is
+            // still unambiguous.
+            var exact = new List<object>();
+            foreach (object obj in candidates)
+            {
+                if (obj.GetType() == expectedBaseType)
+                    exact.Add(obj);
+            }
+            if (exact.Count == 1)
+                return GetClassGuid(exact[0]);
+
+            var described = new List<string>();
+            foreach (object obj in candidates.Take(6))
+                described.Add(obj.GetType().Name + " " + GetClassGuid(obj).ToString("N").Substring(0, 8));
+            throw new InvalidOperationException(
+                "AMBIGUOUS_POINTER: field expects '" + expectedBaseType.Name + "' and the asset has " +
+                candidates.Count + " matching objects (" + string.Join(", ", described) +
+                "); pass class_guid explicitly");
+        }
+
+        /// <summary>
+        /// BehaviorTreeData.Root is the node other trees link to for a subtree
+        /// reference. Read it through the public property, or through the field
+        /// on types that expose EBX fields directly.
+        /// </summary>
+        private static object GetBehaviorTreeRootNode(object treeObject)
+        {
+            object value = null;
+            PropertyInfo prop = treeObject.GetType().GetProperty("Root");
+            if (prop != null)
+                value = prop.GetValue(treeObject);
+            else
+            {
+                FieldInfo field = treeObject.GetType().GetField("Root");
+                if (field != null)
+                    value = field.GetValue(treeObject);
+            }
+
+            if (value is PointerRef pr && pr.Type == PointerRefType.Internal)
+                return pr.Internal;
+            return null;
+        }
+
+        internal static object ResolveComponent(EbxAsset asset, JObject p, out int index)
         {
             index = -1;
             if (p["index"] != null)
@@ -2345,7 +2909,7 @@ namespace FrostyMcpPlugin.Bridge
             return null;
         }
 
-        private static Guid GetClassGuid(object obj)
+        internal static Guid GetClassGuid(object obj)
         {
             AssetClassGuid g = ((dynamic)obj).GetInstanceGuid();
             if (g.IsExported)
@@ -2421,6 +2985,230 @@ namespace FrostyMcpPlugin.Bridge
         /// unique InternalId. AddObject already picks max+1, so this repairs ids that
         /// arrive negative or duplicated.
         /// </summary>
+        // Every component in an EBX file carries a ClientIndex and a ServerIndex;
+        // 255 means "absent on that side". The client and server component tables are
+        // sized by ClientRuntimeComponentCount / ServerRuntimeComponentCount, so a
+        // component that claims a slot on a side it has no runtime implementation for
+        // leaves an entry with no instance behind it and the game dies walking the
+        // table. Which sides a component occupies is per instance and is not
+        // derivable from its type, so the reference instance decides: the duplicate
+        // source when there is one, otherwise an existing instance of the same type
+        // in this asset. With neither, the realm is the best guess and the reply says
+        // so; client_index / server_index override the result outright.
+        internal static string AssignComponentIndices(EbxAsset asset, object newObject, object reference = null, JObject p = null)
+        {
+            Type t = newObject.GetType();
+            PropertyInfo clientPi = t.GetProperty("ClientIndex");
+            PropertyInfo serverPi = t.GetProperty("ServerIndex");
+            if (clientPi == null && serverPi == null)
+                return null;
+
+            int? explicitClient = p?.Value<int?>("client_index");
+            int? explicitServer = p?.Value<int?>("server_index");
+
+            object refObj = reference;
+            if (refObj == null)
+            {
+                foreach (object obj in asset.Objects)
+                {
+                    if (ReferenceEquals(obj, newObject) || obj.GetType() != t)
+                        continue;
+                    refObj = obj;
+                    break;
+                }
+            }
+
+            PropertyInfo refClientPi = refObj?.GetType().GetProperty("ClientIndex");
+            PropertyInfo refServerPi = refObj?.GetType().GetProperty("ServerIndex");
+            bool inferredClient;
+            bool inferredServer;
+            string how;
+
+            if (refClientPi != null || refServerPi != null)
+            {
+                int refClient = refClientPi == null ? 255 : Convert.ToInt32(refClientPi.GetValue(refObj));
+                int refServer = refServerPi == null ? 255 : Convert.ToInt32(refServerPi.GetValue(refObj));
+                inferredClient = refClient != 255;
+                inferredServer = refServer != 255;
+                how = "mirrored from " + refObj.GetType().Name;
+            }
+            else
+            {
+                string realm = null;
+                PropertyInfo realmPi = t.GetProperty("Realm");
+                if (realmPi != null && realmPi.GetValue(newObject) != null)
+                    realm = realmPi.GetValue(newObject).ToString();
+                inferredClient = realm == null || realm.IndexOf("Client", StringComparison.Ordinal) >= 0;
+                inferredServer = realm == null || realm.IndexOf("Server", StringComparison.Ordinal) >= 0;
+                how = "realm only (no instance of this type to copy from; check a vanilla one)";
+            }
+
+            // An explicit value only overrides its own side; the other side still
+            // follows the inference, so passing server_index=255 to make a
+            // client-only component does not silently drop the client slot too.
+            bool onClient = explicitClient.HasValue ? explicitClient.Value != 255 : inferredClient;
+            bool onServer = explicitServer.HasValue ? explicitServer.Value != 255 : inferredServer;
+            if (explicitClient.HasValue || explicitServer.HasValue)
+                how = "explicit, " + how;
+
+            // The numeric value is no longer decided here; see the renumber pass below.
+
+            // Slot ids are not "max + 1". The game builds one flat table per side by
+            // walking the finished object tree depth first, so the ids have to be
+            // dense in that order and the two counters have to match the counts.
+            // Assigning max + 1 leaves a hole the moment an object is inserted in the
+            // middle of the tree, and the loader then dereferences an empty slot while
+            // initialising the entity; the observed symptom is a null read at load.
+            // So the side membership decided above is kept and the numbering is
+            // recomputed for the whole asset.
+            if (clientPi != null && clientPi.CanWrite)
+                clientPi.SetValue(newObject, Convert.ChangeType(255, clientPi.PropertyType));
+            if (serverPi != null && serverPi.CanWrite)
+                serverPi.SetValue(newObject, Convert.ChangeType(255, serverPi.PropertyType));
+
+            string renumber = RenumberComponentSlots(asset, newObject, onClient, onServer);
+
+            int finalClient = clientPi == null ? 255 : Convert.ToInt32(clientPi.GetValue(newObject));
+            int finalServer = serverPi == null ? 255 : Convert.ToInt32(serverPi.GetValue(newObject));
+
+            return how + ", client=" + finalClient + ", server=" + finalServer
+                   + (renumber == null ? "" : ", " + renumber);
+        }
+
+        private static List<object> ComponentChildrenOf(object obj)
+        {
+            List<object> children = new List<object>();
+
+            // Only the Components list is walked. Vanilla numbering over four playable
+            // references is exactly the depth-first order of these lists, and none of
+            // them carries a populated Objects or Children array, so adding either here
+            // would reorder the walk and permute every slot.
+            //
+            // The list holds PointerRef wrappers, not the objects themselves; a walk that
+            // used them as they are would find no children at all and silently fall back
+            // to the order of asset.Objects.
+            if (!(GetListMember(obj, "Components") is System.Collections.IEnumerable list) || list is string)
+                return children;
+
+            foreach (object item in list)
+            {
+                object child = UnwrapPointer(item);
+                if (child != null)
+                    children.Add(child);
+            }
+            return children;
+        }
+
+        /// <summary>
+        /// Renumbers every component slot in the asset by depth-first order, per side,
+        /// and syncs the runtime counters. Membership is preserved: an object that was
+        /// 255 on a side stays 255 on that side. Returns a short summary for the reply.
+        /// </summary>
+        internal static string RenumberComponentSlots(EbxAsset asset, object newObject,
+                                                      bool newOnClient, bool newOnServer)
+        {
+            List<object> roots = new List<object>();
+            HashSet<object> hasParent = new HashSet<object>(ReferenceEqualityComparer.Instance);
+            foreach (object obj in asset.Objects)
+            {
+                foreach (object child in ComponentChildrenOf(obj))
+                    hasParent.Add(child);
+            }
+            foreach (object obj in asset.Objects)
+            {
+                if (!hasParent.Contains(obj))
+                    roots.Add(obj);
+            }
+
+            List<object> order = new List<object>();
+            HashSet<object> visited = new HashSet<object>(ReferenceEqualityComparer.Instance);
+            Stack<object> stack = new Stack<object>();
+            for (int i = roots.Count - 1; i >= 0; --i)
+                stack.Push(roots[i]);
+            while (stack.Count > 0)
+            {
+                object obj = stack.Pop();
+                if (obj == null || !visited.Add(obj))
+                    continue;
+                order.Add(obj);
+                List<object> children = ComponentChildrenOf(obj);
+                for (int i = children.Count - 1; i >= 0; --i)
+                    stack.Push(children[i]);
+            }
+            // Anything unreachable still has to keep a valid id.
+            foreach (object obj in asset.Objects)
+            {
+                if (visited.Add(obj))
+                    order.Add(obj);
+            }
+
+            int nextClient = 0;
+            int nextServer = 0;
+            foreach (object obj in order)
+            {
+                Type t = obj.GetType();
+                PropertyInfo cp = t.GetProperty("ClientIndex");
+                PropertyInfo sp = t.GetProperty("ServerIndex");
+                bool onClient;
+                bool onServer;
+
+                if (ReferenceEquals(obj, newObject))
+                {
+                    onClient = newOnClient;
+                    onServer = newOnServer;
+                }
+                else
+                {
+                    onClient = cp != null && Convert.ToInt32(cp.GetValue(obj)) != 255;
+                    onServer = sp != null && Convert.ToInt32(sp.GetValue(obj)) != 255;
+                }
+
+                if (cp != null && cp.CanWrite)
+                    cp.SetValue(obj, Convert.ChangeType(onClient ? nextClient : 255, cp.PropertyType));
+                if (onClient && cp != null)
+                    ++nextClient;
+
+                if (sp != null && sp.CanWrite)
+                    sp.SetValue(obj, Convert.ChangeType(onServer ? nextServer : 255, sp.PropertyType));
+                if (onServer && sp != null)
+                    ++nextServer;
+            }
+
+            // The counters live on the entity, which is the first object carrying them.
+            foreach (object obj in order)
+            {
+                Type t = obj.GetType();
+                PropertyInfo cc = t.GetProperty("ClientRuntimeComponentCount");
+                PropertyInfo sc = t.GetProperty("ServerRuntimeComponentCount");
+                if (cc != null && cc.CanWrite)
+                {
+                    cc.SetValue(obj, Convert.ChangeType(nextClient, cc.PropertyType));
+                    if (sc != null && sc.CanWrite)
+                        sc.SetValue(obj, Convert.ChangeType(nextServer, sc.PropertyType));
+                    break;
+                }
+            }
+
+            return "renumbered client=" + nextClient + ", server=" + nextServer;
+        }
+
+        // TypeLibrary.CreateObject + new AssetClassGuid(guid, -1) leaves the object
+        // marked as exported, because AssetClassGuid.IsExported is simply
+        // "the exported guid is not empty". A sub-object that lives in the asset's own
+        // object list must be internal instead: written as an export entry, the runtime
+        // resolves it to null when it walks the component list, and the game crashes in
+        // the saved-component loader. Dropping the exported guid keeps the internal id
+        // that AddObject just assigned.
+        internal static void MakeCreatedObjectInternal(object obj)
+        {
+            AssetClassGuid g = ((dynamic)obj).GetInstanceGuid();
+            if (!g.IsExported)
+                return;
+
+            int id = g.InternalId;
+            ((dynamic)obj).SetInstanceGuid(id >= 0 ? new AssetClassGuid(id) : new AssetClassGuid(Guid.Empty, -1));
+        }
+
         private static void RepairInternalIdCollisions(EbxAsset asset, List<object> preexisting)
         {
             HashSet<object> oldObjects = new HashSet<object>(preexisting, ReferenceEqualityComparer.Instance);
@@ -2714,12 +3502,14 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        private static bool TryAddPointerToRootArray(object root, string arrayName, PointerRef pref)
+        private static bool TryAddPointerToRootArray(object root, string arrayName, PointerRef pref, out int index)
         {
+            index = -1;
             object listObj = GetListMember(root, arrayName);
             if (listObj is IList list)
             {
                 list.Add(pref);
+                index = list.Count - 1;
                 return true;
             }
             return false;
@@ -2741,9 +3531,9 @@ namespace FrostyMcpPlugin.Bridge
             return true;
         }
 
-        private static string TryAddPointerToArrays(object host, PointerRef pref, string arrayName, bool explicitName)
+        private static string TryAddPointerToArrays(object host, PointerRef pref, string arrayName, bool explicitName, out int addedIndex)
         {
-            if (TryAddPointerToRootArray(host, arrayName, pref))
+            if (TryAddPointerToRootArray(host, arrayName, pref, out addedIndex))
                 return arrayName;
             if (explicitName)
                 return null;
@@ -2752,10 +3542,16 @@ namespace FrostyMcpPlugin.Bridge
             {
                 if (string.Equals(fallback, arrayName, StringComparison.OrdinalIgnoreCase))
                     continue;
-                if (TryAddPointerToRootArray(host, fallback, pref))
+                if (TryAddPointerToRootArray(host, fallback, pref, out addedIndex))
                     return fallback;
             }
+            addedIndex = -1;
             return null;
+        }
+
+        private static string TryAddPointerToArrays(object host, PointerRef pref, string arrayName, bool explicitName)
+        {
+            return TryAddPointerToArrays(host, pref, arrayName, explicitName, out _);
         }
 
         /// <summary>
@@ -2786,6 +3582,213 @@ namespace FrostyMcpPlugin.Bridge
             if (o is PointerRef pr && pr.Type == PointerRefType.Internal && pr.Internal != null)
                 return pr.Internal;
             return o;
+        }
+
+        // ---------------------------------------------------------------------
+        // Creation validation / auto-registration helpers
+        // ---------------------------------------------------------------------
+
+        /// <summary>
+        /// Position of <paramref name="target"/> in <paramref name="list"/>, or -1.
+        /// A Null PointerRef or a pointer whose Internal object is gone does not
+        /// match, which is how a silently dropped node is detected.
+        /// </summary>
+        private static int FindPointerIndex(IList list, object target)
+        {
+            if (list == null)
+                return -1;
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (ReferenceEquals(UnwrapPointer(list[i]), target))
+                    return i;
+            }
+            return -1;
+        }
+
+        private static bool IsNullPointerSlot(object item)
+        {
+            if (item == null)
+                return true;
+            return item is PointerRef pr && pr.Type == PointerRefType.Null;
+        }
+
+        /// <summary>
+        /// Rime widgets only instantiate entities that are listed in the
+        /// WidgetSpawnerItemData.Components array. An object added straight to the
+        /// root Objects array exists in the file but never runs, so mirror the
+        /// editor and append it to the spawner as well. Returns the host type
+        /// name when registration happened.
+        /// </summary>
+        /// <summary>
+        /// A character blueprint only runs the objects listed in
+        /// PVZCharacterEntityData.Components. An object appended to the root
+        /// Objects array alone is written to the file but never instantiated at
+        /// runtime, which silently produces a component with no effect. Mirror the
+        /// editor and append the pointer to the entity as well. Returns the host
+        /// type name when registration happened.
+        /// </summary>
+        private static string RegisterIntoCharacterEntity(EbxAsset asset, PointerRef pref)
+        {
+            if (asset?.Objects == null)
+                return null;
+
+            foreach (object obj in asset.Objects)
+            {
+                if (obj == null || obj.GetType().Name != "PVZCharacterEntityData")
+                    continue;
+
+                object listObj = GetListMember(obj, "Components");
+                if (listObj is IList list)
+                {
+                    foreach (object item in list)
+                    {
+                        if (item is PointerRef existing && ReferenceEquals(existing.Internal, pref.Internal))
+                            return obj.GetType().Name;
+                    }
+                    list.Add(pref);
+                    RepairRuntimeComponentCounts(asset, obj);
+                    return obj.GetType().Name;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The entity declares how many runtime component slots exist on each side
+        /// (ClientRuntimeComponentCount / ServerRuntimeComponentCount). A component
+        /// whose ClientIndex/ServerIndex lands past that count points outside the
+        /// runtime array, and the character crashes as soon as it spawns. Assigning
+        /// indices without widening the counts is exactly how that happens, so keep
+        /// the counts at least one past the highest index in use.
+        /// </summary>
+        internal static void RepairRuntimeComponentCounts(EbxAsset asset, object entity)
+        {
+            try
+            {
+                int maxClient = -1;
+                int maxServer = -1;
+
+                foreach (object obj in asset.Objects)
+                {
+                    if (obj == null)
+                        continue;
+
+                    Type t = obj.GetType();
+                    PropertyInfo ci = t.GetProperty("ClientIndex");
+                    if (ci != null && ci.PropertyType == typeof(byte))
+                    {
+                        byte v = (byte)ci.GetValue(obj);
+                        if (v != 255 && v > maxClient)
+                            maxClient = v;
+                    }
+
+                    PropertyInfo si = t.GetProperty("ServerIndex");
+                    if (si != null && si.PropertyType == typeof(byte))
+                    {
+                        byte v = (byte)si.GetValue(obj);
+                        if (v != 255 && v > maxServer)
+                            maxServer = v;
+                    }
+                }
+
+                Type et = entity.GetType();
+                PropertyInfo cc = et.GetProperty("ClientRuntimeComponentCount");
+                if (cc != null && maxClient >= 0)
+                {
+                    int cur = Convert.ToInt32(cc.GetValue(entity));
+                    if (maxClient + 1 > cur)
+                        cc.SetValue(entity, Convert.ChangeType(maxClient + 1, cc.PropertyType));
+                }
+
+                PropertyInfo sc = et.GetProperty("ServerRuntimeComponentCount");
+                if (sc != null && maxServer >= 0)
+                {
+                    int cur = Convert.ToInt32(sc.GetValue(entity));
+                    if (maxServer + 1 > cur)
+                        sc.SetValue(entity, Convert.ChangeType(maxServer + 1, sc.PropertyType));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string RegisterIntoWidgetSpawner(EbxAsset asset, PointerRef pref)
+        {
+            if (asset?.Objects == null)
+                return null;
+            foreach (object obj in asset.Objects)
+            {
+                if (obj == null)
+                    continue;
+                if (obj.GetType().Name.IndexOf("WidgetSpawnerItemData", StringComparison.Ordinal) < 0)
+                    continue;
+                object listObj = GetListMember(obj, "Components");
+                if (listObj is IList list)
+                {
+                    list.Add(pref);
+                    return obj.GetType().Name;
+                }
+            }
+            return null;
+        }
+
+        private static bool IsDataBusPeer(object obj)
+        {
+            if (obj == null || obj.GetType().IsValueType)
+                return false;
+            try { return TypeLibrary.IsSubClassOf(obj, "DataBusPeer"); }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Sound graph nodes must be listed in SoundGraphData.Nodes as well as in
+        /// the asset's OutputNodes array. The EBX writer only keeps objects that are
+        /// reachable from the root's non-transient members, and OutputNodes is
+        /// derived data for the editor, so a node that only sits there is written
+        /// back as a null pointer.
+        /// </summary>
+        private static string RegisterIntoSoundGraph(EbxAsset asset, PointerRef pref)
+        {
+            try
+            {
+                dynamic root = asset.RootObject;
+                if (root == null || !root.GetType().Name.Contains("SoundPatchAsset"))
+                    return null;
+                // Graph is a PointerRef holding the SoundGraphData object.
+                object graphObj = UnwrapPointer((object)root.Graph);
+                if (graphObj == null)
+                    return null;
+                object nodesObj = GetListMember(graphObj, "Nodes");
+                if (!(nodesObj is IList nodes))
+                    return null;
+                object target = pref.Internal;
+                if (target != null && FindPointerIndex(nodes, target) < 0)
+                    nodes.Add(new PointerRef(target));
+                return "Graph.Nodes";
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// The blueprint editor recomputes ClientEvent/ClientProperty (and the
+        /// server bits) on both endpoints when a connection is added. Doing the
+        /// same here is what makes a freshly created entity evaluate at runtime.
+        /// </summary>
+        private static void SetConnectionEndpointFlag(PointerRef endpoint, bool isEvent, bool client, bool server)
+        {
+            object obj = endpoint.Internal;
+            if (!IsDataBusPeer(obj))
+                return;
+            uint flags = GetObjectFlagsRaw(obj);
+            if (client)
+                flags |= isEvent ? ClientEventFlag : ClientPropertyFlag;
+            if (server)
+                flags |= isEvent ? ServerEventFlag : ServerPropertyFlag;
+            SetObjectFlagsRaw(obj, flags);
         }
 
         private static Guid TryGetClassGuid(object obj)
@@ -3131,6 +4134,8 @@ namespace FrostyMcpPlugin.Bridge
                 Utils.GenerateDeterministicGuid(asset.Objects, "InterfaceDescriptorData", asset.FileGuid), -1);
             ((dynamic)newObject).SetInstanceGuid(classGuid);
             asset.AddObject(newObject);
+            MakeCreatedObjectInternal(newObject);
+            AssignComponentIndices(asset, newObject);
             ifaceProp.SetValue(root, new PointerRef(newObject));
             return newObject;
         }
@@ -3171,15 +4176,30 @@ namespace FrostyMcpPlugin.Bridge
         {
             string name = "";
             string value = "";
+            string valueType = null;
+            string valueRef = null;
             string access = null;
             try { name = (string)(CString)field.Name; } catch { }
             try { value = (string)(CString)field.Value; } catch { }
+            try { valueType = field.ValueType?.TypeInfo?.ToString(); } catch { }
+            try
+            {
+                PointerRef pr = (PointerRef)field.ValueRef;
+                if (pr != null && pr.Type == PointerRefType.External)
+                {
+                    EbxAssetEntry target = App.AssetManager.GetEbxEntry(pr.External.FileGuid);
+                    valueRef = target != null ? target.Name : pr.External.FileGuid.ToString();
+                }
+            }
+            catch { }
             try { access = field.AccessType?.ToString(); } catch { }
             return new Dictionary<string, object>
             {
                 ["index"] = index,
                 ["name"] = name,
                 ["value"] = value,
+                ["value_type"] = valueType,
+                ["value_ref"] = valueRef,
                 ["access_type"] = access
             };
         }
@@ -3309,6 +4329,55 @@ namespace FrostyMcpPlugin.Bridge
             return null;
         }
 
+        /// <summary>
+        /// True when the type is one of the EBX-generated data types, recognised
+        /// by the field metadata attribute its members carry.
+        /// </summary>
+        private static bool IsEbxDataType(Type type)
+        {
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
+            foreach (PropertyInfo pi in type.GetProperties(flags))
+                if (pi.GetCustomAttribute<EbxFieldMetaAttribute>() != null)
+                    return true;
+            foreach (FieldInfo fi in type.GetFields(flags))
+                if (fi.GetCustomAttribute<EbxFieldMetaAttribute>() != null)
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Refuses a name the target type cannot write. Without this an unknown
+        /// key is dropped and the field is overwritten with a default instance,
+        /// while the call still reports success: writing {"guid": "..."} at an
+        /// AntRef (whose member is AssetGuid) zeroed the animation binding and
+        /// crashed the character. Never swallow the lookup failure.
+        /// </summary>
+        private static void EnsureMembersWritable(Type type, JObject obj, string where)
+        {
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
+            List<string> unknown = new List<string>();
+            foreach (JProperty prop in obj.Properties())
+            {
+                PropertyInfo pi = GetPropertyAliased(type, prop.Name);
+                if (pi != null && pi.CanWrite)
+                    continue;
+                if (pi == null && type.GetField(prop.Name, flags) == null)
+                    unknown.Add(prop.Name);
+                else if (pi != null)
+                    unknown.Add(prop.Name + " (read-only)");
+            }
+            if (unknown.Count == 0)
+                return;
+
+            List<string> writable = new List<string>();
+            foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                if (pi.CanWrite)
+                    writable.Add(pi.Name);
+            throw new InvalidOperationException(
+                "UNKNOWN_MEMBER: " + where + " has no field '" + string.Join("', '", unknown) +
+                "'. Writable fields: " + string.Join(", ", writable));
+        }
+
         private static object ResolvePath(object root, string path, out string typeName)
         {
             object current = root;
@@ -3383,10 +4452,17 @@ namespace FrostyMcpPlugin.Bridge
 
             if (lastIdx >= 0)
             {
-                object listObj = string.IsNullOrEmpty(lastName) ? current :
-                    current.GetType().GetProperty(lastName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase).GetValue(current);
+                PropertyInfo listProperty = string.IsNullOrEmpty(lastName)
+                    ? null
+                    : GetPropertyAliased(current.GetType(), lastName);
+                object listObj = listProperty != null ? listProperty.GetValue(current) : current;
                 IList list = (IList)listObj;
-                list[lastIdx] = ConvertToken(value, list[lastIdx]?.GetType() ?? typeof(object), asset);
+                // A null slot (or a null seed element) has no runtime type to
+                // borrow, so fall back to the declared element type.
+                Type elemType = list[lastIdx]?.GetType()
+                    ?? (list.GetType().IsGenericType ? list.GetType().GetGenericArguments()[0] : typeof(object));
+                Type pointerBaseType = listProperty?.GetCustomAttribute<EbxFieldMetaAttribute>()?.BaseType;
+                list[lastIdx] = ConvertToken(value, elemType, asset, pointerBaseType);
             }
             else
             {
@@ -3400,10 +4476,14 @@ namespace FrostyMcpPlugin.Bridge
                 ?? throw new InvalidOperationException("Missing property: " + name);
             if (!pi.CanWrite)
                 throw new InvalidOperationException("Property is read-only: " + name);
-            pi.SetValue(obj, ConvertToken(value, pi.PropertyType, asset));
+            // Pointer fields declare their target class through EbxFieldMeta.
+            // Passing it down lets an asset-only PointerRef resolve the right
+            // internal object instead of silently falling back to the asset root.
+            Type pointerBaseType = pi.GetCustomAttribute<EbxFieldMetaAttribute>()?.BaseType;
+            pi.SetValue(obj, ConvertToken(value, pi.PropertyType, asset, pointerBaseType));
         }
 
-        private static object ConvertToken(JToken token, Type targetType, EbxAsset asset)
+        private static object ConvertToken(JToken token, Type targetType, EbxAsset asset, Type pointerBaseType = null)
         {
             if (token == null || token.Type == JTokenType.Null)
                 return targetType.IsValueType ? Activator.CreateInstance(targetType) : null;
@@ -3414,7 +4494,7 @@ namespace FrostyMcpPlugin.Bridge
             if (targetType == typeof(PointerRef) || targetType.Name == "PointerRef")
             {
                 if (token is JObject jo)
-                    return ResolvePointerRef(asset, jo, "");
+                    return ResolvePointerRef(asset, jo, "", pointerBaseType);
                 if (token.Type == JTokenType.String)
                 {
                     string s = token.Value<string>();
@@ -3424,7 +4504,7 @@ namespace FrostyMcpPlugin.Bridge
                         if (o != null)
                             return new PointerRef(o);
                     }
-                    return ResolvePointerRef(asset, new JObject { ["asset"] = s }, "");
+                    return ResolvePointerRef(asset, new JObject { ["asset"] = s }, "", pointerBaseType);
                 }
             }
 
@@ -3467,21 +4547,72 @@ namespace FrostyMcpPlugin.Bridge
             }
             if (u == typeof(string)) return token.Type == JTokenType.String ? token.Value<string>() : token.ToString();
 
+            // TypeInfoRef carries { Asset, TypeInfo }. The default conversion of
+            // {"type": "..."} fills Asset and leaves TypeInfo null, which makes a
+            // field with no type at all; the mod then fails to export with a bare
+            // null reference that names no asset. Build it explicitly and refuse
+            // to hand back a typeless result.
+            if (targetType.Name == "TypeInfoRef")
+            {
+                object info = Activator.CreateInstance(targetType);
+                if (token is JObject typeInfoObject)
+                {
+                    JToken assetToken = typeInfoObject.Property("Asset")?.Value;
+                    if (assetToken != null && assetToken.Type != JTokenType.Null)
+                        SetMemberValue(info, "Asset", assetToken, asset);
+                    JToken typeToken = typeInfoObject.Property("TypeInfo")?.Value
+                        ?? typeInfoObject.Property("type")?.Value;
+                    if (typeToken != null && typeToken.Type != JTokenType.Null)
+                        SetMemberValue(info, "TypeInfo", typeToken, asset);
+                }
+                else
+                {
+                    SetMemberValue(info, "TypeInfo", token, asset);
+                }
+                if (((dynamic)info).TypeInfo == null)
+                    throw new InvalidOperationException(
+                        "TypeInfoRef requires a type; pass {\"type\": \"TextureAsset\"} or \"TypeRef 'TextureAsset'\"");
+                return info;
+            }
+
             if (targetType == typeof(TypeRef) || targetType.Name == "TypeRef")
             {
                 string s = token.ToString().Trim();
                 if (s.StartsWith("TypeRef '") && s.EndsWith("'") && s.Length >= 10)
                     s = s.Substring(9, s.Length - 10);
-                return new TypeRef(s);
+                // The writer stores whichever form the TypeRef carries: the type
+                // GUID as a string, or the bare type name. Vanilla fields carry
+                // the GUID, and the game resolves only that form; writing the
+                // name leaves a TypeRef it cannot resolve and the loader dies on
+                // a null type descriptor. Look the name up instead.
+                Guid typeGuid = Guid.TryParse(s, out Guid parsedGuid)
+                    ? parsedGuid
+                    : TypeLibrary.Reflection.LookupGuid(s);
+                return typeGuid != Guid.Empty ? new TypeRef(typeGuid) : new TypeRef(s);
             }
 
-            if (token is JObject jobj && u.IsValueType)
+            if (token is JArray jarr && typeof(IList).IsAssignableFrom(targetType))
             {
+                // Assembling the list element by element is the only way a
+                // List<PointerRef> keeps its pointers: the default Newtonsoft
+                // conversion turns every JObject into a null element.
+                Type elemType = targetType.IsGenericType
+                    ? targetType.GetGenericArguments()[0]
+                    : typeof(object);
+                IList built = targetType.IsGenericType
+                    ? (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elemType))
+                    : (IList)new System.Collections.ArrayList();
+                foreach (JToken item in jarr)
+                    built.Add(ConvertToken(item, elemType, asset, pointerBaseType));
+                return built;
+            }
+
+            if (token is JObject jobj && (u.IsValueType || IsEbxDataType(u)))
+            {
+                EnsureMembersWritable(u, jobj, u.Name);
                 object inst = Activator.CreateInstance(u);
                 foreach (JProperty prop in jobj.Properties())
-                {
-                    try { SetMemberValue(inst, prop.Name, prop.Value, asset); } catch { }
-                }
+                    SetMemberValue(inst, prop.Name, prop.Value, asset);
                 return inst;
             }
 
@@ -3569,6 +4700,12 @@ namespace FrostyMcpPlugin.Bridge
                 WalkSearch(obj, "", objIndex, cg, typeName, query, scope, cmp, maxDepth, 0, visited, matches, ref total, limit + offset);
                 objIndex++;
             }
+
+            // Interface fields live in InterfaceDescriptorData.Fields, which the
+            // property walk never reaches: each entry is a DataField whose Name is
+            // the interface field name. Without this pass search_ebx_fields reports
+            // total:0 for a name that list_interface plainly shows.
+            SearchInterfaceFields(asset, typeFilter, query, scope, cmp, matches, ref total, limit + offset);
 
             // total counts every match; matches only keeps the first limit+offset for paging.
             if (includeConnections)
@@ -3704,11 +4841,49 @@ namespace FrostyMcpPlugin.Bridge
                 if (comp == null)
                     return McpHandlers.Error("Component not found (provide class_guid or index)", "NOT_FOUND");
 
+                // AudioGraphNodePort: writing UnconnectedValue while the port is
+                // connected has no runtime effect. Report that instead of a bare
+                // success, and let disconnect_first=true detach it in the same call.
+                string portWarning = null;
+                if (path.EndsWith(".UnconnectedValue", StringComparison.OrdinalIgnoreCase))
+                {
+                    string portPath = path.Substring(0, path.Length - ".UnconnectedValue".Length);
+                    bool portConnected = false;
+                    try
+                    {
+                        portConnected = ResolvePath(comp, portPath + ".IsConnected", out _) is bool connectedFlag && connectedFlag;
+                    }
+                    catch { }
+
+                    if ((p.Value<bool?>("disconnect_first") ?? false) && portConnected)
+                    {
+                        SetPath(comp, portPath + ".IsConnected", new JValue(false), asset);
+                        portConnected = false;
+                    }
+                    if (portConnected)
+                        portWarning = "Port '" + portPath + "' is connected (IsConnected=true); UnconnectedValue has no runtime effect. Set '" + portPath + ".IsConnected' = false first, or pass disconnect_first=true.";
+                }
+
                 SetPath(comp, path, p["value"], asset);
                 SaveAsset(entry, asset);
 
-                object newValue = ResolvePath(comp, path, out string vt);
-                return new Dictionary<string, object>
+                // The write is already saved at this point. Reading it back
+                // round-trips through reflection and throws for some pointer and
+                // type fields, so a failure here must not be reported as a failed
+                // write: callers retry, rewrite, and end up corrupting the field.
+                string vt = null;
+                object newValue = null;
+                string readbackError = null;
+                try
+                {
+                    newValue = ResolvePath(comp, path, out vt);
+                }
+                catch (Exception readback)
+                {
+                    readbackError = readback.Message;
+                }
+
+                Dictionary<string, object> result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
@@ -3716,9 +4891,15 @@ namespace FrostyMcpPlugin.Bridge
                     ["class_guid"] = GetClassGuid(comp).ToString(),
                     ["object_type"] = comp.GetType().Name,
                     ["path"] = path,
+                    ["applied"] = true,
                     ["value_type"] = vt,
-                    ["value"] = SerializeAny(newValue)
+                    ["value"] = readbackError == null ? SerializeAny(newValue) : null
                 };
+                if (readbackError != null)
+                    result["readback_error"] = readbackError;
+                if (portWarning != null)
+                    result["warning"] = portWarning;
+                return result;
             }
             catch (Exception ex)
             {
@@ -3900,6 +5081,68 @@ namespace FrostyMcpPlugin.Bridge
             catch { }
         }
 
+        private static void SearchInterfaceFields(EbxAsset asset, string typeFilter, string query, string scope,
+            StringComparison cmp, List<object> matches, ref int total, int maxCollect)
+        {
+            if (!string.IsNullOrEmpty(typeFilter) &&
+                !typeFilter.Equals("InterfaceDescriptorData", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            int objIndex = 0;
+            foreach (object obj in asset.Objects)
+            {
+                if (obj.GetType().Name == "InterfaceDescriptorData")
+                {
+                    // Interface fields are a dynamic member (DynamicDataContainer),
+                    // not a CLR property, so reflection cannot see them; the dynamic
+                    // accessor that list_interface uses is the one that works.
+                    System.Collections.IList fields = null;
+                    try { fields = ((dynamic)obj).Fields; }
+                    catch { }
+
+                    if (fields != null)
+                    {
+                        for (int i = 0; i < fields.Count; i++)
+                        {
+                            object field = fields[i];
+                            if (field == null)
+                                continue;
+
+                            string name = null;
+                            object value = null;
+                            try { name = (string)((dynamic)field).Name; }
+                            catch { }
+                            try { value = (object)((dynamic)field).Value; }
+                            catch { }
+
+                            name = name ?? "";
+                            string valueText = SerializeAny(value)?.ToString() ?? "";
+
+                            bool nameHit = (scope == "name" || scope == "both") && name.IndexOf(query, cmp) >= 0;
+                            bool valueHit = (scope == "value" || scope == "both") && valueText.IndexOf(query, cmp) >= 0;
+                            if (!nameHit && !valueHit)
+                                continue;
+
+                            total++;
+                            if (matches.Count >= maxCollect)
+                                continue;
+
+                            matches.Add(new Dictionary<string, object>
+                            {
+                                ["kind"] = "interface_field",
+                                ["object_index"] = objIndex,
+                                ["path"] = "Fields[" + i + "].Name",
+                                ["value"] = name,
+                                ["value_type"] = "CString",
+                                ["match_in"] = nameHit && valueHit ? "both" : nameHit ? "name" : "value"
+                            });
+                        }
+                    }
+                }
+                objIndex++;
+            }
+        }
+
         private static void CheckConnField(string path, string text, string query, string scope, StringComparison cmp, List<object> matches, ref int total, int maxCollect)
         {
             if (text == null)
@@ -4016,7 +5259,15 @@ namespace FrostyMcpPlugin.Bridge
             if (pr.Type == PointerRefType.Null)
                 return "";
             if (pr.Type == PointerRefType.External)
-                return pr.External.FileGuid + "/" + pr.External.ClassGuid;
+            {
+                // Include the target asset name: searching for a name that only lives on
+                // the other side of a pointer used to return zero hits and read as
+                // "nothing references this".
+                string name = null;
+                try { name = App.AssetManager?.GetEbxEntry(pr.External.FileGuid)?.Name; } catch { }
+                string suffix = string.IsNullOrEmpty(name) ? "" : "/" + name;
+                return pr.External.FileGuid + "/" + pr.External.ClassGuid + suffix;
+            }
             if (pr.Internal != null)
                 return pr.Internal.GetType().Name + ":" + GetClassGuid(pr.Internal);
             return pr.Type.ToString();

@@ -1,4 +1,5 @@
 ﻿using Frosty.Core;
+using Frosty.Core.Controls;
 using FrostySdk;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
@@ -103,6 +104,16 @@ namespace FrostyMcpPlugin.Bridge
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = hits.Count,
+                // A scan that stopped early cannot say "nothing points here". Without
+                // this the reply reads as a clean 0 and the caller concludes there are
+                // no references, when the asset that holds them was never reached.
+                ["note"] = scanTruncated
+                    ? (total == 0
+                        ? "SCAN INCOMPLETE: stopped at max_scan (" + maxScan + ") before covering the project, so 0 hits does NOT mean unreferenced. Raise max_scan or pass query to narrow."
+                        : "SCAN INCOMPLETE: stopped at max_scan (" + maxScan + "); more references may exist. Raise max_scan or pass query to narrow.")
+                    : (total == 0
+                        ? "0 hits can also mean the referenced object's class guid is not in the target's exported set; cross-check with find_references / search_ebx_fields"
+                        : null),
                 ["references"] = hits
             };
         }
@@ -205,6 +216,76 @@ namespace FrostyMcpPlugin.Bridge
             if (pr.External.FileGuid != fileGuid)
                 return false;
             return classGuid == Guid.Empty || pr.External.ClassGuid == classGuid;
+        }
+
+        // find_references needs the same match without building a hit list. The
+        // dependency graph is built from saved bytes, so a reference added to a
+        // modified asset during this session is not in it yet.
+        internal static bool HasExternalPointerTo(EbxAsset asset, Guid fileGuid)
+        {
+            if (asset == null || asset.Objects == null)
+                return false;
+
+            var visited = new HashSet<int>();
+            foreach (object obj in asset.Objects)
+            {
+                if (obj != null && WalksToFile(obj, obj.GetType(), 0, visited, fileGuid))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool WalksToFile(object obj, Type type, int depth, HashSet<int> visited, Guid fileGuid)
+        {
+            if (obj == null || depth > 6)
+                return false;
+
+            foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!pi.CanRead || pi.GetIndexParameters().Length != 0)
+                    continue;
+
+                object value;
+                try { value = pi.GetValue(obj); }
+                catch { continue; }
+                if (value == null)
+                    continue;
+
+                if (value is PointerRef pr)
+                {
+                    if (PrPointsTo(pr, fileGuid))
+                        return true;
+                    continue;
+                }
+
+                if (value is IList list && !(value is string))
+                {
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        object element = list[i];
+                        if (element is PointerRef itemRef)
+                        {
+                            if (PrPointsTo(itemRef, fileGuid))
+                                return true;
+                            continue;
+                        }
+                        if (ShouldWalkInto(element) && visited.Add(RuntimeHelpers.GetHashCode(element)) &&
+                            WalksToFile(element, element.GetType(), depth + 1, visited, fileGuid))
+                            return true;
+                    }
+                    continue;
+                }
+
+                if (ShouldWalkInto(value) && visited.Add(RuntimeHelpers.GetHashCode(value)) &&
+                    WalksToFile(value, value.GetType(), depth + 1, visited, fileGuid))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool PrPointsTo(PointerRef pr, Guid fileGuid)
+        {
+            return pr.Type == FrostySdk.IO.PointerRefType.External && pr.External.FileGuid == fileGuid;
         }
 
         // Lists the assets whose External PointerRefs still address the given
@@ -333,6 +414,34 @@ namespace FrostyMcpPlugin.Bridge
                 ["class_guid"] = hostGuid
             };
 
+            // The preview has to fail the same way the commit would. Resolving the host
+            // and the list here means a wrong path is rejected up front instead of
+            // returning would_change:true and only failing on the commit call.
+            {
+                EbxAsset previewAsset;
+                try
+                {
+                    previewAsset = App.AssetManager.GetEbx(entry);
+                }
+                catch (Exception ex)
+                {
+                    return McpHandlers.Error(ex.Message, "LOAD_FAILED");
+                }
+
+                if (previewAsset == null)
+                    return McpHandlers.Error("Failed to load EBX", "LOAD_FAILED");
+
+                object previewHost = ResolveInsertHost(previewAsset, entry, hostGuid, p);
+                if (previewHost == null)
+                    return McpHandlers.Error("host component not found", "NOT_FOUND");
+
+                if (!TryResolveList(previewHost, path, out IList previewList, out _))
+                    return McpHandlers.Error("Could not resolve list at path: " + path, "NOT_FOUND");
+
+                if (sourceIndex >= previewList.Count)
+                    return McpHandlers.Error("source_index out of range (list count " + previewList.Count + ")", "INVALID_PARAMS");
+            }
+
             return McpCommit.Require("insert_ebx_item", p, plan, () =>
             {
             try
@@ -340,14 +449,9 @@ namespace FrostyMcpPlugin.Bridge
                 // Resolve again inside the commit: preview and execute are two
                 // separate calls and the asset may have changed between them.
                 EbxAsset hostAsset = App.AssetManager.GetEbx(entry);
-                object host = hostAsset.RootObject;
-                if (!string.IsNullOrEmpty(hostGuid))
-                {
-                    object found = FindObjectByGuid(entry, Guid.Parse(hostGuid));
-                    if (found == null)
-                        return McpHandlers.Error("host component not found", "NOT_FOUND");
-                    host = found;
-                }
+                object host = ResolveInsertHost(hostAsset, entry, hostGuid, p);
+                if (host == null)
+                    return McpHandlers.Error("host component not found", "NOT_FOUND");
 
                 if (!TryResolveList(host, path, out IList list, out string resolvedPath))
                     return McpHandlers.Error("Could not resolve list at path: " + path, "NOT_FOUND");
@@ -361,7 +465,7 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     if (sourceIndex >= list.Count)
                         return McpHandlers.Error("source_index out of range", "INVALID_PARAMS");
-                    item = list[sourceIndex];
+                    item = CloneListElement(list[sourceIndex], hostAsset, entry);
                 }
                 else
                 {
@@ -374,6 +478,11 @@ namespace FrostyMcpPlugin.Bridge
                 list.Insert(insertAt, item);
 
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
+                // A component added straight to PVZCharacterEntityData.Components has a
+                // ClientIndex/ServerIndex of its own; the entity's runtime slot counters
+                // have to cover it, or the character crashes as soon as it spawns.
+                if (((object)host).GetType().Name == "PVZCharacterEntityData" && resolvedPath == "Components")
+                    McpBlueprintHandlers.RepairRuntimeComponentCounts(asset, host);
                 asset.Update();
                 App.AssetManager.ModifyEbx(entry.Name, asset);
 
@@ -420,6 +529,20 @@ namespace FrostyMcpPlugin.Bridge
             });
         }
 
+        /// <summary>
+        /// A source_index insert must not share the source element. FrostyClipboard
+        /// deep copies EBX classes and lists and gives internal pointers a fresh
+        /// identity in the host asset; primitives and value types are returned as-is.
+        /// </summary>
+        private static object CloneListElement(object source, EbxAsset asset, EbxAssetEntry entry)
+        {
+            if (source == null)
+                return null;
+
+            FrostyClipboard.Current.SetData(source);
+            return FrostyClipboard.Current.GetData(asset, entry);
+        }
+
         private static object DefaultElement(Type elementType)
         {
             if (elementType == typeof(PointerRef) || elementType.Name == "PointerRef")
@@ -431,6 +554,33 @@ namespace FrostyMcpPlugin.Bridge
             return null;
         }
 
+        // Host resolution shared by the preview and the commit of insert_ebx_item:
+        // an explicit GUID first, then an explicit component type, and the root
+        // only when the caller named neither. Naming a host that does not resolve
+        // returns null so the caller reports NOT_FOUND instead of silently
+        // inserting into the root object.
+        private static object ResolveInsertHost(EbxAsset asset, EbxAssetEntry entry, string hostGuid, JObject p)
+        {
+            if (!string.IsNullOrEmpty(hostGuid))
+                return FindObjectByGuid(entry, Guid.Parse(hostGuid));
+
+            string typeName = p.Value<string>("component_type") ?? p.Value<string>("host_type") ?? "";
+            if (string.IsNullOrEmpty(typeName))
+                return asset.RootObject;
+
+            return McpBlueprintHandlers.ResolveComponent(asset, new JObject
+            {
+                ["type"] = typeName,
+                ["type_index"] = p.Value<int?>("type_index") ?? 0
+            }, out _);
+        }
+
+        // Objects that are not exported keep an all-zero ExportedGuid and carry
+        // their identity in InternalId, so comparing ExportedGuid alone never
+        // finds them. Build the same synthesised guid GetClassGuid produces
+        // (internal id as hex, padded to 32 digits) and compare that: one
+        // conversion for every caller instead of a second, decimal-based one
+        // that disagreed for anything above 9.
         private static object FindObjectByGuid(EbxAssetEntry entry, Guid guid)
         {
             EbxAsset asset = App.AssetManager.GetEbx(entry);
@@ -438,7 +588,7 @@ namespace FrostyMcpPlugin.Bridge
             {
                 try
                 {
-                    if (((dynamic)obj).GetInstanceGuid().ExportedGuid == guid)
+                    if (McpBlueprintHandlers.GetClassGuid(obj) == guid)
                         return obj;
                 }
                 catch { }

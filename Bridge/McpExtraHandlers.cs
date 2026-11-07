@@ -50,6 +50,13 @@ namespace FrostyMcpPlugin.Bridge
                         loc = locSrc[i] + 33u * loc;
 
                     result["text"] = text;
+                    // Utils.HashString is djb2-xor (h = h*33 ^ c, seed 5381), not FNV.
+                    // Report it under its real name and keep the old keys as aliases so
+                    // existing callers do not break.
+                    result["algorithm"] = "djb2-xor (h = h*33 ^ c, seed 5381)";
+                    result["djb2"] = fnv;
+                    result["djb2_hex"] = "0x" + fnvU.ToString("X8");
+                    result["djb2_uint"] = fnvU;
                     result["fnv1"] = fnv;
                     result["fnv1_hex"] = "0x" + fnvU.ToString("X8");
                     result["fnv1_uint"] = fnvU;
@@ -95,6 +102,71 @@ namespace FrostyMcpPlugin.Bridge
             if (db.GetType().Name == "DefaultLocalizedStringDatabase")
                 return McpHandlers.Error("No localization database plugin is registered for this profile", "PLUGIN_MISSING");
             return null;
+        }
+
+        /// <summary>
+        /// BF1 localized string id hash (start 0xFFFFFFFF, h = c + 33 * h). The
+        /// localization plugin uses the same function for GetString(string), so
+        /// computing it here lets the list tool match an ID_... query without a
+        /// per-string reverse lookup.
+        /// </summary>
+        internal static uint ComputeLocalizedIdHash(string text)
+        {
+            uint hash = 0xFFFFFFFF;
+            foreach (char c in text)
+                hash = unchecked((uint)c + 33u * hash);
+            return hash;
+        }
+
+        internal static int CountModifiedLocalizedStrings()
+        {
+            try
+            {
+                ILocalizedStringDatabase db = LocalizedStringDatabase.Current;
+                if (db == null || db.GetType().Name == "DefaultLocalizedStringDatabase")
+                    return 0;
+                int count = 0;
+                foreach (uint id in db.EnumerateModifiedStrings())
+                    count++;
+                return count;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// The localization plugin keeps every edited string on one EbxAsset (the
+        /// TextDatabase). Return that asset's GUID and name so revert/diff can tell
+        /// whether a given asset owns the edited string layer.
+        /// </summary>
+        internal static bool TryGetLocalizationDatabaseAsset(out Guid fileGuid, out string assetName)
+        {
+            fileGuid = Guid.Empty;
+            assetName = null;
+            try
+            {
+                ILocalizedStringDatabase db = LocalizedStringDatabase.Current;
+                if (db == null || db.GetType().Name == "DefaultLocalizedStringDatabase")
+                    return false;
+                FieldInfo field = db.GetType().GetField("loadedDatabase", BindingFlags.NonPublic | BindingFlags.Instance);
+                object loaded = field?.GetValue(db);
+                if (loaded == null)
+                    return false;
+                PropertyInfo guidProperty = loaded.GetType().GetProperty("FileGuid", BindingFlags.Public | BindingFlags.Instance);
+                if (guidProperty == null)
+                    return false;
+                fileGuid = (Guid)guidProperty.GetValue(loaded);
+                if (fileGuid == Guid.Empty)
+                    return false;
+                assetName = App.AssetManager?.GetEbxEntry(fileGuid)?.Name;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         public static object GetLocalizedString(JObject p)
@@ -233,6 +305,19 @@ namespace FrostyMcpPlugin.Bridge
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 100);
 
+            // A query can be the string id (ID_M_...) rather than its text. The
+            // enumeration gives hashes only, so match the query through the same
+            // BF1 id hash the database uses for GetString(string). Without this,
+            // an id query returns an empty list and reads as "no such string".
+            uint queryIdHash = 0;
+            uint queryIdHashUpper = 0;
+            if (!string.IsNullOrEmpty(query))
+            {
+                queryIdHash = ComputeLocalizedIdHash(query);
+                string upper = query.ToUpperInvariant();
+                queryIdHashUpper = upper == query ? queryIdHash : ComputeLocalizedIdHash(upper);
+            }
+
             try
             {
                 IEnumerable<uint> ids = modifiedOnly
@@ -247,8 +332,10 @@ namespace FrostyMcpPlugin.Bridge
                     if (!string.IsNullOrEmpty(query))
                     {
                         string hex = id.ToString("X");
-                        if (value.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0 &&
-                            hex.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0)
+                        bool matched = value.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       hex.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       id == queryIdHash || id == queryIdHashUpper;
+                        if (!matched)
                             continue;
                     }
 
@@ -271,6 +358,8 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     ["success"] = true,
                     ["query"] = query,
+                    ["query_id_hash"] = string.IsNullOrEmpty(query) ? null : "0x" + queryIdHash.ToString("X8"),
+                    ["query_id_hash_checked"] = !string.IsNullOrEmpty(query),
                     ["modified_only"] = modifiedOnly,
                     ["total"] = total,
                     ["offset"] = offset,
@@ -351,6 +440,10 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 if (!contained)
                     targetAsset.AddObject(copy);
+
+                // The paste keeps the source's ClientIndex/ServerIndex, which collides
+                // with the original in this file and crashes it at load time.
+                McpBlueprintHandlers.AssignComponentIndices(targetAsset, copy);
 
                 string arrayName = p.Value<string>("array") ?? "Objects";
                 PointerRef pref = new PointerRef(copy);
@@ -506,7 +599,10 @@ namespace FrostyMcpPlugin.Bridge
                     ["res_name"] = resEntry.Name,
                     ["res_rid"] = resEntry.ResRid.ToString(),
                     ["chunk_id"] = texture.ChunkId.ToString(),
-                    ["chunk_size"] = chunk?.Size,
+                    // Added chunks have no vanilla entry, so Size reads 0; report null
+                    // instead of a zero that looks like an empty texture.
+                    ["chunk_size"] = chunk == null || chunk.IsAdded ? null : (object)chunk.Size,
+                    ["modified_bytes"] = chunk?.ModifiedEntry?.Data?.Length,
                     ["bundles"] = entry.EnumerateBundles().Select(id => App.AssetManager.GetBundleEntry(id)?.Name).Where(n => n != null).ToList()
                 };
             }

@@ -646,11 +646,39 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("Source asset not found", "NOT_FOUND");
 
-            AssetEntry linked = ResolveLinkedTarget(p);
-            if (linked == null)
-                return McpHandlers.Error("Linked asset not found", "NOT_FOUND");
+            // A reverted chunk keeps its record in the referencing asset's link list
+            // even though it is gone from the asset manager. Resolving the target
+            // first made those links impossible to remove, so match the recorded
+            // entries directly instead.
+            string linkedKind = (p.Value<string>("linked_kind") ?? "res").Trim().ToLowerInvariant();
+            string linkedName = p.Value<string>("linked_name") ?? p.Value<string>("linked");
+            string linkedGuid = p.Value<string>("linked_guid");
+            bool prune = p.Value<bool?>("prune_dangling") ?? false;
+            if (string.IsNullOrEmpty(linkedName) && string.IsNullOrEmpty(linkedGuid))
+                prune = true;
 
-            if (!entry.LinkedAssets.Contains(linked))
+            if (prune)
+            {
+                List<AssetEntry> dead = entry.LinkedAssets.Where(IsDanglingLink).ToList();
+                foreach (AssetEntry item in dead)
+                    entry.LinkedAssets.Remove(item);
+                if (dead.Count > 0)
+                    entry.IsDirty = true;
+                return new Dictionary<string, object>
+                {
+                    ["success"] = true,
+                    ["name"] = entry.Name,
+                    ["pruned"] = dead.Count,
+                    ["pruned_items"] = dead.Select(d => d.AssetType + ":" + d.Name).ToList(),
+                    ["count"] = entry.LinkedAssets.Count()
+                };
+            }
+
+            Guid.TryParse(linkedGuid ?? linkedName, out Guid linkedChunkId);
+
+            AssetEntry linked = entry.LinkedAssets
+                .FirstOrDefault(a => MatchesLink(a, linkedKind, linkedName, linkedChunkId));
+            if (linked == null)
                 return McpHandlers.Error("Asset is not linked to this target", "NOT_LINKED");
 
             entry.LinkedAssets.Remove(linked);
@@ -662,6 +690,30 @@ namespace FrostyMcpPlugin.Bridge
                 ["unlinked"] = linked.Name,
                 ["count"] = entry.LinkedAssets.Count()
             };
+        }
+
+        private static bool MatchesLink(AssetEntry linked, string kind, string name, Guid chunkId)
+        {
+            if (kind == "chunk")
+                return linked is ChunkAssetEntry chunk && chunkId != Guid.Empty && chunk.Id == chunkId;
+            if (string.IsNullOrEmpty(name))
+                return false;
+            if (kind == "res")
+                return linked is ResAssetEntry res &&
+                       string.Equals(res.Name, name, StringComparison.OrdinalIgnoreCase);
+            return linked is EbxAssetEntry ebx &&
+                   string.Equals(ebx.Name, name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsDanglingLink(AssetEntry linked)
+        {
+            if (linked is ChunkAssetEntry chunk)
+                return App.AssetManager.GetChunkEntry(chunk.Id) == null;
+            if (linked is ResAssetEntry res)
+                return App.AssetManager.GetResEntry(res.ResRid) == null;
+            if (linked is EbxAssetEntry ebx)
+                return App.AssetManager.GetEbxEntry(ebx.Name) == null;
+            return false;
         }
 
         public static object CheckGuidInvariants(JObject p)

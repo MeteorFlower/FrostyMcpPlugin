@@ -125,10 +125,13 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 bool isSeekable = p.Value<bool?>("seekable") ?? (bool)((dynamic)root).IsSeekable;
 
+                // Instance lives on the generic base HelperBase<T>, and reflection only
+                // returns inherited statics when FlattenHierarchy is set. Without it the
+                // lookup returns null and every import dies with a bogus NOT_READY.
                 object helper = toolHelperType.GetProperty("Instance",
-                    BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                    BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)?.GetValue(null);
                 if (helper == null)
-                    return McpHandlers.Error("SoundEditorPlugin ToolHelper is not initialised", "NOT_READY");
+                    return McpHandlers.Error("ToolHelper.Instance not found on SoundEditorPlugin", "NOT_READY");
 
                 object taskObject = importSound.Invoke(helper, new object[] { path, codecName, isSeekable, channelCount, remix });
                 Task task = taskObject as Task;
@@ -136,9 +139,16 @@ namespace FrostyMcpPlugin.Bridge
                     return McpHandlers.Error("ImportSound did not return a task", "IMPORT_FAILED");
                 task.GetAwaiter().GetResult();
 
+                // ImportSound returns Task<(byte[] sps, byte[] seek)>. The task itself
+                // has no Item1/Item2 - they live on the ValueTuple inside Result, so
+                // reading Item1 off the task type used to blow up with an NRE.
                 Type resultType = taskObject.GetType();
-                byte[] spsData = (byte[])resultType.GetProperty("Item1").GetValue(taskObject);
-                byte[] seekTableData = isSeekable ? (byte[])resultType.GetProperty("Item2").GetValue(taskObject) : null;
+                object tuple = resultType.GetProperty("Result").GetValue(taskObject);
+                if (tuple == null)
+                    return McpHandlers.Error("Encoder returned no result", "IMPORT_FAILED");
+                Type tupleType = tuple.GetType();
+                byte[] spsData = (byte[])tupleType.GetField("Item1").GetValue(tuple);
+                byte[] seekTableData = isSeekable ? (byte[])tupleType.GetField("Item2").GetValue(tuple) : null;
                 if (spsData == null || spsData.Length == 0)
                     return McpHandlers.Error("Encoder produced no data", "IMPORT_FAILED");
 
@@ -203,8 +213,10 @@ namespace FrostyMcpPlugin.Bridge
                     root.Chunks.Add(chunkToModify);
                     chunkIndex = (int)root.Chunks.Count - 1;
 
-                    newChunk.AddToBundles(existingChunk.Bundles);
-                    newChunk.AddToBundles(existingChunk.AddedBundles);
+                    // Vanilla chunks carry no bundle lists; touching them without a
+                    // guard throws a bare NullReferenceException.
+                    newChunk.AddToBundles(SafeInts(existingChunk.Bundles));
+                    newChunk.AddToBundles(SafeInts(existingChunk.AddedBundles));
                 }
 
                 bool segmentUpdated = false;
@@ -251,6 +263,18 @@ namespace FrostyMcpPlugin.Bridge
                     resChunks.Add(resChunk);
                 }
 
+                // The sample data now holds the count the encoder actually wrote, but the
+                // EBX field still carries the template's value. Leave them disagreeing and
+                // the asset plays as the wrong layout, so sync it before the update.
+                PropertyInfo channelCountProp = ((object)root).GetType().GetProperty("ChannelCount");
+                if (channelCountProp != null && channelCountProp.CanWrite)
+                {
+                    object current = channelCountProp.GetValue((object)root);
+                    object wanted = Convert.ChangeType(channelCount, channelCountProp.PropertyType);
+                    if (!Equals(current, wanted))
+                        channelCountProp.SetValue((object)root, wanted);
+                }
+
                 asset.Update();
                 App.AssetManager.ModifyEbx(entry.Name, asset);
 
@@ -261,7 +285,32 @@ namespace FrostyMcpPlugin.Bridge
                         && m.GetParameters().Length == 2
                         && m.GetParameters()[0].ParameterType == typeof(ulong)
                         && m.GetParameters()[1].ParameterType.Name == "Resource");
+                // The engine registers the sound bank under the resource meta, so it has
+                // to be the owning asset's instance GUID. ModifyRes writes the resource's
+                // inherited meta back, which leaves the bank registered under the asset
+                // this one was duplicated from; the first playback then resolves to a
+                // null bank and crashes. Same requirement as DuplicationPlugin's
+                // NewWaveExtension, which is why that one passes the new GUID in.
+                Guid instanceGuid = ((AssetClassGuid)((dynamic)asset.RootObject).GetInstanceGuid()).ExportedGuid;
+
                 modifyResResource.Invoke(App.AssetManager, new[] { (object)resEntry.ResRid, newWave });
+
+                if (resEntry.ModifiedEntry == null)
+                    resEntry.ModifiedEntry = new ModifiedAssetEntry();
+                resEntry.ModifiedEntry.ResMeta = instanceGuid.ToByteArray();
+
+                // A duplicated waveform keeps the template's bank key, which names a
+                // bank the engine no longer registers, so the first playback resolves
+                // to nothing. Rewrite it here instead of asking for the manual
+                // export, byte-patch, import round trip.
+                int bankKeyPatched = PatchBankKey(resEntry, instanceGuid);
+
+                // Replacing a chunk reverts the old one but leaves its record in the
+                // link lists, so every import used to strand one more dead chunk on
+                // both the ebx and the resource. Drop links the chunk list no longer
+                // names before adding the new one.
+                PruneChunkLinks(entry, root.Chunks);
+                PruneChunkLinks(resEntry, root.Chunks);
 
                 if (newChunk != null)
                     resEntry.LinkAsset(newChunk);
@@ -285,7 +334,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["variation_index"] = variationIndex,
                     ["variation_count"] = variations.Count,
                     ["segment_updated"] = segmentUpdated,
-                    ["variation_updated"] = variationUpdated
+                    ["variation_updated"] = variationUpdated,
+                    ["bank_key_patched"] = bankKeyPatched
                 };
             }
             catch (Exception ex)
@@ -296,10 +346,85 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     ["success"] = false,
                     ["error"] = Unwrap(ex),
+                    ["detail"] = ex.ToString(),
                     ["error_code"] = "IMPORT_FAILED",
                     ["partial_changes_possible"] = true
                 };
             }
+        }
+
+        private static IEnumerable<int> SafeInts(IEnumerable<int> source)
+        {
+            return source ?? Enumerable.Empty<int>();
+        }
+
+        // Drops chunk links that the asset's own chunk list does not name. A link
+        // left over from a reverted chunk still reads back from LinkedAssets but no
+        // longer resolves, which made the asset look incompletely packaged.
+        private static void PruneChunkLinks(AssetEntry asset, IList ebxChunks)
+        {
+            if (asset == null || ebxChunks == null)
+                return;
+
+            HashSet<Guid> live = new HashSet<Guid>();
+            foreach (object item in ebxChunks)
+                live.Add((Guid)((dynamic)item).ChunkId);
+
+            List<AssetEntry> dead = asset.LinkedAssets
+                .Where(linked => linked is ChunkAssetEntry chunk && !live.Contains(chunk.Id))
+                .ToList();
+            foreach (AssetEntry linked in dead)
+                asset.LinkedAssets.Remove(linked);
+            if (dead.Count > 0)
+                asset.IsDirty = true;
+        }
+
+        // A NewWave resource carries the sound bank key at body offset 0x0C and
+        // repeats it in the segment and variation tables. The engine registers the
+        // bank under the owning asset's instance GUID, so a waveform copied from a
+        // template still points every reference at the template's bank. Rewriting
+        // all occurrences of the old key is the same edit as exporting the resource,
+        // replacing the bytes, and importing it back.
+        //
+        // Returns the number of occurrences rewritten; 0 means the key already
+        // matched or the body was too short to hold one.
+        internal static int PatchBankKey(ResAssetEntry resEntry, Guid instanceGuid)
+        {
+            if (resEntry == null)
+                return 0;
+
+            byte[] data;
+            using (NativeReader reader = new NativeReader(App.AssetManager.GetRes(resEntry)))
+                data = reader.ReadToEnd();
+            if (data == null || data.Length < 16)
+                return 0;
+
+            uint wanted = unchecked((uint)Utils.HashString(instanceGuid.ToString()));
+            uint current = BitConverter.ToUInt32(data, 0x0C);
+            if (current == wanted)
+                return 0;
+
+            byte[] from = BitConverter.GetBytes(current);
+            byte[] to = BitConverter.GetBytes(wanted);
+            int replaced = 0;
+            for (int i = 0; i + 4 <= data.Length; i++)
+            {
+                if (data[i] != from[0] || data[i + 1] != from[1] ||
+                    data[i + 2] != from[2] || data[i + 3] != from[3])
+                    continue;
+                Buffer.BlockCopy(to, 0, data, i, 4);
+                replaced++;
+                i += 3;
+            }
+            if (replaced == 0)
+                return 0;
+
+            byte[] meta = resEntry.ModifiedEntry?.ResMeta ?? instanceGuid.ToByteArray();
+            App.AssetManager.ModifyRes(resEntry.Name, data, meta);
+            if (resEntry.ModifiedEntry == null)
+                resEntry.ModifiedEntry = new ModifiedAssetEntry();
+            resEntry.ModifiedEntry.ResMeta = meta;
+            return replaced;
         }
 
         // Sample data starts with a 0x48 marker, a big-endian header size, then the
