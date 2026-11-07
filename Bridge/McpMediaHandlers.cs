@@ -367,6 +367,8 @@ namespace FrostyMcpPlugin.Bridge
                 compiledPi.SetValue(newObject, new PointerRef(importRef));
 
                 hostAsset.AddObject(newObject);
+                McpBlueprintHandlers.MakeCreatedObjectInternal(newObject);
+                McpBlueprintHandlers.AssignComponentIndices(hostAsset, newObject);
                 PointerRef pref = new PointerRef(newObject);
                 string arrayName = p.Value<string>("array") ?? "Objects";
                 bool added = TryAddPointer(hostAsset.RootObject, arrayName, pref);
@@ -1235,11 +1237,19 @@ namespace FrostyMcpPlugin.Bridge
                         dynamic c = root.Chunks[i];
                         Guid cid = (Guid)c.ChunkId;
                         ChunkAssetEntry ce = App.AssetManager.GetChunkEntry(cid);
+
+                        // An added chunk has no entry in the vanilla layout, so Size
+                        // reads 0 and would look like an empty chunk. Report null and
+                        // give the bytes actually carried by the modification.
+                        object chunkSize = ce == null || ce.IsAdded ? null : (object)ce.Size;
+                        int? modifiedBytes = ce?.ModifiedEntry?.Data?.Length;
+
                         chunks.Add(new Dictionary<string, object>
                         {
                             ["index"] = i,
                             ["chunk_id"] = cid.ToString(),
-                            ["chunk_size"] = ce?.Size,
+                            ["chunk_size"] = chunkSize,
+                            ["modified_bytes"] = modifiedBytes,
                             ["exists"] = ce != null
                         });
                     }
@@ -1432,8 +1442,20 @@ namespace FrostyMcpPlugin.Bridge
                 EbxAsset newAsset = App.AssetManager.GetEbx(newEntry);
                 if (newAsset != null)
                 {
-                    McpEditHandlers.RenumberAssetObjectGuids(newAsset);
-                    newAsset.Update();
+                    // A wave asset is one root object whose internals and resource are
+                    // produced by the duplication extension, and that extension derives
+                    // the resource meta and the sound bank key from the instance GUID it
+                    // just assigned. Renumbering the graph afterwards changes that GUID,
+                    // which leaves both stale; on a multi-chunk wave it also leaves the
+                    // resource unwritten and the export is then an all-zero body. The
+                    // editor's own Duplicate, which does not renumber, produces a correct
+                    // copy, so a wave keeps the GUIDs the extension gave it.
+                    bool isWave = entry.Type != null && entry.Type.Contains("NewWaveAsset");
+                    if (!isWave)
+                    {
+                        McpEditHandlers.RenumberAssetObjectGuids(newAsset);
+                        newAsset.Update();
+                    }
                     App.AssetManager.ModifyEbx(newEntry.Name, newAsset);
                 }
 

@@ -189,7 +189,17 @@ namespace FrostyMcpPlugin.Bridge
                     }
                     else
                     {
-                        r = method.Invoke(null, new object[] { item.DeepClone() });
+                        JObject args = (JObject)item.DeepClone();
+                        // The wrapper hands batch items over with the raw string
+                        // form of 'value', while set_ebx_field receives it already
+                        // JSON-parsed. Normalize so both paths write the same thing.
+                        if (args["value"] is JValue rawValue && rawValue.Type == JTokenType.String)
+                        {
+                            string raw = (string)rawValue.Value;
+                            try { args["value"] = JToken.Parse(raw); }
+                            catch { }
+                        }
+                        r = method.Invoke(null, new object[] { args });
                     }
                 }
                 catch (Exception ex)
@@ -296,7 +306,7 @@ namespace FrostyMcpPlugin.Bridge
             }
 
             int cap = p.Value<int?>("limit") ?? 200;
-            return new Dictionary<string, object>
+            var result = new Dictionary<string, object>
             {
                 ["success"] = true,
                 ["name"] = entry.Name,
@@ -306,6 +316,22 @@ namespace FrostyMcpPlugin.Bridge
                 ["removed"] = removed.Take(cap).ToList(),
                 ["truncated"] = added.Count > cap || removed.Count > cap
             };
+
+            // Edited localized strings are a separate layer from EBX fields, so a
+            // TextDatabase diff can read 0 while the project still carries edits.
+            if (McpExtraHandlers.TryGetLocalizationDatabaseAsset(out Guid localizationGuid, out string localizationName) &&
+                entry.Guid == localizationGuid)
+            {
+                int modifiedStrings = McpExtraHandlers.CountModifiedLocalizedStrings();
+                result["localized_strings_asset"] = localizationName;
+                result["localized_strings_modified"] = modifiedStrings;
+                if (modifiedStrings > 0)
+                    result["note_localized"] =
+                        "This asset owns " + modifiedStrings +
+                        " edited localized string(s); they live outside the EBX field layer and do not appear in this diff. revert_asset requires revert_strings=true.";
+            }
+
+            return result;
         }
 
         public static object ValidateRefs(JObject p)
@@ -746,7 +772,10 @@ namespace FrostyMcpPlugin.Bridge
                 ["asset_count"] = assetNames.Count,
                 ["registries_checked"] = registries,
                 ["registries_skipped"] = registriesSkipped,
+                // missing_total only covers the registries actually sampled. Say so
+                // in the payload: the plain name reads like a whole-project figure.
                 ["missing_total"] = totalMissing,
+                ["missing_total_scope"] = registriesSkipped > 0 ? "sampled_registries_only" : "all_registries",
                 ["assets"] = results
             };
         }

@@ -5,7 +5,8 @@ description: Use the Frosty Editor MCP bridge to inspect and edit Frostbite EBX 
 
 # Frosty Editor MCP
 
-Wraps a running Frosty Editor through a named pipe. 162 tools.
+Wraps a running Frosty Editor through a named pipe. 162 tools. The bridge reports version
+2.3.12 through `capabilities`; this file describes that build.
 
 ## Servers and prerequisites
 
@@ -51,8 +52,8 @@ disconnect, or 10 minutes of idle time discards the plan and yields `COMMIT_REQU
 Two-phase tools: `delete_bundle`, `revert_asset`, `revert_all`, `remove_from_bundle`,
 `remove_from_bundle_smart`, `remove_from_network_registry`, `remove_component`,
 `remove_ebx_item`, `remove_connection`, `remove_connections_by_guid`,
-`remove_interface_field`, `remove_interface_event`, `manage_bundles`, `import_project`,
-`create_asset`, and `import_ebx_bin` when `data_only: false`.
+`remove_interface_field`, `remove_interface_event`, `insert_ebx_item`, `manage_bundles`,
+`import_project`, `create_asset`, and `import_ebx_bin` when `data_only: false`.
 
 Read `plan` before committing: it lists the resolved members, indices, counts and GUIDs.
 
@@ -96,7 +97,9 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 
 ### Text export
 - `get_ebx_xml` / `get_ebx_yaml`: one asset as text; `summary`, `filter`, `max_chars`,
-  `char_offset` for continuation.
+  `char_offset` for continuation. `filter` is a **plain case-insensitive substring**: no regex,
+  no alternation (`a|b` matches nothing and is indistinguishable from "field absent").
+  To look for several terms, call the tool once per term.
 - `export_all_ebx`: every EBX to XML/YAML files under a directory, mirroring paths.
 
 ### EBX properties and fields
@@ -105,7 +108,20 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `search_ebx_fields`: find field names or values inside any component or connection.
 - `get_ebx_field` / `set_ebx_field`: one field, addressed by `class_guid`, `index`, or
   `component_type` + `type_index`; `$PropertyConnections[0].SourceField` style paths reach
-  connections.
+  connections. An external PointerRef that names only the asset takes its class GUID from
+  the field's declared base type rather than defaulting to the target root; several
+  candidates fail with `SET_FAILED` and an `AMBIGUOUS_POINTER` message, none fails with
+  `POINTER_BASE_TYPE_MISMATCH`, and a `BehaviorTreeData` target resolves to the tree's
+  `Root` node for a BT node slot (`Nodes`, `SubTree`), while a field declared as
+  `BehaviorTreeData` itself (`AISpawnData.BehaviorTreeOverride`) takes the tree object.
+  The same resolution applies to every property write, including
+  `set_component_property` and `properties` objects.
+  An object value for an EBX struct or EBX data class must name members that
+  type actually has: an unknown or read-only key fails with
+  `SET_FAILED` and `UNKNOWN_MEMBER`, which lists the writable names. The write
+  is refused rather than applied, so the field keeps its previous value.
+  Writing `{"guid": "..."}` at an `AntRef` (whose member is `AssetGuid`) used
+  to zero the whole struct and still report success.
 - `batch_set_field`: many field writes in one call, each item shaped like the single call.
 - `get_ebx_guids`: file GUID, root class GUID, and optionally every object's class GUID.
 - `get_internal_pointer_ref`: build an External PointerRef for one asset or component.
@@ -119,13 +135,22 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `create_ebx`: a bare EBX of a type; only suitable for pure-data types.
 - `create_asset`: a resource-backed asset (EBX + RES + chunk) through the PVZ asset
   handlers; use this for texture, mesh, sound and atlas assets.
-- `duplicate_ebx`: a copy with fresh object GUIDs; `copy_bundles`, `copy_linked`.
+- `duplicate_ebx`: a copy with a new file GUID and every exported object GUID renumbered,
+  so the copy cannot collide with its source inside a shared bundle; `copy_bundles`,
+  `copy_linked`. It refuses a source that owns a RES with `HAS_LINKED_RES`, so a
+  resource-backed asset goes through `duplicate_deep`.
 - `duplicate_deep`: copy through DuplicationPlugin's per-type extensions, which also copy
-  the linked RES and chunks.
-- `revert_asset`: undo edits on one EBX/RES/chunk.
+  the linked RES and chunks, then renumber every exported object GUID the same way.
+  NewWaveAsset is the exception: its GUIDs stay as the duplication extension made them,
+  because the sound resource and bank key are derived from them.
+- `revert_asset`: undo edits on one EBX/RES/chunk. On the project's localization database
+  it refuses with `LOCALIZED_STRINGS_PENDING` while edited strings exist; pass
+  `revert_strings: true` to revert the string layer together with the asset.
 - `export_asset`: export through the editor's asset definition (format depends on type).
 - `export_ebx_bin` / `import_ebx_bin`: binary EBX round trip.
-- `diff_ebx`: line-level diff of an asset against its vanilla data.
+- `diff_ebx`: line-level diff of an asset against its vanilla data. On the localization
+  database it also reports `localized_strings_modified`, because edited strings live
+  outside the field layer and never appear in `added` or `removed`.
 - `check_guid_invariants`: find assets whose entry GUID and file GUID diverged.
 
 ### RES and chunks
@@ -174,16 +199,64 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `get_component`: one component, property dump optional (`include_properties`).
 - `create_component`: new EntityData on a blueprint; `at_index` inserts, `array_host_guid`
   targets an array on a nested host, and a missing array is an error rather than an orphan.
-- `duplicate_component`: copy one component with fresh GUIDs.
+  With neither argument the pointer goes into the root `Objects` array. A node added to a
+  SoundPatch is also appended to `Graph.Nodes` and reported in `registered_in_graph`; an
+  object added to the root `Objects` of an asset that carries a `WidgetSpawnerItemData` is
+  also appended to its `Components` and reported in `registered_in`, which is what lets a
+  Rime entity run at all.
+- `duplicate_component`: copy one component with fresh GUIDs, optional `properties`
+  overrides and the same extra registrations; `at_index` inserts, but the array is always
+  one of the root object's and `array_host_guid` is ignored. The numbering rules below
+  apply to it too.
 - `remove_component`: drop a component and the arrays/connections touching it; reports
   `cleared_paths`.
 - `set_component_flags`: object flags and realm.
 - `get_component_property` / `set_component_property`: SDK properties by dotted path.
 - `remove_ebx_item`: delete elements from any EBX array (property-grid Remove item).
-- `insert_ebx_item`: insert into any array (property-grid Insert item).
+- `insert_ebx_item`: insert into any array (property-grid Insert item). With
+  `source_index`, the element is deep-copied, so editing the inserted element does not
+  change the source; internal pointers get fresh identities in the host asset.
 - `create_ebx_class` / `list_ebx_class_types`: create a class into a PointerRef field.
+  `create_only` registers the object without assigning it, and is refused when nothing
+  references it.
 - `create_struct`: new struct value, optionally appended to a list.
 - `clipboard_paste_object`: paste a copied object graph with regenerated GUIDs.
+
+`create_component`, `duplicate_component` and `create_ebx_class` also verify their own
+result, unlike `clipboard_paste_object`. The asset is saved and the array is read back; an
+object the serializer discarded is taken back out and the call returns
+`OBJECT_NOT_PERSISTED` instead of reporting success, and a generated GUID that already
+exists removes the new object and returns `GUID_COLLISION`.
+
+Every object added by `create_component`, `duplicate_component`, `create_ebx_class` or
+`clipboard_paste_object` is numbered automatically. Do not fill these fields yourself:
+
+- `ClientIndex` / `ServerIndex`: the whole asset is renumbered by **depth-first order**
+  over the object tree, per side, densely from 0 with no gaps and no repeats; the two
+  `*RuntimeComponentCount` fields on the entity are set to the resulting totals. Which
+  side an object occupies is preserved: an object that was 255 on a side stays 255 there,
+  a new object mirrors the side of an existing instance of its type (or falls back to its
+  realm). The walk follows `Components` only, and that list holds `PointerRef` wrappers,
+  not the objects. `remove_component` and `remove_ebx_item` run the same pass, because a
+  deleted component would otherwise leave a hole. "One past the highest value in use" is
+  wrong and used to leave a hole the game dereferences at load; do not reintroduce it.
+  Verifying a result: export the asset and check that the recorded values equal the
+  depth-first position per side. Vanilla playable blueprints satisfy that exactly.
+- `InternalId`: a duplicated graph arrives with ids of -1 or with ids that repeat existing
+  objects; any such id is renumbered to one past the highest in use, and the
+  `ExportedGuid` is left as it was.
+- Exported to internal: a new object still marked exported is converted to internal. Left
+  exported, the runtime resolves it to null while walking the component list and the game
+  crashes in the saved-component loader.
+
+What this prevents is a shared runtime slot. A copy that keeps the source's `ClientIndex`
+or `ServerIndex`, or an object that reuses an `InternalId`, loads cleanly in the editor and
+crashes the game when the asset is instantiated. A hand-picked value collides exactly the
+way the copied one did, so pass nothing and read the result: `get_component` with
+`include_properties: true` returns `ClientIndex` and `ServerIndex` among the properties of
+the component types that carry them, and the `class_guid` in `list_components` is the
+internal form, whose number is the `InternalId`. The new component must show values no
+earlier component had.
 
 ### Blueprint connections
 - `list_connections`: property, event and link connections, paged, compact by default.
@@ -212,11 +285,16 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `get_texture_info`, `export_texture`, `import_texture`: textures; import validates the
   DDS against the existing texture and rebuilds its metadata.
 - `get_mesh_info`, `export_mesh`, `import_mesh`: meshes via MeshSetPlugin; import runs
-  through the editor's progress window.
+  through the editor's progress window. `export_mesh` handles MeshSet assets only and
+  refuses a `RigidMeshAsset` up front with `UNSUPPORTED_ASSET_TYPE` and `asset_type`.
 - `export_atlas_texture` / `import_atlas_texture`: DXT5 atlas textures.
 - `export_svg` / `import_svg`: SVG images, point for point as the editor parses them.
 - `get_sound_info`: SoundWave chunks, variations and segments.
-- `export_sound_wav` / `import_sound_wav`: PCM16 WAV only, no re-encoding.
+- `export_sound_wav` / `import_sound_wav`: WAV around a SoundWave. `import_sound_wav` writes
+  Pcm16Big only; `export_sound_wav` reads Pcm16Big from an old-style SoundWave and decodes a
+  NewWaveAsset through the sound plugin's vgmstream, so other encodings can come out.
+  NewWave chunks with `IsSeekable=true` cannot be exported: their per-block frame headers hide
+  the codec header, and the error reply carries `is_seekable: true`.
 - `import_sound`: re-encode any audio file with SoundEditorPlugin's tool, updating the
   chunk and the segment and variation tables.
 - `export_ies`: IES profile as a DDS.
@@ -237,6 +315,12 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `get_localized_string`, `set_localized_string`, `revert_localized_string`,
   `list_localized_strings`. These need a database plugin; the built-in default is a no-op
   and the tools refuse it with `PLUGIN_MISSING`.
+- `list_localized_strings` `query` matches the value, the hex hash and the `ID_...` name,
+  the last through the database's own id hash, in both the original and upper-cased
+  spelling. A string id therefore finds its row instead of returning an empty list.
+- Edited strings live outside the EBX field layer. `diff_ebx` on the localization database
+  reports `localized_strings_modified`, and `revert_asset` refuses it with
+  `LOCALIZED_STRINGS_PENDING` unless `revert_strings: true` is passed.
 
 ### Hashing
 - `hash_string`: FNV1, localized hash, float bit pattern.
@@ -282,16 +366,28 @@ code; messages change.
 | `UNSUPPORTED_TYPE` | Type uses a custom handler; the binary path refuses it |
 | `UNSUPPORTED_VERSION` / `UNSUPPORTED_FORMAT` / `UNSUPPORTED_CODEC` / `UNSUPPORTED_LOGGER` | Input or environment outside what the tool handles |
 | `TYPE_NOT_FOUND` / `TYPE_MISMATCH` / `INVALID_TYPE` | SDK type missing, or the asset is another kind |
-| `GUID_MISMATCH` / `GUID_INCONSISTENT` | Entry GUID and file GUID diverged; the write was refused |
+| `GUID_MISMATCH` | Entry GUID and file GUID diverged; the write was refused |
+| `GUID_COLLISION` | The new object's class GUID already exists in the asset; the object was removed |
+| `HAS_LINKED_RES` | `duplicate_ebx` on a source that owns a RES; use `duplicate_deep` |
 | `VERIFY_FAILED` | RES round-trip byte comparison failed; previous data restored |
 | `SCAN_INCOMPLETE` | A validation scan failed part way; the asset was not fully checked |
 | `ITEM_DROPPED` | `insert_ebx_item` added the element but `Update()` discarded it |
+| `OBJECT_NOT_PERSISTED` | The new object did not survive the save: the type cannot be serialised, the array read back as null, or `create_only` left it unreferenced |
+| `LOCALIZED_STRINGS_PENDING` | `revert_asset` on the localization database with edited strings; pass `revert_strings` |
 | `CODEC_UNKNOWN` / `CHANNELS_UNKNOWN` | `import_sound` could not read the existing sample header; pass `codec` / `channel_count` |
 | `ARRAY_NOT_FOUND` | No array accepted the new object; nothing was created |
 | `FORBIDDEN` | Attempt to remove the root object |
 | `AMBIGUOUS_COMPONENT` | class GUID matches several components; pass `index` |
+| `UNSUPPORTED_ASSET_TYPE` | The asset type has no exporter path, for example `export_mesh` on a `RigidMeshAsset` |
 | `NO_VANILLA_DATA` / `EXPORT_EMPTY` / `INVALID_DDS` / `FORMAT_MISMATCH` | Export or import precondition failed |
-| `*_FAILED` | Operation-specific failure: `ADD_FAILED`, `REMOVE_FAILED`, `CREATE_FAILED`, `DUPLICATE_FAILED`, `EXPORT_FAILED`, `IMPORT_FAILED`, `SAVE_FAILED`, `SET_FAILED`, `GET_FAILED`, `LOAD_FAILED`, `OPEN_FAILED`, `REVERT_FAILED`, `DIFF_FAILED`, `DEPS_FAILED`, `LIST_FAILED`, `INFO_FAILED`, `VALIDATE_FAILED`, `PASTE_FAILED`, `RESOLVE_FAILED`, `REFRESH_FAILED`, `COMPILE_FAILED`, `DECOMPILE_FAILED`, `NEW_PROJECT_FAILED`, `MANAGE_FAILED`, `SET_FLAGS_FAILED`, `ENSURE_FAILED`, `PATH_FAILED`, `UPDATE_FAILED` |
+| `*_FAILED` | Operation-specific failure: `ADD_FAILED`, `REMOVE_FAILED`, `CREATE_FAILED`, `DUPLICATE_FAILED`, `EXPORT_FAILED`, `IMPORT_FAILED`, `SAVE_FAILED`, `SET_FAILED`, `GET_FAILED`, `LOAD_FAILED`, `OPEN_FAILED`, `REVERT_FAILED`, `DIFF_FAILED`, `DEPS_FAILED`, `LIST_FAILED`, `INFO_FAILED`, `VALIDATE_FAILED`, `PASTE_FAILED`, `RESOLVE_FAILED`, `REFRESH_FAILED`, `COMPILE_FAILED`, `DECOMPILE_FAILED`, `NEW_PROJECT_FAILED`, `MANAGE_FAILED`, `SET_FLAGS_FAILED`, `ENSURE_FAILED`, `PATH_FAILED`, `UPDATE_FAILED`, `INSERT_FAILED`, `MERGE_FAILED` |
+
+`GUID_INCONSISTENT` is not an `error_code`. It only appears as a prefix inside `error`
+messages, and the code that comes back with it is `INVALID_PARAMS` or `ADD_FAILED`, so a
+handler that branches on the code must not wait for that string. `AMBIGUOUS_POINTER` and
+`POINTER_BASE_TYPE_MISMATCH` work the same way: a property write that cannot resolve an
+external PointerRef returns `SET_FAILED` (or `CREATE_FAILED` from a class insert) with the
+reason in the message.
 
 Transport-level failures (pipe closed, timeout) come back as `error_code: "RPC_ERROR"`
 with the JSON-RPC number in `rpc_code`.
@@ -325,12 +421,16 @@ gives the copy the same RES and chunks as the source; `linked_assets_shared` say
 either asset's texture changes both.
 
 **Two assets in one bundle must not share internal object GUIDs.** That combination crashes
-the game on load. Use `duplicate_ebx` or `duplicate_deep` rather than copying objects by
-hand, and run `check_guid_invariants` after any bulk copy.
+the game on load. `duplicate_ebx` and `duplicate_deep` renumber every exported object GUID
+in the copy, so prefer them over copying objects by hand, and run `check_guid_invariants`
+after any bulk copy. A `duplicate_deep` of a `NewWaveAsset` keeps its GUIDs on purpose,
+because the sound resource and bank key were derived from them.
 
 **Native bundle membership cannot be removed.** A mod can add memberships and drop the ones
 it added; it cannot take an asset out of the bundle it ships in. `remove_from_bundle`
-returns `NOT_EXPORTABLE` there, and `native_skipped` counts what it left alone.
+returns `NOT_EXPORTABLE` there. `native_skipped` is a field of
+`remove_from_bundle_smart`, which counts what it left alone; the plain tool has no such
+field.
 
 **`set_bundle_super` on a vanilla bundle is editor-only.** It returns `NOT_EXPORTED` unless
 `force`, and with `force` the mod still ships without the change.
@@ -357,13 +457,14 @@ says how many were tested.
 
 **`insert_ebx_item` verifies its own insert.** `asset.Update()` drops elements it cannot
 re-serialise, so the tool reads the list back and returns `ITEM_DROPPED` with the before and
-after counts. A `success: true` from the older path did not prove the element survived.
+after counts. A bare `success: true` proves nothing on its own; the readback is the evidence.
 
 **`import_sound` reads the codec and channel count from the existing sample header.** When
 that header cannot be read the call fails with `CODEC_UNKNOWN` or `CHANNELS_UNKNOWN` instead
 of guessing, because a wrong guess re-encodes the asset in the wrong format and still
-reports success. `segment_index` and `variation_index` default to 0; on a multi-segment
-asset that is a guess, so check `segment_count` and `variation_count`.
+reports success. `segment_index` and `variation_index` fall back to 0 only when the keys are
+absent; the Python wrapper always sends -1, so through MCP you must pass 0 yourself (see
+the entry below). Check `segment_count` and `variation_count`.
 
 **Importing into a streamed sound appends to the existing chunk data.** Re-importing without
 reverting first grows the chunk each time. Revert the asset between attempts.
@@ -378,55 +479,69 @@ client or the server sees the property.
 captured before a restart, a revert or a duplicate may address a different object. Re-read
 `list_components` instead of reusing it.
 
+The same happens when a project is loaded from disk again, including `open_project` on the
+same file inside one session, and after restoring a `.fbproject` backup. Nothing about the
+tool changes: the editor renumbers the internal objects as it loads them, so every
+`class_guid` of the form `00000000-0000-0000-0000-0000000000NN` and every `object_index`
+written down earlier is stale. The symptom is a write that fails with `Missing property`
+or silently lands on a different object of the same class. After any reopen, look the object
+up again: `search_ebx_fields` with a field name returns the current `object_index`, and
+`list_components` returns the current `class_guid`. Never reuse ids from notes, logs or a
+previous build without re-resolving them.
+
 **`export_mod` needs a saved project and actual modifications.** It refuses with
 `NOTHING_TO_EXPORT` when `GetModifiedCount()` is zero, and metadata arguments apply to that
 export only, not to the project's ModSettings.
 
-**`import_project` overwrites by default.** Vanilla entries that were never modified are
-protected and skipped unless `allow_overwrite`; read `skipped_protected` rather than assuming
-the whole file was applied.
+**`import_project` overwrites by default.** `overwrite_modified: false` protects only
+entries the target project already records as modified; a vanilla entry that was never
+modified is overwritten regardless of the flag. Read `skipped_protected` rather than
+assuming the whole file was applied, and see the later entry on which asset kinds that
+protection actually reaches, because it is narrower than the flag suggests.
 
-**`copy_linked: true` is best effort and every way it can fail is silent.** `DuplicateEbx` fills `shared_linked_assets` only when `copy_linked` is false (`McpEditHandlers.cs` lines 313 to 321), while the actual copying runs through `TryDuplicateLinkedTextureRes`, which returns quietly when the root object has no `Resource` property, when the old RES is missing, when a RES with the destination name already exists, and on any exception, because both the inner and the outer body are empty `catch` blocks (lines 1630 to 1685). For a mesh, a sound, a non-texture asset, or any failure along the way, the duplicate keeps pointing at the source RES or chunk while the reply says `copy_linked: true` with `shared_linked_assets: []` and no `linked_assets_shared` key. The tell is that empty list next to a non-empty `linked_assets` in `get_ebx_entry` for the source: when the source has linked resources and `shared_linked_assets` is empty with no warning, assume the copy shares them.
+**`copy_linked: true` is best effort and every way it can fail is silent.** `DuplicateEbx` fills `shared_linked_assets` only when `copy_linked` is false, while the actual copying runs through `TryDuplicateLinkedTextureRes`, which returns quietly when the root object has no `Resource` property, when the old RES is missing, when a RES with the destination name already exists, and on any exception, because both the inner and the outer body of that helper are empty `catch` blocks. For a mesh, a sound, a non-texture asset, or any failure along the way, the duplicate keeps pointing at the source RES or chunk while the reply says `copy_linked: true` with `shared_linked_assets: []` and no `linked_assets_shared` key. The tell is that empty list next to a non-empty `linked_assets` in `get_ebx_entry` for the source: when the source has linked resources and `shared_linked_assets` is empty with no warning, assume the copy shares them.
 
-**A failed `import_ebx_bin` can still have imported.** `def.Import` has already run at line 187 when the follow-up reload is checked at lines 194 to 197, and a null reload returns `IMPORT_FAILED` without reverting; the revert path exists only in the `GUID_MISMATCH` branch (lines 214 to 225). Any exception thrown after the import, for example while computing the after-GUID set, also lands in the outer `catch` and returns `IMPORT_FAILED`. After an `IMPORT_FAILED` from this tool, treat the asset as possibly imported and check `get_ebx_entry` `is_modified` and `diff_ebx` before retrying, because a retry against an already imported asset compounds the change.
+**A failed `import_ebx_bin` can still have imported.** `def.Import` has already run by the time the follow-up reload is inspected, and a null reload returns `IMPORT_FAILED` without reverting; the revert path exists only in the `GUID_MISMATCH` branch. Any exception thrown after the import, for example while computing the after-GUID set, also lands in the outer `catch` and returns `IMPORT_FAILED`. After an `IMPORT_FAILED` from this tool, treat the asset as possibly imported and check `get_ebx_entry` `is_modified` and `diff_ebx` before retrying, because a retry against an already imported asset compounds the change.
 
-**`raw_chunk: true` writes whatever bytes you hand it into the texture chunk.** The only checks are that the existing texture is `TT_2d` and, if the file starts with the DDS magic, whether a DX10 header makes the header size 148 instead of 128 (lines 1770 to 1787). A non-DDS file, a PNG or a JPEG, sets `headerSize = 0` and the whole file is copied into the chunk as pixel data, returning `success: true` with `metadata_changed: false` and a warning that only mentions metadata. Check `bytes` against the file length and `metadata_changed`: the tool never compares the written size with the existing chunk or the expected mip chain, so the reply looks exactly like a correct import.
+**`raw_chunk: true` writes whatever bytes you hand it into the texture chunk.** The only checks are that the existing texture is `TT_2d` and, if the file starts with the DDS magic, whether a DX10 header makes the header size 148 instead of 128. A non-DDS file, a PNG or a JPEG, sets `headerSize = 0` and the whole file is copied into the chunk as pixel data, returning `success: true` with `metadata_changed: false` and a warning that only mentions metadata. Check `bytes` against the file length and `metadata_changed`: the tool never compares the written size with the existing chunk or the expected mip chain, so the reply looks exactly like a correct import.
 
-**A `guid` that disagrees with `name` silently wins, and RES resolves in the opposite order.** `ResolveEbxEntry` tries the GUID first and returns it if it resolves, falling back to the name with no warning when the GUID is malformed or names nothing (lines 806 to 819), while `ResolveRes` tries the name first and only then `res_rid` (lines 1235 to 1255). Every handler that takes both, including `duplicate_ebx`, `import_ebx_bin`, `set_ebx_property` and `revert_asset`, therefore targets one of the two without saying which won. The reply always names the asset it actually resolved, so compare reply `name` or `asset.name` with what you sent; a mismatch means a stale GUID from an earlier session sent the edit to the wrong asset.
+**A `guid` that disagrees with `name` silently wins, and RES resolves in the opposite order.** `ResolveEbxEntry` tries the GUID first and returns it if it resolves, falling back to the name with no warning when the GUID is malformed or names nothing, while `ResolveRes` tries the name first and only then `res_rid`. Every handler that takes both, including `duplicate_ebx`, `import_ebx_bin`, `set_ebx_property` and `revert_asset`, therefore targets one of the two without saying which won. The reply always names the asset it actually resolved, so compare reply `name` or `asset.name` with what you sent; a mismatch means a stale GUID from an earlier session sent the edit to the wrong asset.
 
-**`import_res` verifies payload bytes and nothing else, and its failure message overstates the recovery.** `BuildResMeta` copies at most 16 bytes of the entry's `ResMeta` (lines 623 to 629) and import writes exactly those 16 bytes back, so a longer metadata blob is silently truncated by one export and import round trip. With `format: "raw"` the call passes a null meta to `ModifyRes` yet reports `meta_updated: false` with a warning that `ResMeta` was left unchanged, and nothing reads the metadata back to prove it. When the payload comparison fails, the previous data was restored message is emitted even when `previousData` could not be read and no restore happened (lines 583 to 601), so the success of the rollback is not a field you can rely on here.
+**`import_res` verifies payload bytes and nothing else, and its failure message overstates the recovery.** `BuildResMeta` copies at most 16 bytes of the entry's `ResMeta` and import writes exactly those 16 bytes back, so a longer metadata blob is silently truncated by one export and import round trip. With `format: "raw"` the call passes a null meta to `ModifyRes` yet reports `meta_updated: false` with a warning that `ResMeta` was left unchanged, and nothing reads the metadata back to prove it. When the payload comparison fails, the previous data was restored message is emitted even when `previousData` could not be read and no restore happened, so the success of the rollback is not a field you can rely on here.
 
-**A JSON object written into a struct silently drops keys it does not recognise.** `ConvertTo` treats any `JObject` aimed at a value type as a bag of fields and wraps each individual `SetMember` call in `catch { }` (lines 1490 to 1499), so `{"x": 1, "z": 3}` written to a two-field vector keeps `x`, drops `z`, leaves the second field at its default, and returns `success: true`. The tool does echo the resolved value afterwards, so compare its keys with the keys you sent; an echoed struct that is missing a key means a typo, not a type that lacked the field.
+**A JSON object written into a struct silently drops keys it does not recognise.** `ConvertTo` treats any `JObject` aimed at a value type as a bag of fields and wraps each individual `SetMember` call in `catch { }`, so `{"x": 1, "z": 3}` written to a two-field vector keeps `x`, drops `z`, leaves the second field at its default, and returns `success: true`. The tool does echo the resolved value afterwards, so compare its keys with the keys you sent; an echoed struct that is missing a key means a typo, not a type that lacked the field.
 
-**`changed_class_guids` is empty when the before-scan failed, not when nothing changed.** `ExportedClassGuids` swallows a load failure and returns an empty set (lines 1186 to 1207), so if the asset could not be read before the import the comparison at line 242 finds no removed GUIDs, and `affected_assets` is never computed. The reply then looks identical to a clean import with no renumbering, which is exactly the case the caller was told to check. Look at `changed_class_guid_count` together with the import having actually succeeded, and re-read `get_ebx_guids` separately when the asset was in a doubtful state before the call.
+**`changed_class_guids` is empty when the before-scan failed, not when nothing changed.** `ExportedClassGuids` swallows a load failure and returns an empty set, so if the asset could not be read before the import the comparison that builds `changed_class_guids` finds no removed GUIDs, and `affected_assets` is never computed. The reply then looks identical to a clean import with no renumbering, which is exactly the case the caller was told to check. Look at `changed_class_guid_count` together with the import having actually succeeded, and re-read `get_ebx_guids` separately when the asset was in a doubtful state before the call.
 
-**`create_bundle` invents the super bundle when the name does not exist.** `ResolveSuperBundleId` returning -1 is not an error: the handler calls `AddSuperBundle(sbName)` and resolves again (lines 911 to 916), so a typo in `super_bundle` silently creates a new empty super bundle instead of failing. The reply then reports `super_matches: true` and the requested name, because the comparison is against the newly created entry. Cross-check the typed name against `list_super_bundles`, and treat any super bundle whose only member is the bundle you just made as the result of a typo.
+**`create_bundle` invents the super bundle when the name does not exist.** `ResolveSuperBundleId` returning -1 is not an error: the handler calls `AddSuperBundle(sbName)` and resolves again, so a typo in `super_bundle` silently creates a new empty super bundle instead of failing. The reply then reports `super_matches: true` and the requested name, because the comparison is against the newly created entry. Cross-check the typed name against `list_super_bundles`, and treat any super bundle whose only member is the bundle you just made as the result of a typo.
 
-**`duplicate_res` accepts an unparsable `res_type` and keeps the source type.** Line 784 runs `Enum.TryParse` and leaves `resType` at the source value when parsing fails, so a misspelled or nonexistent resource type produces a normal duplicate, `success: true`, and no warning. The reply's `asset.res_type` is the real value, which will differ from what you passed; compare those two fields rather than assuming the override applied.
+**`duplicate_res` accepts an unparsable `res_type` and keeps the source type.** The handler runs `Enum.TryParse` and leaves `resType` at the source value when parsing fails, so a misspelled or nonexistent resource type produces a normal duplicate, `success: true`, and no warning. The reply's `asset.res_type` is the real value, which will differ from what you passed; compare those two fields rather than assuming the override applied.
 
-**`add_to_bundle` suppresses its own warning precisely when the asset carries linked resources.** The warning is added only when `IsResourceBackedType(entry.Type)` is true and `entry.LinkedAssets` is empty (lines 829 to 830), so a texture or mesh that already has its RES and chunk linked, which is the case where a raw membership add leaves those resources unshipped, produces `warnings: []`. An empty warning list therefore proves nothing; run `check_asset_ready` or `bundle_closure_check` instead, and treat `warnings: []` on a resource-backed asset as the expected output, not as confirmation.
+**`add_to_bundle` suppresses its own warning precisely when the asset carries linked resources.** The warning is added only when `IsResourceBackedType(entry.Type)` is true and `entry.LinkedAssets` is empty, so a texture or mesh that already has its RES and chunk linked, which is the case where a raw membership add leaves those resources unshipped, produces `warnings: []`. An empty warning list therefore proves nothing; run `check_asset_ready` or `bundle_closure_check` instead, and treat `warnings: []` on a resource-backed asset as the expected output, not as confirmation.
 
-**`get_ebx_property` prints a type name where a compound value should be.** In `SerializeValue` any member that is not primitive, string, enum, GUID, CString or PointerRef, and is not a value type from a `FrostySdk` namespace, is returned as `v.GetType().Name` (lines 1615 to 1620). For a field that holds an object or an array of objects, the reply's `value` contains a string like a struct name, with no flag saying it was substituted. Read `type` alongside `value`, and if the type is a class or a list while the value is a plain string, treat it as an unresolved reference rather than a value.
+**`get_ebx_property` expands compound values, and one nested case degrades to a type name.** In `SerializeValue` a list comes back as `{count, truncated, items}` (first 100 items) and an object as a dictionary of its public properties. Only an object held inside such a dictionary, one level down, is returned as `v.GetType().Name`, a bare string with no flag saying it was substituted. Read `type` alongside `value`, and when a nested value is a plain string where an object belongs, treat it as an unresolved reference rather than a value.
 
-**`create_bundle` turns an unknown `type` into `BlueprintBundle` without saying so.** `Enum.TryParse` failure falls through to `bundleType = BundleType.BlueprintBundle` (lines 903 to 905), and `requested_type` in the reply echoes that fallback rather than the string you sent, so `type` and `requested_type` always agree. The bundle is created with the wrong type, which matters because bundle type drives the loader. Compare the reply `type` against the literal you passed, not against `requested_type`, and prefer the exact enum spelling.
+**`create_bundle` turns an unknown `type` into `BlueprintBundle` without saying so.** `Enum.TryParse` failure falls through to `bundleType = BundleType.BlueprintBundle`, and `requested_type` in the reply echoes that fallback rather than the string you sent, so `type` and `requested_type` always agree. The bundle is created with the wrong type, which matters because bundle type drives the loader. Compare the reply `type` against the literal you passed, not against `requested_type`, and prefer the exact enum spelling.
 
-**`add_to_bundle` and `remove_from_bundle` echo your lowercased string as `bundle`, not the canonical name.** Both handlers lowercase the input at line 813 and line 850 before resolving and then return the lowercased string in the `bundle` field, so a bundle indexed as `Mod/Foo` comes back as `mod/foo`. Because the input has already been lowercased, the exact-case fast path in `ResolveBundleId` (lines 772 to 791) can never hit, and when two bundles differ only in case the loop returns the first case-insensitive match, which may not be the one you meant. Use `list_bundles` to get the real spelling and check `bundle_id` rather than the echoed name.
+**`add_to_bundle` and `remove_from_bundle` echo your lowercased string as `bundle`, not the canonical name.** Both handlers lowercase the input before resolving and then return the lowercased string in the `bundle` field, so a bundle indexed as `Mod/Foo` comes back as `mod/foo`. Because the input has already been lowercased, the exact-case fast path in `ResolveBundleId` can never hit, and when two bundles differ only in case the loop returns the first case-insensitive match, which may not be the one you meant. Use `list_bundles` to get the real spelling and check `bundle_id` rather than the echoed name.
 
-**`max_chars: 0` means 60000, not zero characters.** Lines 221 to 223 replace any non-positive `max_chars` with `DefaultXmlMaxChars`, unlike `limit: 0`, which genuinely returns no rows. A caller who passes 0 expecting an empty body, or expecting no cap, gets a 60000-character page with `truncated: true` and a `next_offset`, and there is no way to ask for the whole document in one call. Page with `next_offset` until `truncated` is false, and never infer no limit from a zero.
+**`max_chars: 0` means 60000, not zero characters.** The handler replaces any non-positive `max_chars` with `DefaultXmlMaxChars`, unlike `limit: 0`, which genuinely returns no rows. A caller who passes 0 expecting an empty body, or expecting no cap, gets a 60000-character page with `truncated: true` and a `next_offset`, and there is no way to ask for the whole document in one call. Page with `next_offset` until `truncated` is false, and never infer no limit from a zero.
 
-**`summary: true` caps `elements` at 40 type names and ignores the other text parameters.** The summary path counts object types, keeps only the top 40 by count (line 268), and returns no flag saying more types existed, while `filter`, `char_offset` and `max_chars` are never consulted on that branch (lines 257 to 282). A caller who asks for a summary plus a filter gets a whole-asset histogram that looks like it answered the filtered question. Check `object_count` against the sum of the `elements` values: any difference means types were dropped.
+**`filter` on `get_ebx_xml` / `get_ebx_yaml` is a literal substring, not a pattern.** No regex, no alternation: `MixGroup|Loudness` matches nothing and returns `match_count: 0` with empty content, which reads exactly like "this field is absent from the asset". Call the tool once per term instead of OR-ing them.
 
-**`export_mesh` echoes your `format` but only writes OBJ for the exact string `obj`.** The exporter receives `format == "obj" ? "obj" : "binary"` (line 2113), so `fbx`, `ascii`, `FBX` and anything else all produce a binary FBX, while the reply repeats the string you typed in `format` (line 1059). The handler also never checks that a file appeared at `path`, so the reply proves only that the reflection call returned. Check the file on disk and read the caller's intent, not the echoed `format`, when the exported file matters.
+**`summary: true` caps `elements` at 40 type names and ignores the other text parameters.** The summary path counts object types, keeps only the top 40 by count in its summary branch, and returns no flag saying more types existed, while `filter`, `char_offset` and `max_chars` are never consulted on that branch. A caller who asks for a summary plus a filter gets a whole-asset histogram that looks like it answered the filtered question. Check `object_count` against the sum of the `elements` values: any difference means types were dropped.
+
+**`export_mesh` echoes your `format` but only writes OBJ for the exact string `obj`.** The exporter receives `format == "obj" ? "obj" : "binary"`, so `fbx`, `ascii`, `FBX` and anything else all produce a binary FBX, while the reply repeats the string you typed in `format`. The handler also never checks that a file appeared at `path`, so the reply proves only that the reflection call returned. Check the file on disk and read the caller's intent, not the echoed `format`, when the exported file matters.
 
 **`remove_ebx_item` silently retargets to the root when the host GUID does not resolve.** In the non-`$` branch the tool parses `class_guid` and calls `FindObjectByClassGuid`, but the assignment is guarded by `if (found != null) host = found;`, so a miss leaves `host` at `asset.RootObject`; the `component_type` path behaves the same way when `ResolveComponent` returns null. A stale GUID plus `path: "Objects[3]"` therefore deletes element 3 from the root object and still returns `success: true`. The only clue is `host_type` in the reply, which will name the root class instead of the component you meant.
 
-**`create_ebx_class` with the default `reuse_guid: true` leaves the replaced object in the asset under the same class GUID.** When the target field already holds an internal pointer, `guid = ((dynamic)existingPr.Internal).GetInstanceGuid()` copies that instance GUID onto the new object, and nothing in the method ever calls `asset.RemoveObject` on the old one, which remains in `asset.Objects`. Two objects then answer to one `class_guid`, so later GUID addressing is ambiguous and `remove_connections_by_guid`, which sweeps every pointer carrying that GUID, hits both. Pass `reuse_guid: false` unless the identity swap is what you want.
+**`create_ebx_class` leaves the object it replaces in the asset.** When the target field already holds an internal pointer, `guid = ((dynamic)existingPr.Internal).GetInstanceGuid()` is copied onto the new object, but the handler never calls `asset.RemoveObject` on the old one, which remains in `asset.Objects`. The new object is converted to internal form before the call returns, so it does not take over the old object's identity: the replacement is additive, the old object stays in the asset, and any other field that pointed at it still resolves to it. `reuse_guid: false` does not remove the old object either, it only skips the copy. Re-read `list_components` after the call and delete the orphan with `remove_component` when the swap was meant to replace it.
 
 **Reference cleanup after `remove_component` and `remove_ebx_item` reads properties only, never fields, and swallows every failure.** `RemoveReferencesToObject` iterates `host.GetType().GetProperties(...)` with no `GetFields` pass, even though `GetListMember` elsewhere in the same file exists because some Frostbite classes expose arrays as fields. Each `SetValue`, `RemoveAt` and `GetValue` in that loop sits inside a bare `catch { }`. A pointer held in a field therefore survives the removal, the call returns `success: true`, and `cleared_paths` simply does not mention it.
 
 **`remove_component` disables its ambiguity guard whenever `index` is present, and a bad index falls through to another selector.** The guard is `if (p["index"] == null && !IsClassGuidUnique(...))`. `ResolveComponent` returns early only for an in-range index; an out-of-range or stale index drops through to `class_guid` and then to `component_type` plus `type_index`, so the call removes the first object of that type instead of failing. Note also that this type match is exact (`obj.GetType().Name.Equals`), unlike `list_components`, which also accepts subclasses.
 
-**`add_property_connection` writes flags 0, which is realm Invalid, and no validator reports it.** `ResolvePropertyConnectionFlags(p)` starts from `existing = 0` and, with no `flags`, `realm`, `prop_type` or `source_cant_be_static`, returns 0 unchanged. `decode_connection_flags` names that value realm Invalid, yet `CheckFlagBits` only flags realms outside 0 through 5, so 0 passes and `validate_connections` stays clean. The connection is added with `success: true` even though neither client nor server should see the property; pass `realm` explicitly and read `realm` back from `list_connections` with `compact: false`.
+**`add_property_connection` leaves the realm to its caller, and the C# default would be Invalid.** `ResolvePropertyConnectionFlags(p)` starts from `existing = 0` and, with no `flags`, `realm`, `prop_type` or `source_cant_be_static`, returns 0 unchanged, and `decode_connection_flags` names that value realm Invalid. Through MCP that path is unreachable: the Python wrapper always sends `realm="ClientAndServer"` and `prop_type="Default"`, so a call that leaves the realm alone comes back as flags 1 rather than Invalid. Only an explicit `flags` value or `realm: "invalid"` yields 0, and the validators do not catch that, because `CheckFlagBits` only flags realms outside 0 through 5. Pass `realm` explicitly anyway and read it back from `list_connections` with `compact: false`.
 
 **Numeric or misspelled `realm` and `prop_type` are applied without masking and silently default.** `ParseRealm` and `ParsePropType` accept any integer through `int.TryParse`, and `ResolvePropertyConnectionFlags` then does `(flags & ~0x7u) | realm` and `(flags & ~0x30u) | (propType << 4)`. A `realm` of 9 also sets bit 3, which is `source_cant_be_static`, so the connection reads back as ClientAndServer with the static rule flipped; a `prop_type` of 5 bleeds into bit 6 the same way. Any unrecognized name, a typo such as ClientSever for instance, falls through to `return 1` (ClientAndServer) with no warning.
 
@@ -444,7 +559,7 @@ the whole file was applied.
 
 **A failed section in `list_connections` looks exactly like an asset with no connections.** `AppendPropertyConnections`, `AppendEventConnections` and `AppendLinkConnections` each wrap their loop in a bare `catch`, and the reply has no `scan_errors` equivalent, so `success: true` with `total: 0` covers both nothing exists and the loop threw. With the default `compact: true` the serialiser also omits `flags_hex` and `source_cant_be_static`, hiding the bit 3 state. The `filter` argument is a case-insensitive substring over the whole serialised row, so `filter: "client"` matches realm text and `filter: "property"` matches the `kind` field.
 
-**The array a new component lands in is not always the one you named.** In `create_component`, supplying `at_index` calls `TryInsertPointerToArray` directly, which has no fallback to `Components` or `Children` and clamps an out-of-range index down to `list.Count`; without `at_index` the same call walks `Objects`, `Components`, `Children` and reports whichever accepted it in `added_to_array`. The `index` inside `component` comes from `IndexOfObject` and is the position in `asset.Objects`, not the array position you asked for. `duplicate_component` never reads `array_host_guid` and always inserts on `asset.RootObject`, and it copies none of the source connections.
+**The array a new component lands in is not always the one you named.** In `create_component`, supplying `at_index` calls `TryInsertPointerToArray` directly, which has no fallback to `Components` or `Children` and clamps an out-of-range index down to `list.Count`; without `at_index` the same call walks `Objects`, `Components`, `Children` and reports whichever accepted it in `added_to_array`. The `index` inside `component` comes from `IndexOfObject` and is the position in `asset.Objects`, not the array position you asked for. `duplicate_component` never reads `array_host_guid` and always inserts on `asset.RootObject`, and it copies none of the source connections. Both tools then save and read the array back; an `OBJECT_NOT_PERSISTED` reply means the object was taken out again, so do not go looking for a half-added component.
 
 **`type` and `modified_only` in `list_bundle_contents` only filter EBX rows.** Both conditions sit inside the `EnumerateEbx` loop, after the RES and chunk loops have already appended their rows, so with `kind: "all"` a `type` filter is applied to part of the result only. The reply echoes `kind` and `total` without saying the filter was partly ignored. The three kinds are also concatenated in a fixed order (res, then chunk, then ebx), so paging with `offset` and `limit` crosses sections.
 
@@ -480,7 +595,7 @@ the whole file was applied.
 
 **`duplicate_res` ignores a bad `res_type` instead of rejecting it.** `Enum.TryParse(typeOverride, true, out ResourceType parsed)` updates the type only on success, so a typo or a name from another game leaves the source type in place and the call still returns success. The reply's `source` and `asset` entries both include `res_type`, but nothing marks it as a fallback. Compare `asset.res_type` with what you sent, and note that `new_name` is lowercased before the duplicate is created.
 
-**`export_ies` does not produce an IES file.** It reads the resource's sample grid and writes a DDS header with `dxgiFormat = R16_Float`, one mip, and `size` by `size` pixels, so the output is a binary texture-like container; the path check even asks for `.dds`. There is no `import_ies` in the bridge, so the export cannot be reversed or edited as text. The reply's `size` is the grid dimension from the resource, and the file length is not reported at all.
+**`export_ies` does not produce an IES file.** It reads the resource's sample grid and writes a DDS header with `dxgiFormat = R16_Float`, one mip, and `size` by `size` pixels, so the output is a binary texture-like container; the path check even asks for `.dds`. There is no `import_ies` in the bridge, so the export cannot be reversed or edited as text. The reply's `size` is the grid dimension from the resource and `bytes` is the length of the payload it wrote; the file length on disk, which adds the 148 byte DX10 header, is still not reported.
 
 **`import_project` with `overwrite_modified: false` protects only RES entries.** Before the payload pass, the dummy EBX pass sets `entry.IsDirty = true` on every EBX name in the file, so the protection test `!allowOverwrite && !entry.IsDirty && entry.IsModified` can never fire for EBX and those assets are overwritten regardless of the flag. Chunks have no protection test at all, so an existing chunk is given a fresh `ModifiedEntry` too. Only the RES pass runs the test, which means `skipped_protected` counts RES entries alone and `success: true` with `skipped_protected: 0` is exactly what an EBX overwrite looks like. Read `ebx_merged` and `chunks_merged` before trusting the flag.
 
@@ -514,7 +629,7 @@ the whole file was applied.
 
 **An oversized request gets no error at all.** `McpBridgeServer` reads a 4 byte length and breaks the loop when `length > MaxRequestBytes` (32 MB) without writing a response, and the client's finally block calls `McpCommit.ClearPending`. A large `import_ebx_bin` or `refs_json` therefore surfaces as a transport failure or a timeout, and any preview taken earlier is gone. Keep bulk payloads under the cap and re-preview after any pipe error.
 
-**A pointer search driven by an asset name compares entry GUIDs to file GUIDs.** When you pass `name` instead of `file_guid`, `find_pointer_references` takes `target.Guid` from the asset entry and compares it against every `PointerRef.External.FileGuid`. If the entry GUID and the file GUID of that asset have diverged, the walk matches nothing and still returns `success: true`, `total: 0`, `returned: 0`, `scan_truncated: false` and `load_failures: 0`, which is indistinguishable from "nothing points at this asset". Cross-check with `get_internal_pointer_ref`, which reports `file_guid` and `asset_file_guid` separately plus `guid_invariant_ok`. When that flag is false, rerun the search with `file_guid` set to `asset_file_guid`.
+**A pointer search driven by an asset name compares entry GUIDs to file GUIDs.** When you pass `name` instead of `file_guid`, `find_pointer_references` takes `target.Guid` from the asset entry and compares it against every `PointerRef.External.FileGuid`. If the entry GUID and the file GUID of that asset have diverged, the walk matches nothing and still returns `success: true`, `total: 0`, `returned: 0`, `scan_truncated: false` and `load_failures: 0`, which is indistinguishable from "nothing points at this asset". Cross-check with `get_internal_pointer_ref`, which reports `file_guid` and `asset_file_guid` separately plus `guid_invariant_ok`. The reply also carries a `note` about this very possibility, but that note appears on any zero-hit result, so it cannot tell the two cases apart; `guid_invariant_ok` is the field that can. When that flag is false, rerun the search with `file_guid` set to `asset_file_guid`.
 
 **A clean reference validation result is weaker than it looks.** Names in `names` that do not resolve are skipped silently, so a call where every name is a typo returns `success: true`, `scanned_assets: 0`, `issue_count: 0` and `truncated: false`. Even when it does scan, an external pointer is only checked with `GetEbxEntry(fileGuid) == null`; the target class GUID inside that file is never looked up, so a component that no longer exists in the target file still passes. Pointers whose file GUID is empty are skipped outright, and the recursive walk stops at depth 4 with no counter. Read `scanned_assets`, `unscanned_assets` and the resolved names before quoting `issue_count: 0`.
 
@@ -524,11 +639,9 @@ the whole file was applied.
 
 **A readiness check judges linked assets by direct bundle membership only.** Dependencies go through the bundle manager when its parent and previous bundle table is loaded, but the `LinkedAssets` loop always calls `EnumerateBundles().Contains(bid)`, so a linked RES that loads from a parent bundle is reported under `linked_assets_outside_bundle`. A dependency test that throws falls back to direct membership with no per-item flag, so the dependency half can be partly guessed while the linked half is never asked. `dependency_check` says which mode the dependency half used, and `note` warns that linked assets only appear once the editor has loaded them, so `ready: true` can mean "nothing was visible to check".
 
-**A network registry add drops bad input instead of refusing it.** An `asset` name that does not resolve leaves the pointer list empty and the call returns the generic "Provide refs_json / file_guid+class_guid / asset name(+class_guid)" `INVALID_PARAMS`, which points at a missing argument rather than a bad name. Inside `refs_json`, a malformed array is swallowed entirely and any entry missing either GUID is skipped one at a time, so `added_count` is the only evidence that part of the list vanished. The bare `file_guid` plus `class_guid` shape also skips both the existence check and the `GUID_INCONSISTENT` check that the `asset` shape performs. Prefer the `asset` shape, where a mismatch is refused.
+**A network registry add drops bad input instead of refusing it.** An `asset` name that does not resolve leaves the pointer list empty and the call returns the generic "Provide refs_json / file_guid+class_guid / asset name(+class_guid)" `INVALID_PARAMS`, which points at a missing argument rather than a bad name. A `refs_json` string that is not valid JSON is rejected by the Python layer with `INVALID_PARAMS` before the bridge sees it; a valid array whose entries are missing a GUID is still skipped one at a time, so `added_count` is the only evidence that part of the list vanished. The bare `file_guid` plus `class_guid` shape also skips both the existence check and the `GUID_INCONSISTENT` check that the `asset` shape performs. Prefer the `asset` shape, where a mismatch is refused.
 
 **A loadability answer can be a direct membership guess with no degraded flag.** The `degraded: true` path is reserved for a loaded plugin whose `m_bundleAndParents` table is empty; when the plugin is missing or `CanBeLoadedByBundle` is not found by reflection, the tool falls through to the dependency loop and answers `can_be_loaded: outside.Count == 0` with `engine: "direct_dependencies_only"`. A dependency satisfied by a parent or previous bundle then reads as `false`, and `true` only means every direct dependency sits in this bundle. Always read `engine` before quoting the boolean.
-
-**The array insert tool is two phase although the documented two phase list omits it.** `insert_ebx_item` calls `McpCommit.Require`, so the first call returns `success: false` with `error_code: "PREVIEW_ONLY"` and a plan, and nothing is inserted; the insert and the `ITEM_DROPPED` readback only happen on the repeat with `commit: true`. The plan echoes your raw `index` (default -1) while the result reports the index actually used. An out of range `index` is not an error: anything below 0 or above `list.Count` inserts at the end.
 
 **The bulk text export has an uncounted file limit and counts nothing.** `limit` defaults to 0 (no cap), but any positive value stops the collection loop after that many entries and the reply carries no `total` and no `truncated`, only `exported_count`. `success` is merely `failures.Count == 0`, so a call that exported nothing (a `query` that matches no name, or every target already on disk with the default `overwrite: false`) returns `success: true` with `exported_count: 0` and a large `skipped_existing`. Compare `exported_count` with the set you asked for, and pass `overwrite: true` on re-runs.
 
@@ -546,9 +659,46 @@ the whole file was applied.
 
 **Every tool failure comes back as a successful JSON-RPC response.** `Dispatch` returns each handler result, including `success: false` and `METHOD_NOT_FOUND`, as the `result` member of an ordinary response; only an exception inside a handler becomes a JSON-RPC error (-32603, with no `error_code`). A client that only checks the transport for errors reads a refused write as a completed call. `METHOD_NOT_FOUND` is also absent from the documented error table and is what any name outside the router gets, including a name that belongs to a different build. The router map ignores case, but the commit gate compares the request name with the canonical tool name using `StringComparison.Ordinal`, so a preview and a commit sent with different case cannot pair.
 
-**`insert_ebx_item` can never be committed through the MCP tool.** The C# handler wraps its work in `McpCommit.Require("insert_ebx_item", ...)`, so a call without `commit` stores the plan and returns `success: false` with `error_code: "PREVIEW_ONLY"`. The Python wrapper has parameters `name`, `guid`, `path`, `class_guid`, `index` and `source_index` only, with no `commit`, and the payload it builds contains no `commit` key, so the commit branch is unreachable from MCP. Every call therefore reports a preview and changes nothing, no matter how many times it is repeated; the reply's `tool` field says `insert_ebx_item` and `would_change` is true while the array stays untouched.
+**`insert_ebx_item` is two phase like the other mutators.** The Python wrapper takes
+`commit` and forwards it, so the usual preview then commit sequence works. The plan echoes
+your raw `index` (default -1) while the result reports the index actually used, and an out of
+range `index` is not an error: anything below 0 or above `list.Count` inserts at the end.
+`source_index` deep-copies the source element (FrostyClipboard), so the inserted element and
+the source can be edited independently; the copy is what the result's `copied_from` refers
+to. `asset.Update()` can still discard an element it cannot rebuild, which comes back as
+`ITEM_DROPPED` with `count_before` and `count_after`; write the whole array with
+`set_ebx_field` when that happens. A host that is an internal object answers to its
+`InternalId`, which sits in the low 32 bits of the GUID, so
+`00000000-0000-0000-0000-000000000006` is a valid host.
 
-**`set_mod_settings` blanks every text field you leave out.** The Python tool always puts `title`, `author`, `category`, `version`, `description` and `link` into the payload, defaulting each to the empty string. The C# loop skips a field only when `p.Value<string>(field) == null`, and `""` is not null, so it assigns an empty author, category, version, description and link for the five fields you did not mention. A call such as `set_mod_settings(title="New")` therefore erases those five while returning `success: true`. To change one field safely, read `get_mod_settings` first and re-send the current values of the others. Only `selected_category = -1` truly means keep current, because the wrapper omits that key when it is negative.
+**A property write reports `applied` separately from the readback.** `set_ebx_field` and
+`set_component_property` save the value first and only then read it back for the reply. A readback
+that throws on a pointer or type field adds `readback_error` and leaves the call `success: true`
+with `applied: true`; it does not mean the write failed. Treat `applied` as the write result and
+read the field yourself when the exact stored shape matters.
+
+**`TypeRef` takes the quoted string form.** Pass `"TypeRef 'TextureAsset'"`; an object such as
+`{"type": "TextureAsset"}` is also accepted. A `TypeInfoRef` built without a `TypeInfo` is refused
+with a message, because such a field makes the whole `.fbmod` export fail with a bare null
+reference that names no asset.
+
+**`find_references` defaults to the dependency graph.** That counts any asset whose bytes mention
+the GUID, including GUIDs parked in exclusion or whitelist arrays, so it answers "who mentions
+this", not "who uses this". Pass `mode: "pointer"` to sweep pointer fields instead and get the
+field path of each hit, which is what separates a real reference from an exclusion entry. The
+default path also re-scans assets already modified in this project, because the dependency
+graph is built from saved bytes and a reference added since the last save is not in it; the
+hits it recovers that way are counted in `recovered_from_modified`.
+
+**Sound resources carry their own bank key.** The key is djb2-xor of the owning asset's instance
+GUID and also lives in each Dset inside the resource. `import_sound` and `duplicate_deep` write it
+for the owning asset and report `bank_keys_patched`; a resource whose key does not match its asset
+makes the game crash at `0x1408D8CE0` on first playback.
+
+**`set_mod_settings` only touches what you pass.** A field left out keeps its current value; an
+explicit empty string clears it. `selected_category = -1` means keep current. `screenshot_paths`
+beyond index 3 are dropped without a warning, and no argument clears an icon. Confirm with the
+returned `settings` object and its `screenshots` count.
 
 **`import_sound` fails on its own defaults because `-1` is sent instead of omitted.** The Python payload always includes `segment_index` and `variation_index`, defaulting to `-1`. The C# handler treats a present key as an explicit request and range-checks it, returning `INVALID_PARAMS` with `segment_index must be 0..N` as soon as the value is negative, before its own absent-means-zero fallback runs. So a normal call with a path and nothing else fails on any sound that has segments, and you must pass `segment_index=0` and `variation_index=0` yourself. In the other direction, `codec: 0`, `channel_count: 0` and `seekable: False` are dropped from the payload, so they mean read the sample header and keep the asset's IsSeekable rather than force that value.
 
@@ -574,7 +724,7 @@ the whole file was applied.
 
 **`get_asset_dependencies` sends `compact: false` and defeats the recursive default.** The Python wrapper defaults `compact` to `False` and always includes it, while the C# handler computes `compact = p.Value<bool?>("compact") ?? recursive`. With `recursive=True` and no `compact` argument the tool would return compact name, type and depth rows; through the wrapper it returns full serialized asset entries instead, which is larger, slower and not what the docstring describes. Set `compact=True` explicitly for graph walks. The `max_nodes` handling is the intended pattern: the wrapper omits the key when it is 0, so the C# default of 200 recursive and 2000 otherwise still applies.
 
-**`batch_set_field` forwards items raw, so routing and value encoding differ from the single tools.** Each item is passed through untouched, and the C# side picks `SetComponentProperty` whenever the item contains an `index` or `component_type` key at all. An item that carries the single tool's sentinel `"index": -1` is therefore routed to the component setter, which has no root fallback and no `$` connection path support, and fails where `set_ebx_field` would have succeeded. Values are also not JSON-decoded the way the single tools decode them, so quotes you add to protect a string survive into string-typed properties. The top-level `success` is true only when `failed_count` is zero, and the per-item rows carry only `name`, `path`, `success` and an optional `error`, so inspect `ok_count` and `results` after any partial failure.
+**`batch_set_field` forwards items raw, so routing and value encoding differ from the single tools.** Each item is passed through untouched, and the C# side picks `SetComponentProperty` whenever the item contains an `index` or `component_type` key at all. An item that carries the single tool's sentinel `"index": -1` is therefore routed to the component setter, which has no root fallback and no `$` connection path support, and fails where `set_ebx_field` would have succeeded. Values are also not JSON-decoded the way the single tools decode them, so quotes you add to protect a string survive into string-typed properties. The top-level `success` is true only when `failed_count` is zero, and the per-item rows carry only `name`, `path`, `success` and, on failure, `error` with `error_code`, so inspect `ok_count` and `results` after any partial failure.
 
 **Python-only aliases silently pick one argument and discard the other.** Several wrappers merge parameters before sending: `search_ebx` sends `query or name`, `list_network_registry` sends `registry or name`, `get_chunk_entry`, `export_chunk` and `import_chunk` send both `id` and `guid` cross-filled, `setup_lua` sends `lua_name or new_name` and `blueprint or host`, and `hash_string` falls back to `value` only when `text` is empty. If both arguments are supplied with different values, the C# side reads them in its own order, which is `query` before `name`, `registry` before `name`, and `id` before `guid`, so the first one wins with no warning. The reply echoes the name or id that was actually used; compare it against what you meant before trusting the result.
 
@@ -613,11 +763,13 @@ first three work.
 alone in `native_skipped`. Native membership cannot be removed at all (`NOT_EXPORTABLE`),
 because a `.fbmod` can only add memberships.
 
-**Four ways to copy.** `duplicate_component` copies one object inside an asset.
-`duplicate_ebx` copies one asset with fresh object GUIDs but shares linked resources unless
-`copy_linked` is set, and the reply flags `linked_assets_shared`. `duplicate_deep` runs
-DuplicationPlugin's per-type extension, which copies the RES and chunks too.
-`clipboard_paste_object` pastes a copied object graph into a different asset.
+**Four ways to copy.** `duplicate_component` copies one object inside an asset, numbering
+`ClientIndex`, `ServerIndex` and `InternalId` for it. `duplicate_ebx` copies one asset with
+a new file GUID and every exported object GUID renumbered, but shares linked resources
+unless `copy_linked` is set, and the reply flags `linked_assets_shared`. `duplicate_deep`
+runs DuplicationPlugin's per-type extension, which copies the RES and chunks too, and then
+renumbers the exported object GUIDs except on a NewWaveAsset. `clipboard_paste_object`
+pastes a copied object graph into a different asset.
 
 **Three ways to write a field.** `set_ebx_property` walks the root object by path and
 understands the `Components` and `Objects` aliases. `set_component_property` addresses one
@@ -647,10 +799,13 @@ members of one with counts and paging. `list_bundle_contents` lists members filt
 reports which of an asset's exported objects are missing. Registration is per object, so an
 asset's root and each of its components are separate entries.
 
-**Sound has four entry points.** `get_sound_info` is read-only. `export_sound_wav` and
-`import_sound_wav` handle PCM16 WAV only and never re-encode. `import_sound` re-encodes any
-file with SoundEditorPlugin's tool and rewrites the chunk, seek table and segment and
-variation tables.
+**Sound has four entry points.** `get_sound_info` is read-only. `import_sound_wav` writes
+Pcm16Big only and never re-encodes; `export_sound_wav` reads Pcm16Big from an old-style
+SoundWave and decodes a NewWaveAsset through vgmstream, so other encodings can come out.
+NewWave chunks with `IsSeekable=true` are not exportable (per-block frame headers hide the
+codec header; the error reply carries `is_seekable: true`).
+`import_sound` re-encodes any file with SoundEditorPlugin's tool and rewrites the chunk, seek
+table and segment and variation tables.
 
 **Export comes in four flavours.** `get_ebx_xml` and `get_ebx_yaml` return text you can
 read. `export_asset` writes a file through the editor's asset definition, whose format
@@ -693,8 +848,10 @@ with `asset` selects a non-root object and is validated. A successful add may ca
 - `limit: 0` returns no rows, which is the way to read only the totals.
 - Paired `*_count` (true) and `*_returned` (page length) fields mean the array was capped; a
   `truncated` boolean says whether more exist.
-- Scan tools (`validate_connections`, `get_sound_info`) report `scan_errors` instead of
-  treating a failed scan as "nothing there", and fail with `SCAN_INCOMPLETE`.
+- Scan tools report `scan_errors` instead of treating a failed scan as "nothing there".
+  `validate_connections` also fails with `SCAN_INCOMPLETE`; `get_sound_info` records
+  `scan_errors` and `scan_error_count` and still returns `success: true`, so read the count
+  yourself.
 - `get_type_info` returns `fields` only; there is no duplicate `properties` key.
 
 ## Bounded scans
@@ -727,6 +884,9 @@ is synthesised from `InternalId`, so it looks like
 - `InternalId` is reassigned when the asset reloads, so a synthesised GUID captured earlier
   can point at a different object later. Resolve it again from the current listing rather
   than storing it.
+- Objects made by `create_component`, `duplicate_component`, `create_ebx_class` and
+  `clipboard_paste_object` always end up internal, so their `class_guid` is this
+  synthesised form and its number is the `InternalId` the call assigned.
 
 ## Workflows
 
@@ -749,6 +909,7 @@ registry_gap(names=[dst])                      # expect missing_total: 0
 Add a component and wire it:
 ```
 create_component(name=A, type=DelayEntityData, at_index=0)
+get_component(name=A, class_guid=<from reply>, include_properties=true)  # ClientIndex/ServerIndex
 add_event_connection(name=A, source_guid=..., source_event=..., target_guid=..., target_event=...)
 validate_connections(name=A)
 ```
@@ -775,9 +936,11 @@ check_guid_invariants(query="mod/", max_scan=2000)
 - `open_project` and `new_project` refuse a dirty project; pass `save_first` or `discard`.
 - A failed `open_project` returns `ASSETS_LOST` with `assets_before` and `assets_after`: the
   editor unloads the current project before parsing the new file.
-- `export_mod` refuses an unmodified project unless `allow_empty`, builds into
-  `<path>.tmp` and moves it into place, and copies the icon and screenshots from ModSettings
-  unless `icon_path` is given.
+- `export_mod` refuses an unmodified project unless `allow_empty`, and refuses with
+  `INVALID_PARAMS` when the ModSettings `title`, `author`, `category` or `version` is empty or
+  contains a brace, so a project whose version was never set cannot be exported. It builds
+  into `<path>.tmp` and moves it into place, and copies the icon and screenshots from
+  ModSettings unless `icon_path` is given.
 - `get_mod_settings` / `set_mod_settings` read and write the mod metadata; the icon and up
   to four screenshots come from file paths.
 - ModSettings: `link` only reaches a `.fbmod` (`link_persists_to: "fbmod"`) and
@@ -792,7 +955,9 @@ Tools that need a plugin refuse with `PLUGIN_MISSING` when it is absent. Confirm
 - TexturePlugin: `export_texture`, `import_texture`, non-DDS image conversion.
 - MeshSetPlugin: `export_mesh`, `import_mesh`, `get_mesh_info`.
 - SvgImagePlugin: `export_svg`, `import_svg`.
-- SoundEditorPlugin: `import_sound`, `get_sound_info`, the WAV helpers.
+- SoundEditorPlugin: `import_sound`. `get_sound_info`, `export_sound_wav` and
+  `import_sound_wav` need no plugin; `export_sound_wav` only uses the plugin's decoder as an
+  optional accelerator for NewWaveAsset and reports `UNSUPPORTED_CODEC` without it.
 - AtlasTexturePlugin, IesResourcePlugin, DuplicationPlugin, LuaPlugin: their own tools.
 - PVZBundleManagerPlugin: `can_be_loaded_by_bundle`, `manage_bundles`, `create_asset`.
   `can_be_loaded_by_bundle` returns `degraded: true` with `can_be_loaded: null` when the

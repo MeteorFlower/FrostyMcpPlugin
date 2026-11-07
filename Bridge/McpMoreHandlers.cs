@@ -12,6 +12,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading.Tasks;
 using FrostySdk.Managers.Entries;
 
 namespace FrostyMcpPlugin.Bridge
@@ -396,6 +397,15 @@ namespace FrostyMcpPlugin.Bridge
             {
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
                 dynamic root = asset.RootObject;
+
+                // NewWaveAsset (BFN weapon sounds) has a flat Chunks list and no
+                // RuntimeVariations/Segments; one chunk holds one whole variation.
+                // Decode it through the plugin's bundled vgmstream, which handles the
+                // codecs these assets actually use (multistreamopus etc).
+                bool isNewWave = asset.RootObject.GetType().Name == "NewWaveAsset";
+                if (isNewWave)
+                    return ExportNewWaveWav(entry, asset, root, variationIndex, path);
+
                 if (variationIndex < 0 || variationIndex >= root.RuntimeVariations.Count)
                     return McpHandlers.Error("variation index out of range", "INVALID_PARAMS");
 
@@ -551,6 +561,13 @@ namespace FrostyMcpPlugin.Bridge
                 asset.Update();
                 App.AssetManager.ModifyEbx(entry.Name, asset);
 
+                // Replacing the samples leaves the template's bank key in the
+                // resource, so the new waveform still resolves to a bank the engine
+                // does not register. Patch it here rather than after the fact.
+                ResAssetEntry soundRes = App.AssetManager.GetResEntry(((string)root.Name).ToLowerInvariant());
+                Guid soundInstanceGuid = ((AssetClassGuid)((dynamic)asset.RootObject).GetInstanceGuid()).ExportedGuid;
+                int bankKeyPatched = McpSoundHandlers.PatchBankKey(soundRes, soundInstanceGuid);
+
                 return new Dictionary<string, object>
                 {
                     ["success"] = true,
@@ -560,6 +577,7 @@ namespace FrostyMcpPlugin.Bridge
                     ["channels"] = channels,
                     ["sample_rate"] = sampleRate,
                     ["bytes"] = pcm16Big.Length,
+                    ["bank_key_patched"] = bankKeyPatched,
                     ["note"] = "Replaced variation chunk as Pcm16Big; multi-segment shared chunks may need manual care"
                 };
             }
@@ -739,6 +757,8 @@ namespace FrostyMcpPlugin.Bridge
                 AppendIntList(newObject, "OutputRefProperties", p["output_ref_properties"] as JArray);
 
                 host.AddObject(newObject);
+                McpBlueprintHandlers.MakeCreatedObjectInternal(newObject);
+                McpBlueprintHandlers.AssignComponentIndices(host, newObject);
                 PointerRef pref = new PointerRef(newObject);
                 string arrayName = p.Value<string>("array") ?? "Objects";
                 bool added = TryAddPointer(host.RootObject, arrayName, pref);
@@ -864,6 +884,106 @@ namespace FrostyMcpPlugin.Bridge
                 writer.Write(frame | 0x40000000, Endian.Big);
                 return writer.ToByteArray();
             }
+        }
+
+        /// <summary>
+        /// NewWaveAsset holds one whole .sps blob per chunk. Decode it with the sound
+        /// plugin's bundled vgmstream, falling back to Pcm16Big when that codec is used.
+        /// </summary>
+        private static object ExportNewWaveWav(EbxAssetEntry entry, EbxAsset asset, dynamic root, int chunkIndex, string path)
+        {
+            IList chunks = (IList)root.Chunks;
+            if (chunkIndex < 0 || chunkIndex >= chunks.Count)
+                return McpHandlers.Error("chunk index out of range (0.." + (chunks.Count - 1) + ")", "INVALID_PARAMS");
+
+            dynamic soundDataChunk = chunks[chunkIndex];
+            Guid chunkId = (Guid)soundDataChunk.ChunkId;
+            ChunkAssetEntry chunkEntry = App.AssetManager.GetChunkEntry(chunkId);
+            if (chunkEntry == null)
+                return McpHandlers.Error("Chunk referenced by the sound asset was not found", "NOT_FOUND");
+
+            byte[] bytes;
+            using (NativeReader reader = new NativeReader(App.AssetManager.GetChunk(chunkEntry)))
+                bytes = reader.ReadToEnd();
+
+            // Seekable waves interleave per-block frame headers with the audio
+            // payload, so the codec byte at offset 4 is not the real codec.
+            bool isSeekable = false;
+            try { isSeekable = (bool)root.IsSeekable; } catch { }
+
+            if (bytes == null || bytes.Length < 12)
+                return McpHandlers.Error("chunk is too small to hold a sound header", "EXPORT_FAILED");
+
+            // Header: [blockType u16][blockSize u16 BE][codec u8][channels u8][rate u16 BE][samples u32 BE]
+            int codec = bytes[4];
+            int channels = (bytes[5] >> 2) + 1;
+            int sampleRate = (bytes[6] << 8) | bytes[7];
+
+            short[] samples = null;
+            string decoder = null;
+
+            Type vgmType = FindType("SoundEditorPlugin.Helpers.VgmStreamHelper");
+            if (vgmType != null)
+            {
+                try
+                {
+                    object inst = vgmType.GetProperty("Instance",
+                        BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)?.GetValue(null);
+                    MethodInfo decode = vgmType.GetMethod("Decode", new[] { typeof(byte[]) });
+                    if (inst != null && decode != null)
+                    {
+                        object taskObject = decode.Invoke(inst, new object[] { bytes });
+                        if (taskObject is Task task)
+                        {
+                            task.GetAwaiter().GetResult();
+                            samples = taskObject.GetType().GetProperty("Result")?.GetValue(taskObject) as short[];
+                            if (samples != null) decoder = "vgmstream";
+                        }
+                    }
+                }
+                catch
+                {
+                    samples = null;
+                }
+            }
+
+            if (samples == null && codec == 2)
+            {
+                samples = DecodePcm16Big(bytes, out channels, out sampleRate);
+                if (samples != null) decoder = "Pcm16Big";
+            }
+
+            if (samples == null)
+            {
+                Dictionary<string, object> failure = McpHandlers.Error(
+                    isSeekable
+                        ? "Seekable NewWave chunk: per-block frame headers hide the codec header and the bundled vgmstream cannot decode it; export is not supported for IsSeekable=true waves"
+                        : "No decoder available for codec 0x" + codec.ToString("X2") +
+                          " (sound plugin's vgmstream failed to decode this chunk)",
+                    "UNSUPPORTED_CODEC");
+                failure["is_seekable"] = isSeekable;
+                failure["codec_byte_at_4"] = "0x" + codec.ToString("X2");
+                return failure;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
+            WriteWavFile(path, samples, channels, sampleRate);
+
+            return new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["name"] = entry.Name,
+                ["path"] = Path.GetFullPath(path),
+                ["chunk"] = chunkIndex,
+                ["chunk_id"] = chunkId.ToString(),
+                ["codec"] = "0x" + codec.ToString("X2"),
+                ["decoder"] = decoder,
+                ["is_seekable"] = isSeekable,
+                ["channels"] = channels,
+                ["sample_rate"] = sampleRate,
+                ["samples"] = samples.Length / Math.Max(1, channels),
+                ["size"] = new FileInfo(path).Length
+            };
         }
 
         private static void WriteWavFile(string path, short[] interleaved, int channels, int sampleRate)

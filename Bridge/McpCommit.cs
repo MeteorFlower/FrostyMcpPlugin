@@ -8,6 +8,11 @@ namespace FrostyMcpPlugin.Bridge
     /// Two-phase gate for destructive tools. The first call stores the resolved plan
     /// and returns would_change; only the immediately following call of the same tool
     /// with deep-equal parameters (ignoring the commit flag) executes the stored plan.
+    ///
+    /// Pending plans are kept per connection. A single shared slot meant any other
+    /// client calling any tool between a preview and its commit discarded the plan,
+    /// so a second client (a subagent's MCP server, for instance) made commits fail
+    /// with "No matching preview" at random.
     /// </summary>
     internal static class McpCommit
     {
@@ -21,30 +26,55 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         private static readonly object s_lock = new object();
-        private static Pending s_pending;
-        private static long s_callCounter;
+        private static readonly Dictionary<long, Pending> s_pending = new Dictionary<long, Pending>();
+        private static readonly Dictionary<long, long> s_callCounters = new Dictionary<long, long>();
         private static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(10);
+
+        // HandleClient serves a connection start to finish on one thread, so the
+        // connection id can ride along as thread state instead of being threaded
+        // through every handler signature.
+        [ThreadStatic] private static long t_connection;
+
+        /// <summary>Called once when a client connects.</summary>
+        internal static void EnterConnection(long connection)
+        {
+            t_connection = connection;
+        }
+
+        /// <summary>Called when a client disconnects; drops only that connection's plan.</summary>
+        internal static void ExitConnection()
+        {
+            ClearPending(t_connection);
+        }
+
+        private static long CurrentConnection => t_connection;
 
         /// <summary>Called once per tool request before dispatch.</summary>
         internal static long BeginCall(string tool)
         {
+            long connection = CurrentConnection;
             lock (s_lock)
             {
-                long call = ++s_callCounter;
-                if (s_pending != null &&
-                    (call != s_pending.PreviewCall + 1 ||
-                     !string.Equals(tool, s_pending.Tool, StringComparison.Ordinal) ||
-                     DateTime.UtcNow > s_pending.ExpiresUtc))
-                    s_pending = null;
+                long call = s_callCounters.TryGetValue(connection, out long previous) ? previous + 1 : 1;
+                s_callCounters[connection] = call;
+
+                // The plan is only valid for the immediately following call on the
+                // same connection; anything else means the caller moved on.
+                if (s_pending.TryGetValue(connection, out Pending pending) &&
+                    (call != pending.PreviewCall + 1 || DateTime.UtcNow > pending.ExpiresUtc))
+                    s_pending.Remove(connection);
+
                 return call;
             }
         }
 
-        /// <summary>Called when a client disconnects; a plan cannot span connections.</summary>
-        internal static void ClearPending()
+        private static void ClearPending(long connection)
         {
             lock (s_lock)
-                s_pending = null;
+            {
+                s_pending.Remove(connection);
+                s_callCounters.Remove(connection);
+            }
         }
 
         /// <summary>
@@ -54,18 +84,19 @@ namespace FrostyMcpPlugin.Bridge
         /// </summary>
         internal static object Require(string tool, JObject p, Dictionary<string, object> plan, Func<object> execute)
         {
+            long connection = CurrentConnection;
             JObject normalized = Normalize(p);
 
             if (!(p.Value<bool?>("commit") ?? false))
             {
                 lock (s_lock)
                 {
-                    s_pending = new Pending
+                    s_pending[connection] = new Pending
                     {
                         Tool = tool,
                         Parameters = normalized,
                         Execute = execute,
-                        PreviewCall = s_callCounter,
+                        PreviewCall = s_callCounters.TryGetValue(connection, out long preview) ? preview : 0,
                         ExpiresUtc = DateTime.UtcNow + Lifetime
                     };
                 }
@@ -88,12 +119,12 @@ namespace FrostyMcpPlugin.Bridge
             Func<object> pendingExecute = null;
             lock (s_lock)
             {
-                if (s_pending != null &&
-                    string.Equals(s_pending.Tool, tool, StringComparison.Ordinal) &&
-                    JToken.DeepEquals(s_pending.Parameters, normalized))
+                if (s_pending.TryGetValue(connection, out Pending pending) &&
+                    string.Equals(pending.Tool, tool, StringComparison.Ordinal) &&
+                    JToken.DeepEquals(pending.Parameters, normalized))
                 {
-                    pendingExecute = s_pending.Execute;
-                    s_pending = null;
+                    pendingExecute = pending.Execute;
+                    s_pending.Remove(connection);
                 }
             }
 

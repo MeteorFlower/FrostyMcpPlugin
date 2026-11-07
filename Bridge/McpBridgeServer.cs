@@ -30,7 +30,7 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        public const string Version = "2.2.3";
+        public const string Version = "2.3.14";
         public const int MaxRequestBytes = 32 * 1024 * 1024;
 
         public static McpBridgeServer Instance { get; } = new McpBridgeServer();
@@ -111,8 +111,8 @@ namespace FrostyMcpPlugin.Bridge
                     if (token.IsCancellationRequested || !pipe.IsConnected)
                         continue;
 
-                    Interlocked.Increment(ref _clientsServed);
-                    HandleClient(pipe, token);
+                    long connectionId = Interlocked.Increment(ref _clientsServed);
+                    HandleClient(pipe, token, connectionId);
                 }
                 catch (OperationCanceledException)
                 {
@@ -129,8 +129,11 @@ namespace FrostyMcpPlugin.Bridge
             }
         }
 
-        private void HandleClient(NamedPipeServerStream pipe, CancellationToken token)
+        private void HandleClient(NamedPipeServerStream pipe, CancellationToken token, long connectionId)
         {
+            // Pending two-phase plans belong to the connection that made them, so a
+            // second client cannot invalidate them and a disconnect cannot wipe them.
+            McpCommit.EnterConnection(connectionId);
             try
             {
             while (!token.IsCancellationRequested && pipe.IsConnected)
@@ -159,7 +162,7 @@ namespace FrostyMcpPlugin.Bridge
             }
             finally
             {
-                McpCommit.ClearPending();
+                McpCommit.ExitConnection();
             }
         }
 

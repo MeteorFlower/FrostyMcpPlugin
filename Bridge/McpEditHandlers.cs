@@ -1,6 +1,7 @@
 ﻿using Frosty.Core;
 using Frosty.Core.Viewport;
 using FrostySdk;
+using FrostySdk.Attributes;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
 using FrostySdk.Managers;
@@ -279,6 +280,28 @@ namespace FrostyMcpPlugin.Bridge
             if (App.AssetManager.GetEbxEntry(newName) != null)
                 return McpHandlers.Error("Target name already exists", "ALREADY_EXISTS");
 
+            // An asset that owns a resource cannot be copied this way. The copy gets
+            // fresh object GUIDs while the resource still belongs to the source, so the
+            // export carries a resource whose meta, and for a sound its bank key, point
+            // at the wrong asset. duplicate_deep runs the duplication extension, which
+            // copies the resource and the chunks along with the asset.
+            bool ownsResource = App.AssetManager.GetResEntry(entry.Name.ToLowerInvariant()) != null;
+            if (!ownsResource)
+            {
+                foreach (AssetEntry linked in entry.LinkedAssets)
+                {
+                    if (linked is ResAssetEntry)
+                    {
+                        ownsResource = true;
+                        break;
+                    }
+                }
+            }
+            if (ownsResource)
+                return McpHandlers.Error(
+                    "Source owns a resource; use duplicate_deep so the resource is copied too",
+                    "HAS_LINKED_RES");
+
             try
             {
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
@@ -452,24 +475,57 @@ namespace FrostyMcpPlugin.Bridge
             if (entry == null)
                 return McpHandlers.Error("Asset not found", "NOT_FOUND");
 
+            // Localized strings live in a layer Frosty's EBX revert does not touch.
+            // Reverting their owning asset alone leaves the edited strings behind
+            // while list_modified_assets stops reporting the asset, so refuse unless
+            // the caller asks to revert both layers together.
+            bool revertStrings = p.Value<bool?>("revert_strings") ?? false;
+            bool ownsLocalizedStrings = false;
+            int modifiedStrings = 0;
+            EbxAssetEntry ebxEntry = entry as EbxAssetEntry;
+            if (kind == "ebx" && ebxEntry != null &&
+                McpExtraHandlers.TryGetLocalizationDatabaseAsset(out Guid localizationGuid, out _) &&
+                ebxEntry.Guid == localizationGuid)
+            {
+                ownsLocalizedStrings = true;
+                modifiedStrings = McpExtraHandlers.CountModifiedLocalizedStrings();
+                if (modifiedStrings > 0 && !revertStrings)
+                    return McpHandlers.Error(
+                        "This asset owns " + modifiedStrings + " edited localized string(s); reverting the EBX alone would leave the string layer edited. Pass revert_strings=true to revert both.",
+                        "LOCALIZED_STRINGS_PENDING");
+            }
+
+            int revertedStrings = 0;
             var plan = new Dictionary<string, object>
             {
                 ["asset"] = entry.Name,
                 ["kind"] = kind,
                 ["data_only"] = dataOnly,
-                ["is_dirty"] = entry.IsDirty
+                ["is_dirty"] = entry.IsDirty,
+                ["localized_strings"] = ownsLocalizedStrings ? modifiedStrings : 0,
+                ["revert_strings"] = revertStrings
             };
 
             return McpCommit.Require("revert_asset", p, plan, () =>
             {
                 try
                 {
+                    if (ownsLocalizedStrings && revertStrings && modifiedStrings > 0)
+                    {
+                        ILocalizedStringDatabase db = LocalizedStringDatabase.Current;
+                        List<uint> edited = db.EnumerateModifiedStrings().ToList();
+                        foreach (uint stringId in edited)
+                            db.RevertString(stringId);
+                        revertedStrings = edited.Count;
+                    }
+
                     App.AssetManager.RevertAsset(entry, dataOnly);
                     return new Dictionary<string, object>
                     {
                         ["success"] = true,
                         ["asset"] = McpHandlers.SerializeAssetEntry(entry),
-                        ["data_only"] = dataOnly
+                        ["data_only"] = dataOnly,
+                        ["localized_strings_reverted"] = revertedStrings
                     };
                 }
                 catch (Exception ex)
@@ -623,8 +679,11 @@ namespace FrostyMcpPlugin.Bridge
         private static byte[] BuildResMeta(ResAssetEntry entry)
         {
             byte[] meta = new byte[16];
-            if (entry.ResMeta != null)
-                Array.Copy(entry.ResMeta, meta, Math.Min(16, entry.ResMeta.Length));
+            // The mod writer prefers the modified meta, so exporting the original one
+            // hides exactly the value that ships in the .fbmod.
+            byte[] source = entry.ModifiedEntry?.ResMeta ?? entry.ResMeta;
+            if (source != null)
+                Array.Copy(source, meta, Math.Min(16, source.Length));
             return meta;
         }
 
@@ -1047,6 +1106,28 @@ namespace FrostyMcpPlugin.Bridge
             bool nonRenderable = p.Value<bool?>("export_non_renderable")
                 ?? Config.Get<bool>("MeshSetExportNonRenderable", false, ConfigScope.Game);
 
+            // MeshSetPlugin's FBXExporter only understands MeshSet assets. A
+            // RigidMeshAsset reaches it with no MeshSet and throws a bare null
+            // reference that names no asset; report the type up front instead.
+            try
+            {
+                string rootTypeName = App.AssetManager.GetEbx(entry).RootObject.GetType().Name;
+                if (rootTypeName == "RigidMeshAsset")
+                {
+                    return new Dictionary<string, object>
+                    {
+                        ["success"] = false,
+                        ["error"] = "export_mesh supports MeshSet assets only; '" + entry.Name + "' is a RigidMeshAsset and MeshSetPlugin's FBXExporter cannot export it",
+                        ["error_code"] = "UNSUPPORTED_ASSET_TYPE",
+                        ["asset_type"] = rootTypeName
+                    };
+                }
+            }
+            catch
+            {
+                // Let the normal export path report any load failure.
+            }
+
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
@@ -1061,7 +1142,19 @@ namespace FrostyMcpPlugin.Bridge
             }
             catch (Exception ex)
             {
-                return McpHandlers.Error(ex.Message, "EXPORT_FAILED");
+                // The exporter wraps the real failure in one or more inner
+                // exceptions, and reporting only the outer message left "every mesh
+                // fails" with no cause anywhere in the reply.
+                Exception root = ex;
+                while (root.InnerException != null)
+                    root = root.InnerException;
+                return new Dictionary<string, object>
+                {
+                    ["success"] = false,
+                    ["error"] = root.Message,
+                    ["detail"] = ex.ToString(),
+                    ["error_code"] = "EXPORT_FAILED"
+                };
             }
         }
 
@@ -1146,11 +1239,56 @@ namespace FrostyMcpPlugin.Bridge
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             int limit = McpHandlers.ClampLimit(p.Value<int?>("limit") ?? 100);
 
+            // The dependency graph answers "whose bytes mention this guid", which
+            // also covers guids parked in data arrays such as an exclusion or
+            // whitelist. For "who actually points at this object" the pointer
+            // sweep is the right answer, and it reports the field path.
+            string mode = (p.Value<string>("mode") ?? "").Trim().ToLowerInvariant();
+            if (mode == "pointer")
+            {
+                JObject pointerArgs = new JObject
+                {
+                    ["file_guid"] = entry.Guid.ToString(),
+                    ["limit"] = limit,
+                    ["offset"] = offset
+                };
+                foreach (string key in new[] { "class_guid", "query", "max_scan" })
+                {
+                    if (p[key] != null)
+                        pointerArgs[key] = p[key];
+                }
+                return McpRefHandlers.FindPointerReferences(pointerArgs);
+            }
+
             List<object> refs = new List<object>();
+            HashSet<Guid> covered = new HashSet<Guid>();
             foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
             {
                 if (e.ContainsDependency(entry.Guid))
+                {
                     refs.Add(McpHandlers.SerializeEbxEntry(e));
+                    covered.Add(e.Guid);
+                }
+            }
+
+            // The dependency graph is built from saved bytes, so a reference added to a
+            // modified asset during this session is missing from it. Sweep the modified
+            // assets only and union whatever the graph did not report.
+            int recoveredFromModified = 0;
+            foreach (EbxAssetEntry e in App.AssetManager.EnumerateEbx())
+            {
+                if (!e.IsModified || e.Guid == entry.Guid || covered.Contains(e.Guid))
+                    continue;
+
+                EbxAsset modified;
+                try { modified = App.AssetManager.GetEbx(e); }
+                catch { continue; }
+                if (modified == null || !McpRefHandlers.HasExternalPointerTo(modified, entry.Guid))
+                    continue;
+
+                refs.Add(McpHandlers.SerializeEbxEntry(e));
+                covered.Add(e.Guid);
+                recoveredFromModified++;
             }
 
             List<object> page = refs.Skip(offset).Take(limit).ToList();
@@ -1158,10 +1296,15 @@ namespace FrostyMcpPlugin.Bridge
             {
                 ["success"] = true,
                 ["target"] = McpHandlers.SerializeEbxEntry(entry),
+                ["mode"] = "dependency",
+                ["note"] = "dependency hits mean the guid appears somewhere in the asset's bytes, "
+                    + "including enumerations such as AIBuffRestrictorData.ExcludedAI; "
+                    + "use mode=pointer to get the field path of real pointer references",
                 ["total"] = refs.Count,
                 ["offset"] = offset,
                 ["limit"] = limit,
                 ["returned"] = page.Count,
+                ["recovered_from_modified"] = recoveredFromModified,
                 ["references"] = page
             };
         }
@@ -1406,6 +1549,54 @@ namespace FrostyMcpPlugin.Bridge
             return name;
         }
 
+        /// <summary>
+        /// True when the type is one of the EBX-generated data types, recognised
+        /// by the field metadata attribute its members carry.
+        /// </summary>
+        private static bool IsEbxDataType(Type type)
+        {
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
+            foreach (PropertyInfo pi in type.GetProperties(flags))
+                if (pi.GetCustomAttribute<EbxFieldMetaAttribute>() != null)
+                    return true;
+            foreach (FieldInfo fi in type.GetFields(flags))
+                if (fi.GetCustomAttribute<EbxFieldMetaAttribute>() != null)
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Refuses a name the target type cannot write. Without this an unknown
+        /// key is dropped and the field is overwritten with a default instance,
+        /// while the call still reports success.
+        /// </summary>
+        private static void EnsureMembersWritable(Type type, JObject obj, string where)
+        {
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
+            List<string> unknown = new List<string>();
+            foreach (JProperty prop in obj.Properties())
+            {
+                string name = AliasMemberName(type, prop.Name);
+                PropertyInfo pi = type.GetProperty(name, flags);
+                if (pi != null && pi.CanWrite)
+                    continue;
+                if (pi == null && type.GetField(name, flags) == null)
+                    unknown.Add(prop.Name);
+                else if (pi != null)
+                    unknown.Add(prop.Name + " (read-only)");
+            }
+            if (unknown.Count == 0)
+                return;
+
+            List<string> writable = new List<string>();
+            foreach (PropertyInfo pi in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                if (pi.CanWrite)
+                    writable.Add(pi.Name);
+            throw new InvalidOperationException(
+                "UNKNOWN_MEMBER: " + where + " has no field '" + string.Join("', '", unknown) +
+                "'. Writable fields: " + string.Join(", ", writable));
+        }
+
         private static object GetMember(object obj, string name)
         {
             Type type = obj.GetType();
@@ -1486,15 +1677,32 @@ namespace FrostyMcpPlugin.Bridge
             if (underlying == typeof(string))
                 return token.Type == JTokenType.String ? token.Value<string>() : token.ToString();
 
-            // Structs with x/y/z fields (Vec2/Vec3/LinearTransform pieces)
-            if (token is JObject jobj && underlying.IsValueType)
+            // A list of pointers must be built element by element. The default
+            // Newtonsoft conversion turns every JObject element into a default
+            // PointerRef, so a List<PointerRef> silently becomes a run of null
+            // pointers while the call still reports success. ConvertToken in
+            // McpBlueprintHandlers has the same branch; the two converters were
+            // written separately and only one of them had it.
+            if (token is JArray jarr && typeof(IList).IsAssignableFrom(targetType))
             {
+                Type elemType = targetType.IsGenericType
+                    ? targetType.GetGenericArguments()[0]
+                    : typeof(object);
+                IList built = targetType.IsGenericType
+                    ? (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elemType))
+                    : (IList)new ArrayList();
+                foreach (JToken item in jarr)
+                    built.Add(ConvertTo(item, elemType));
+                return built;
+            }
+
+            // Structs with x/y/z fields (Vec2/Vec3/LinearTransform pieces)
+            if (token is JObject jobj && (underlying.IsValueType || IsEbxDataType(underlying)))
+            {
+                EnsureMembersWritable(underlying, jobj, underlying.Name);
                 object inst = Activator.CreateInstance(underlying);
                 foreach (JProperty prop in jobj.Properties())
-                {
-                    try { SetMember(inst, prop.Name, prop.Value); }
-                    catch { /* skip unknown */ }
-                }
+                    SetMember(inst, prop.Name, prop.Value);
                 return inst;
             }
 
