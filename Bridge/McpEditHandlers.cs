@@ -1821,7 +1821,9 @@ namespace FrostyMcpPlugin.Bridge
                 return new Dictionary<string, object>
                 {
                     ["boxed_type"] = boxed.Type.ToString(),
-                    ["array_type"] = boxed.ArrayType.ToString(),
+                    // Stock 1.0.6.3's BoxedValueRef has no ArrayType member; keep
+                    // this optional so the same source builds against both trees.
+                    ["array_type"] = boxed.GetType().GetProperty("ArrayType")?.GetValue(boxed)?.ToString(),
                     ["value"] = SerializeValue(boxed.Value)
                 };
             }
