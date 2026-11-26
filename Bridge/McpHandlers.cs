@@ -231,6 +231,7 @@ namespace FrostyMcpPlugin.Bridge
                 if (asset == null)
                     return Error("Failed to load EBX data", "LOAD_FAILED");
 
+                int expectedObjects = asset.Objects.Count();
                 string text;
                 using (MemoryStream ms = new MemoryStream())
                 {
@@ -252,6 +253,34 @@ namespace FrostyMcpPlugin.Bridge
                             writer.WriteObjects(asset.Objects);
                     }
                     text = Encoding.UTF8.GetString(ms.ToArray());
+                }
+
+                // Root-level YAML entries are written as "  Type <guid> :". If the
+                // lazy object table was not fully populated on the first pass, the
+                // old code silently returned a short document. Warm the graph with
+                // an XML pass and retry once; if it still disagrees, say so.
+                int yamlObjects = -1;
+                bool yamlMismatch = false;
+                if (!xml)
+                {
+                    Func<string, int> countYamlObjects = s =>
+                        Regex.Matches(s, @"(?m)^  [A-Za-z_][A-Za-z0-9_]* <[0-9a-fA-F-]+> :").Count;
+                    yamlObjects = countYamlObjects(text);
+                    yamlMismatch = yamlObjects < expectedObjects;
+                    if (yamlMismatch)
+                    {
+                        using (MemoryStream warm = new MemoryStream())
+                        using (EbxXmlWriter warmWriter = new EbxXmlWriter(asset, warm, App.AssetManager, 2, false))
+                            warmWriter.WriteObjects();
+                        using (MemoryStream retry = new MemoryStream())
+                        {
+                            using (EbxYamlWriter writer = new EbxYamlWriter(retry, App.AssetManager))
+                                writer.WriteObjects(asset.Objects);
+                            text = Encoding.UTF8.GetString(retry.ToArray());
+                        }
+                        yamlObjects = countYamlObjects(text);
+                        yamlMismatch = yamlObjects < expectedObjects;
+                    }
                 }
 
                 if (summary)
@@ -322,6 +351,11 @@ namespace FrostyMcpPlugin.Bridge
                         ["type"] = entry.Type,
                         ["guid"] = entry.Guid.ToString(),
                         ["format"] = xml ? "xml" : "yaml",
+                        ["object_count_expected"] = expectedObjects,
+                        ["yaml_object_count"] = yamlObjects,
+                        ["warning"] = yamlMismatch
+                            ? "YAML_OBJECT_COUNT_MISMATCH: wrote " + yamlObjects + " root objects, asset table has " + expectedObjects + "; some objects may still be missing."
+                            : null,
                         ["filter"] = filter,
                         ["filter_context"] = filterContext,
                         // Matching lines only. Counting the context lines as matches
@@ -353,6 +387,11 @@ namespace FrostyMcpPlugin.Bridge
                     ["type"] = entry.Type,
                     ["guid"] = entry.Guid.ToString(),
                     ["format"] = xml ? "xml" : "yaml",
+                    ["object_count_expected"] = expectedObjects,
+                    ["yaml_object_count"] = yamlObjects,
+                    ["warning"] = yamlMismatch
+                        ? "YAML_OBJECT_COUNT_MISMATCH: wrote " + yamlObjects + " root objects, asset table has " + expectedObjects + "; some objects may still be missing."
+                        : null,
                     ["truncated"] = truncated,
                     ["char_offset"] = charOffset,
                     ["next_offset"] = truncated ? charOffset + maxChars : -1,
