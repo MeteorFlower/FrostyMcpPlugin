@@ -270,9 +270,7 @@ namespace FrostyMcpPlugin.Bridge
                     yamlMismatch = yamlObjects < expectedObjects;
                     if (yamlMismatch)
                     {
-                        using (MemoryStream warm = new MemoryStream())
-                        using (EbxXmlWriter warmWriter = new EbxXmlWriter(asset, warm, App.AssetManager, 2, false))
-                            warmWriter.WriteObjects();
+                        WarmXmlObjectGraph(asset);
                         using (MemoryStream retry = new MemoryStream())
                         {
                             using (EbxYamlWriter writer = new EbxYamlWriter(retry, App.AssetManager))
@@ -404,6 +402,44 @@ namespace FrostyMcpPlugin.Bridge
             catch (Exception ex)
             {
                 return Error(ex.Message, "EXPORT_FAILED");
+            }
+        }
+
+        // 1.0.7.0's EbxXmlWriter takes (asset, stream, am, tab, offsets) and
+        // WriteObjects() has no arguments; stock 1.0.6.3 takes (stream, am) and
+        // WriteObjects(IEnumerable<object>). Invoke whichever exists so the same
+        // source builds against both trees.
+        private static void WarmXmlObjectGraph(EbxAsset asset)
+        {
+            using (MemoryStream warm = new MemoryStream())
+            {
+                object writer = null;
+                try
+                {
+                    Type writerType = typeof(EbxXmlWriter);
+                    var five = writerType.GetConstructor(new[]
+                    {
+                        typeof(EbxAsset), typeof(Stream), typeof(AssetManager), typeof(int), typeof(bool)
+                    });
+                    if (five != null)
+                    {
+                        writer = five.Invoke(new object[] { asset, warm, App.AssetManager, 2, false });
+                        writerType.GetMethod("WriteObjects", Type.EmptyTypes)?.Invoke(writer, null);
+                    }
+                    else
+                    {
+                        var two = writerType.GetConstructor(new[] { typeof(Stream), typeof(AssetManager) });
+                        if (two == null)
+                            return;
+                        writer = two.Invoke(new object[] { warm, App.AssetManager });
+                        writerType.GetMethod("WriteObjects", new[] { typeof(IEnumerable<object>) })
+                            ?.Invoke(writer, new object[] { asset.Objects });
+                    }
+                }
+                finally
+                {
+                    (writer as IDisposable)?.Dispose();
+                }
             }
         }
 
