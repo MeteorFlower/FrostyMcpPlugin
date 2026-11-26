@@ -2831,9 +2831,11 @@ namespace FrostyMcpPlugin.Bridge
         {
             if (pref.Type == PointerRefType.External)
             {
-                EbxAssetEntry e = App.AssetManager?.GetEbxEntry(pref.External.FileGuid);
-                if (e != null)
-                    return e.Name + " [" + pref.External.FileGuid + "]";
+                // Do not resolve the asset name here. On GW1 a connection list can
+                // contain hundreds of external pointers, and GetEbxEntry on an
+                // unresolved/cyclic one pinned the bridge thread. Compact listings
+                // only need the file GUID; callers that need the name use
+                // compact=false, which goes through SerializePointerRef.
                 return "External [" + pref.External.FileGuid + "]";
             }
             if (pref.Type == PointerRefType.Internal && pref.Internal != null)
