@@ -103,8 +103,10 @@
     <Compile Include="Bridge\McpRefHandlers.cs" />
     <Compile Include="Bridge\PipeProfiles.g.cs" />
     <Compile Include="Bridge\McpTypeExplorerHandlers.cs" />
+    <Compile Include="Bridge\McpLog.cs" />
     <Compile Include="Extensions\McpStartupAction.cs" />
     <Compile Include="Extensions\McpStatusMenuExtension.cs" />
+    <Compile Include="Extensions\McpToolLogMenuExtension.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
