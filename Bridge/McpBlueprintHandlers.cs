@@ -9,6 +9,7 @@ using Newtonsoft.Json.Linq;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using FrostySdk.Managers.Entries;
@@ -32,6 +33,38 @@ namespace FrostyMcpPlugin.Bridge
         private const uint ServerLinkFlag = 0x40000000u;
         private const uint UnusedFlag = 0x80000000u;
 
+        // A malformed/self-referential object graph must not take the editor's
+        // only bridge thread down for minutes. Both search paths check this
+        // budget between nodes and return partial data with scan_truncated=true.
+        private sealed class ScanBudget
+        {
+            private readonly Stopwatch _watch = Stopwatch.StartNew();
+            private readonly int _milliseconds;
+            private readonly int _maxNodes;
+            internal int Nodes;
+            internal bool Expired;
+
+            internal ScanBudget(int milliseconds, int maxNodes)
+            {
+                _milliseconds = milliseconds < 1000 ? 1000 : milliseconds;
+                _maxNodes = maxNodes < 1 ? int.MaxValue : maxNodes;
+            }
+
+            internal bool Stop()
+            {
+                if (Expired)
+                    return true;
+                if (_watch.ElapsedMilliseconds >= _milliseconds || Nodes >= _maxNodes)
+                    Expired = true;
+                return Expired;
+            }
+
+            internal void Node()
+            {
+                Nodes++;
+            }
+        }
+
         // =====================================================================
         // Connections: list / add / update / remove
         // =====================================================================
@@ -48,14 +81,19 @@ namespace FrostyMcpPlugin.Bridge
             bool compact = p.Value<bool?>("compact") ?? true;
             string componentGuid = (p.Value<string>("component_guid") ?? "").Trim();
             string textFilter = (p.Value<string>("filter") ?? "").Trim();
+            int scanMs = p.Value<int?>("max_scan_ms") ?? 20000;
+            if (scanMs < 1000) scanMs = 1000;
+            if (scanMs > 60000) scanMs = 60000;
+            ScanBudget budget = new ScanBudget(scanMs, int.MaxValue);
 
             List<object> items = new List<object>();
-            if (kind == "all" || kind == "property")
-                AppendPropertyConnections(root, items, compact);
-            if (kind == "all" || kind == "event")
-                AppendEventConnections(root, items, compact);
-            if (kind == "all" || kind == "link")
-                AppendLinkConnections(root, items, compact);
+            int scanErrors = 0;
+            if ((kind == "all" || kind == "property") && !budget.Expired)
+                scanErrors += AppendPropertyConnections(root, items, compact, budget);
+            if ((kind == "all" || kind == "event") && !budget.Expired)
+                scanErrors += AppendEventConnections(root, items, compact, budget);
+            if ((kind == "all" || kind == "link") && !budget.Expired)
+                scanErrors += AppendLinkConnections(root, items, compact, budget);
 
             if (!string.IsNullOrEmpty(componentGuid) || !string.IsNullOrEmpty(textFilter))
             {
@@ -72,6 +110,15 @@ namespace FrostyMcpPlugin.Bridge
                 ["limit"] = limit,
                 ["returned"] = page.Count,
                 ["compact"] = compact,
+                // A connection that fails to serialize must not silently truncate
+                // the list: the item is kept as a placeholder and counted here.
+                ["scan_errors"] = scanErrors,
+                ["scan_truncated"] = budget.Expired,
+                ["note"] = budget.Expired
+                    ? "SCAN INCOMPLETE: the scan budget (" + scanMs + " ms) expired; only the connections serialized before the deadline are listed."
+                    : scanErrors > 0
+                        ? "SCAN INCOMPLETE: " + scanErrors + " connection(s) failed to serialize and are reported as placeholder items; the list may be missing data."
+                        : null,
                 ["connections"] = page
             };
         }
@@ -361,14 +408,20 @@ namespace FrostyMcpPlugin.Bridge
                 return McpCommit.Require("remove_connection", p, plan, () =>
                 {
                     object removed = list[index];
-                    list.RemoveAt(index);
+                    if (removed == null)
+                        return McpHandlers.Error("Connection at index " + index + " is null; nothing was removed", "REMOVE_FAILED");
+                    int before = list.Count;
                     try
                     {
+                        list.RemoveAt(index);
+                        if (list.Count != before - 1)
+                            return McpHandlers.Error("Connection was not removed (count stayed " + list.Count + ")", "REMOVE_FAILED");
                         SaveAsset(entry, asset);
                     }
                     catch (Exception ex)
                     {
-                        list.Insert(index, removed);
+                        if (list.Count == before - 1)
+                            list.Insert(index, removed);
                         // Surface the inner exception: the outer one is always the
                         // same bare null reference and names no object, which made
                         // this failure impossible to diagnose from the tool result.
@@ -553,6 +606,18 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 PointerRef pref = new PointerRef(newObject);
 
+                // A SoundGraph node that carries plugin refs needs a new voice and
+                // plugin instances; this writer cannot create those, and silently
+                // appending the node made it share another voice's plugins at
+                // runtime. Refuse before the node enters any array.
+                if (IsSoundPatchAsset(asset) && HasValidSoundGraphPluginRefs(newObject))
+                {
+                    asset.RemoveObject(newObject);
+                    return McpHandlers.Error(
+                        "SoundGraph node '" + newObject.GetType().Name + "' carries SoundGraphPluginRef members; creating it without a matching voice/plugin registration would share another voice's plugins at runtime. Create it in the Frosty GUI, or extend the tool to copy the voice/plugin tables.",
+                        "SOUNDGRAPH_VOICE_UNREGISTERED");
+                }
+
                 // Target array lives on the root object unless a host component is named
                 object arrayHost = asset.RootObject;
                 string hostGuidStr = p.Value<string>("array_host_guid") ?? p.Value<string>("array_host");
@@ -565,8 +630,23 @@ namespace FrostyMcpPlugin.Bridge
                         return McpHandlers.Error("array_host_guid not found in asset: " + hostGuidStr, "NOT_FOUND");
                 }
 
-                string arrayName = p.Value<string>("array") ?? "Objects";
-                bool explicitName = !string.IsNullOrEmpty(p.Value<string>("array"));
+                string arrayName = p.Value<string>("array");
+                bool explicitName = !string.IsNullOrEmpty(arrayName);
+                if (!explicitName && string.IsNullOrEmpty(hostGuidStr) && !MustStayOnRootObjects(newObject)
+                    && TryFindDefaultComponentArray(asset, out object defaultHost, out string defaultArray))
+                {
+                    arrayHost = defaultHost;
+                    arrayName = defaultArray;
+                }
+                else if (explicitName && string.IsNullOrEmpty(hostGuidStr) && !MustStayOnRootObjects(newObject)
+                    && string.Equals(arrayName, "Components", StringComparison.OrdinalIgnoreCase)
+                    && !(GetListMember(arrayHost, "Components") is IList)
+                    && TryFindDefaultComponentArray(asset, out object componentsHost, out _))
+                {
+                    arrayHost = componentsHost;
+                }
+                if (arrayName == null)
+                    arrayName = "Objects";
                 int atIndex = p.Value<int?>("at_index") ?? -1;
                 int addedIndex = atIndex;
                 string usedArray = atIndex >= 0
@@ -608,14 +688,14 @@ namespace FrostyMcpPlugin.Bridge
 
                 string spawnerHost = null;
                 string entityHost = null;
-                if (usedArray == "Objects" && ReferenceEquals(arrayHost, asset.RootObject))
+                if (usedArray == "Objects" && ReferenceEquals(arrayHost, asset.RootObject) && !MustStayOnRootObjects(newObject))
                 {
                     spawnerHost = RegisterIntoWidgetSpawner(asset, pref);
                     entityHost = RegisterIntoCharacterEntity(asset, pref);
                 }
                 string graphHost = RegisterIntoSoundGraph(asset, pref);
 
-                indexSides = AssignComponentIndices(asset, newObject, null, p);
+                indexSides = AssignComponentIndices(asset, newObject, null, p, arrayHost);
 
                 SaveAsset(entry, asset);
 
@@ -732,14 +812,45 @@ namespace FrostyMcpPlugin.Bridge
                 // in its array, because it walks the finished tree.
                 string indexSides = null;
 
+                // Same guard as CreateComponent: a plugin-bearing SoundGraph node
+                // copied without its voice/plugin tables would share another
+                // voice's plugins at runtime.
+                if (IsSoundPatchAsset(asset) && HasValidSoundGraphPluginRefs(copy))
+                {
+                    foreach (object addedObj in asset.Objects.ToList())
+                    {
+                        if (!preexisting.Contains(addedObj))
+                            asset.RemoveObject(addedObj);
+                    }
+                    return McpHandlers.Error(
+                        "Duplicated SoundGraph node '" + copy.GetType().Name + "' carries SoundGraphPluginRef members; the copy needs its own voice/plugin registration. Create it in the Frosty GUI, or extend the tool to copy the voice/plugin tables.",
+                        "SOUNDGRAPH_VOICE_UNREGISTERED");
+                }
+
                 PointerRef pref = new PointerRef(copy);
-                string arrayName = p.Value<string>("array") ?? "Objects";
-                bool explicitName = !string.IsNullOrEmpty(p.Value<string>("array"));
+                object arrayHost = asset.RootObject;
+                string arrayName = p.Value<string>("array");
+                bool explicitName = !string.IsNullOrEmpty(arrayName);
+                if (!explicitName && !MustStayOnRootObjects(copy)
+                    && TryFindDefaultComponentArray(asset, out object defaultHost, out string defaultArray))
+                {
+                    arrayHost = defaultHost;
+                    arrayName = defaultArray;
+                }
+                else if (explicitName && !MustStayOnRootObjects(copy)
+                    && string.Equals(arrayName, "Components", StringComparison.OrdinalIgnoreCase)
+                    && !(GetListMember(arrayHost, "Components") is IList)
+                    && TryFindDefaultComponentArray(asset, out object componentsHost, out _))
+                {
+                    arrayHost = componentsHost;
+                }
+                if (arrayName == null)
+                    arrayName = "Objects";
                 int atIndex = p.Value<int?>("at_index") ?? -1;
                 int addedIndex = atIndex;
                 string usedArray = atIndex >= 0
-                    ? (TryInsertPointerToArray(asset.RootObject, arrayName, pref, atIndex) ? arrayName : null)
-                    : TryAddPointerToArrays(asset.RootObject, pref, arrayName, explicitName: explicitName, out addedIndex);
+                    ? (TryInsertPointerToArray(arrayHost, arrayName, pref, atIndex) ? arrayName : null)
+                    : TryAddPointerToArrays(arrayHost, pref, arrayName, explicitName: explicitName, out addedIndex);
 
                 if (usedArray == null)
                 {
@@ -754,13 +865,13 @@ namespace FrostyMcpPlugin.Bridge
                         ["success"] = false,
                         ["error"] = "Array not found: " + arrayName,
                         ["error_code"] = "ARRAY_NOT_FOUND",
-                        ["available_arrays"] = ListPointerArrayNames(asset.RootObject)
+                        ["available_arrays"] = ListPointerArrayNames(arrayHost)
                     };
                 }
 
                 // Same persistence check as CreateComponent: a duplicate that the
                 // serializer drops must not be reported as success.
-                IList usedList = GetListMember(asset.RootObject, usedArray) as IList;
+                IList usedList = GetListMember(arrayHost, usedArray) as IList;
                 if (usedList == null || FindPointerIndex(usedList, copy) < 0)
                 {
                     if (usedList != null && usedList.Count > 0 && IsNullPointerSlot(usedList[usedList.Count - 1]))
@@ -780,8 +891,14 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 string spawnerHost = null;
-                if (usedArray == "Objects")
+                string entityHost = null;
+                if (usedArray == "Objects" && ReferenceEquals(arrayHost, asset.RootObject) && !MustStayOnRootObjects(copy))
+                {
                     spawnerHost = RegisterIntoWidgetSpawner(asset, pref);
+                    // Same requirement as CreateComponent: a character blueprint only
+                    // runs the objects listed in PVZCharacterEntityData.Components.
+                    entityHost = RegisterIntoCharacterEntity(asset, pref);
+                }
                 string graphHost = RegisterIntoSoundGraph(asset, pref);
 
                 if (p["properties"] is JObject props)
@@ -790,15 +907,20 @@ namespace FrostyMcpPlugin.Bridge
                         SetMemberValue(copy, prop.Name, prop.Value);
                 }
 
+                // The runtime counters belong to the entity that owns the component
+                // list, not to whichever object happens to be first in traversal
+                // order (a weapon blueprint embeds a projectile entity there).
+                object indexHost = FindPointerListOwner(asset, copy, "Components")
+                                   ?? FindPointerListOwner(asset, copy, "Objects");
                 foreach (object addedObj in asset.Objects.ToList())
                 {
                     if (!preexisting.Contains(addedObj))
-                        indexSides = AssignComponentIndices(asset, addedObj, source, p);
+                        indexSides = AssignComponentIndices(asset, addedObj, source, p, indexHost);
                 }
 
                 SaveAsset(entry, asset);
 
-                if (addedIndex >= 0)
+                if (addedIndex >= 0 && ReferenceEquals(arrayHost, asset.RootObject))
                 {
                     EbxAsset reloaded = App.AssetManager.GetEbx(entry);
                     IList reloadedList = reloaded == null ? null : GetListMember(reloaded.RootObject, usedArray) as IList;
@@ -821,6 +943,21 @@ namespace FrostyMcpPlugin.Bridge
                     }
                 }
 
+                // A component belongs to the entity, not to the blueprint root.
+                // Leaving the pointer in the root Objects array as well makes the
+                // loader build a component-table entry with no instance behind it
+                // (see CreateComponent for the full explanation).
+                if (entityHost != null)
+                {
+                    IList rootObjects = GetListMember(asset.RootObject, "Objects") as IList;
+                    int rootPos = FindPointerIndex(rootObjects, copy);
+                    if (rootPos >= 0)
+                    {
+                        rootObjects.RemoveAt(rootPos);
+                        SaveAsset(entry, asset);
+                    }
+                }
+
                 int index = IndexOfObject(asset, copy);
                 return new Dictionary<string, object>
                 {
@@ -828,6 +965,7 @@ namespace FrostyMcpPlugin.Bridge
                     ["source_index"] = srcIndex,
                     ["added_to_array"] = usedArray,
                     ["registered_in"] = spawnerHost,
+                    ["registered_in_entity"] = entityHost,
                     ["registered_in_graph"] = graphHost,
                     ["index_sides"] = indexSides,
                     ["component"] = SerializeComponent(copy, index, asset),
@@ -930,6 +1068,11 @@ namespace FrostyMcpPlugin.Bridge
             try
             {
                 SetPath(comp, path, p["value"], asset);
+                // Same rule as set_ebx_field: a Components write must leave the runtime
+                // counters consistent, not just the list itself.
+                string indexSides = PathTargetsComponentList(path)
+                    ? NormalizeComponentSlots(asset, comp)
+                    : null;
                 SaveAsset(entry, asset);
 
                 // Same as set_ebx_field: the value is saved, so a failing readback
@@ -959,6 +1102,8 @@ namespace FrostyMcpPlugin.Bridge
                 };
                 if (readbackError != null)
                     result["readback_error"] = readbackError;
+                if (indexSides != null)
+                    result["index_sides"] = indexSides;
                 return result;
             }
             catch (Exception ex)
@@ -1002,6 +1147,11 @@ namespace FrostyMcpPlugin.Bridge
                     dynamic root = asset.RootObject;
                     bool guidUnique = IsClassGuidUnique(asset, classGuid);
 
+                    // Remember the entity that owns the component list: its runtime
+                    // counters must be repaired after the removal.
+                    object countHost = FindPointerListOwner(asset, comp, "Components")
+                                       ?? FindPointerListOwner(asset, comp, "Objects");
+
                     // Remove only the connections/pointers that belong to this instance.
                     // A class-guid sweep would also hit another object that happens to
                     // share the same guid.
@@ -1018,7 +1168,7 @@ namespace FrostyMcpPlugin.Bridge
                     // Removing a component leaves its slot number unused. Slot ids are
                     // dense per side and the loader walks the whole table, so the gap
                     // becomes a null entry it dereferences while initialising the entity.
-                    string renumber = RenumberComponentSlots(asset, null, false, false);
+                    string renumber = NormalizeComponentSlots(asset, countHost);
 
                     SaveAsset(entry, asset);
                     return new Dictionary<string, object>
@@ -1220,7 +1370,7 @@ namespace FrostyMcpPlugin.Bridge
 
                 // Deleting a component this way also leaves a slot unused, with the same
                 // null-table-entry consequence as remove_component.
-                string renumber = RenumberComponentSlots(asset, null, false, false);
+                string renumber = NormalizeComponentSlots(asset, hostObj);
 
                 SaveAsset(entry, asset);
                 return new Dictionary<string, object>
@@ -1713,9 +1863,12 @@ namespace FrostyMcpPlugin.Bridge
             string assetTypeFilter = (p.Value<string>("asset_type") ?? "").Trim();
             bool includeSubclasses = p.Value<bool?>("include_subclasses") ?? true;
             bool modifiedOnly = p.Value<bool?>("modified_only") ?? false;
+            // 0 scans the whole project. The default 150 only covers the first
+            // assets in enumeration order, which made a rare component look unused
+            // (UISettingsOptionCollectionData in a Stitch UI asset was reported as
+            // 0 instances while the asset holds two).
             int maxScan = p.Value<int?>("max_scan") ?? 150;
-            if (maxScan < 1) maxScan = 1;
-            if (maxScan > 2000) maxScan = 2000;
+            if (maxScan < 0) maxScan = 0;
             int maxExamples = p.Value<int?>("max_examples") ?? 20;
             if (maxExamples < 1) maxExamples = 1;
             if (maxExamples > 100) maxExamples = 100;
@@ -1779,7 +1932,7 @@ namespace FrostyMcpPlugin.Bridge
 
             foreach (EbxAssetEntry entry in candidates)
             {
-                if (scanned >= maxScan)
+                if (maxScan > 0 && scanned >= maxScan)
                     break;
                 scanned++;
 
@@ -1897,11 +2050,12 @@ namespace FrostyMcpPlugin.Bridge
                 ["assets_with_type"] = assetsWithType,
                 ["instance_count"] = instanceCount,
                 ["max_scan"] = maxScan,
+                ["max_scan_meaning"] = maxScan == 0 ? "0 = scan the whole project" : null,
                 // A scan stopped at max_scan must not read as "this type is unused":
                 // the caller has no other way to tell the two apart.
-                ["scan_truncated"] = scanned >= maxScan,
-                ["note"] = scanned >= maxScan
-                    ? "SCAN INCOMPLETE: stopped at max_scan before covering the project, so a low or zero instance_count does NOT mean the type is unused. Raise max_scan or narrow with name_query."
+                ["scan_truncated"] = maxScan > 0 && scanned >= maxScan,
+                ["note"] = maxScan > 0 && scanned >= maxScan
+                    ? "SCAN INCOMPLETE: stopped at max_scan before covering the project, so a low or zero instance_count does NOT mean the type is unused. Pass max_scan=0 to scan the whole project, or narrow with name_query."
                     : null,
                 ["sdk"] = new Dictionary<string, object>
                 {
@@ -2323,6 +2477,16 @@ namespace FrostyMcpPlugin.Bridge
                 }
                 PointerRef pref = new PointerRef(newObject);
 
+                // Same guard as CreateComponent: a plugin-bearing SoundGraph node
+                // cannot be registered by this writer (it only appends Graph.Nodes).
+                if (IsSoundPatchAsset(asset) && HasValidSoundGraphPluginRefs(newObject))
+                {
+                    asset.RemoveObject(newObject);
+                    return McpHandlers.Error(
+                        "SoundGraph node '" + newObject.GetType().Name + "' carries SoundGraphPluginRef members; creating it without a matching voice/plugin registration would share another voice's plugins at runtime. Create it in the Frosty GUI, or extend the tool to copy the voice/plugin tables.",
+                        "SOUNDGRAPH_VOICE_UNREGISTERED");
+                }
+
                 string assignedPath = null;
                 int listIndex = -1;
                 if (!createOnly)
@@ -2331,10 +2495,34 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 string graphHost = null;
+                string spawnerHost = null;
+                string entityHost = null;
                 if (!createOnly && ReferenceEquals(host, asset.RootObject))
+                {
                     graphHost = RegisterIntoSoundGraph(asset, pref);
+                    // create_component has always registered root Objects into these
+                    // two tables; create_ebx_class must do the same or a Rime entity
+                    // is written but never instantiated, and a character component
+                    // sits outside the entity's runtime component list. Audio sound
+                    // entities are the exception: they belong on the root.
+                    if (!MustStayOnRootObjects(newObject))
+                    {
+                        spawnerHost = RegisterIntoWidgetSpawner(asset, pref);
+                        entityHost = RegisterIntoCharacterEntity(asset, pref);
+                    }
+                }
 
-                indexSides = AssignComponentIndices(asset, newObject, null, p);
+                indexSides = AssignComponentIndices(asset, newObject, null, p, host);
+
+                // A character component belongs to PVZCharacterEntityData.Components,
+                // not to the blueprint root; keep the root array at zero.
+                if (entityHost != null && ReferenceEquals(host, asset.RootObject))
+                {
+                    IList rootObjects = GetListMember(asset.RootObject, "Objects") as IList;
+                    int rootPos = FindPointerIndex(rootObjects, newObject);
+                    if (rootPos >= 0)
+                        rootObjects.RemoveAt(rootPos);
+                }
 
                 // Verify the new object is actually reachable through the assigned
                 // path. BehaviorTree nodes were reported as created while the asset
@@ -2450,6 +2638,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["list_index"] = listIndex >= 0 ? (object)listIndex : null,
                     ["mode"] = createOnly ? "create_only" : assignMode,
                     ["registered_in_graph"] = graphHost,
+                    ["registered_in"] = spawnerHost,
+                    ["registered_in_entity"] = entityHost,
                     ["index_sides"] = indexSides,
                     ["component"] = SerializeComponent(newObject, newIndex, asset),
                     ["pointer"] = SerializePointerRef(pref)
@@ -2499,34 +2689,82 @@ namespace FrostyMcpPlugin.Bridge
             App.AssetManager.ModifyEbx(entry.Name, asset);
         }
 
-        private static void AppendPropertyConnections(dynamic root, List<object> items, bool compact)
+        // Each connection is serialized in its own try block. The old code wrapped
+        // the whole loop, so one bad connection silently cut off every connection
+        // after it while the call still returned success. A failed item is kept as
+        // a placeholder and counted in scan_errors.
+        private static int AppendPropertyConnections(dynamic root, List<object> items, bool compact, ScanBudget budget)
         {
-            try
+            int count;
+            try { count = (int)root.PropertyConnections.Count; }
+            catch { return 0; /* asset may not be a blueprint */ }
+            int errors = 0;
+            for (int i = 0; i < count; i++)
             {
-                for (int i = 0; i < root.PropertyConnections.Count; i++)
-                    items.Add(SerializePropertyConnection(root.PropertyConnections[i], i, compact));
+                if (budget.Stop())
+                    break;
+                budget.Node();
+                try { items.Add(SerializePropertyConnection(root.PropertyConnections[i], i, compact)); }
+                catch (Exception ex)
+                {
+                    errors++;
+                    items.Add(ConnectionSerializationFailure("property", i, ex));
+                }
             }
-            catch { /* asset may not be a blueprint */ }
+            return errors;
         }
 
-        private static void AppendEventConnections(dynamic root, List<object> items, bool compact)
+        private static int AppendEventConnections(dynamic root, List<object> items, bool compact, ScanBudget budget)
         {
-            try
+            int count;
+            try { count = (int)root.EventConnections.Count; }
+            catch { return 0; }
+            int errors = 0;
+            for (int i = 0; i < count; i++)
             {
-                for (int i = 0; i < root.EventConnections.Count; i++)
-                    items.Add(SerializeEventConnection(root.EventConnections[i], i, compact));
+                if (budget.Stop())
+                    break;
+                budget.Node();
+                try { items.Add(SerializeEventConnection(root.EventConnections[i], i, compact)); }
+                catch (Exception ex)
+                {
+                    errors++;
+                    items.Add(ConnectionSerializationFailure("event", i, ex));
+                }
             }
-            catch { }
+            return errors;
         }
 
-        private static void AppendLinkConnections(dynamic root, List<object> items, bool compact)
+        private static int AppendLinkConnections(dynamic root, List<object> items, bool compact, ScanBudget budget)
         {
-            try
+            int count;
+            try { count = (int)root.LinkConnections.Count; }
+            catch { return 0; }
+            int errors = 0;
+            for (int i = 0; i < count; i++)
             {
-                for (int i = 0; i < root.LinkConnections.Count; i++)
-                    items.Add(SerializeLinkConnection(root.LinkConnections[i], i, compact));
+                if (budget.Stop())
+                    break;
+                budget.Node();
+                try { items.Add(SerializeLinkConnection(root.LinkConnections[i], i, compact)); }
+                catch (Exception ex)
+                {
+                    errors++;
+                    items.Add(ConnectionSerializationFailure("link", i, ex));
+                }
             }
-            catch { }
+            return errors;
+        }
+
+        private static Dictionary<string, object> ConnectionSerializationFailure(string kind, int index, Exception ex)
+        {
+            return new Dictionary<string, object>
+            {
+                ["kind"] = kind,
+                ["index"] = index,
+                ["serialization_failed"] = true,
+                ["error"] = ex.Message
+            };
         }
 
         private static Dictionary<string, object> SerializePropertyConnection(dynamic conn, int index, bool compact = false)
@@ -2886,10 +3124,14 @@ namespace FrostyMcpPlugin.Bridge
                 }
             }
 
-            string typeName = p.Value<string>("component_type") ?? p.Value<string>("type");
+            string typeName = (p.Value<string>("component_type") ?? p.Value<string>("type") ?? "").Trim();
             int typeIndex = p.Value<int?>("type_index") ?? 0;
             if (!string.IsNullOrEmpty(typeName))
             {
+                // Exact type first; only then accept subclasses. The old exact-only
+                // path returned NOT_FOUND when callers passed a base class name
+                // (e.g. asking for a SoundGraphNodeData), which looked like the
+                // component was missing even though it was present.
                 int match = 0;
                 int i = 0;
                 foreach (object obj in asset.Objects)
@@ -2904,6 +3146,25 @@ namespace FrostyMcpPlugin.Bridge
                         match++;
                     }
                     i++;
+                }
+
+                if (match == 0)
+                {
+                    match = 0;
+                    i = 0;
+                    foreach (object obj in asset.Objects)
+                    {
+                        if (TypeLibrary.IsSubClassOf(obj.GetType().Name, typeName))
+                        {
+                            if (match == typeIndex)
+                            {
+                                index = i;
+                                return obj;
+                            }
+                            match++;
+                        }
+                        i++;
+                    }
                 }
             }
 
@@ -2956,7 +3217,7 @@ namespace FrostyMcpPlugin.Bridge
             return count == 1 ? match : -1;
         }
 
-        private static bool IsContainedInObjects(EbxAsset asset, object target)
+        internal static bool IsContainedInObjects(EbxAsset asset, object target)
         {
             foreach (object obj in asset.Objects)
             {
@@ -2996,7 +3257,7 @@ namespace FrostyMcpPlugin.Bridge
         // source when there is one, otherwise an existing instance of the same type
         // in this asset. With neither, the realm is the best guess and the reply says
         // so; client_index / server_index override the result outright.
-        internal static string AssignComponentIndices(EbxAsset asset, object newObject, object reference = null, JObject p = null)
+        internal static string AssignComponentIndices(EbxAsset asset, object newObject, object reference = null, JObject p = null, object countHost = null)
         {
             Type t = newObject.GetType();
             PropertyInfo clientPi = t.GetProperty("ClientIndex");
@@ -3067,7 +3328,7 @@ namespace FrostyMcpPlugin.Bridge
             if (serverPi != null && serverPi.CanWrite)
                 serverPi.SetValue(newObject, Convert.ChangeType(255, serverPi.PropertyType));
 
-            string renumber = RenumberComponentSlots(asset, newObject, onClient, onServer);
+            string renumber = RenumberComponentSlots(asset, newObject, onClient, onServer, countHost);
 
             int finalClient = clientPi == null ? 255 : Convert.ToInt32(clientPi.GetValue(newObject));
             int finalServer = serverPi == null ? 255 : Convert.ToInt32(serverPi.GetValue(newObject));
@@ -3106,7 +3367,8 @@ namespace FrostyMcpPlugin.Bridge
         /// 255 on a side stays 255 on that side. Returns a short summary for the reply.
         /// </summary>
         internal static string RenumberComponentSlots(EbxAsset asset, object newObject,
-                                                      bool newOnClient, bool newOnServer)
+                                                      bool newOnClient, bool newOnServer,
+                                                      object countHost = null)
         {
             List<object> roots = new List<object>();
             HashSet<object> hasParent = new HashSet<object>(ReferenceEqualityComparer.Instance);
@@ -3175,22 +3437,182 @@ namespace FrostyMcpPlugin.Bridge
                     ++nextServer;
             }
 
-            // The counters live on the entity, which is the first object carrying them.
-            foreach (object obj in order)
+            // The counters belong to the entity that owns the component list. In a
+            // weapon blueprint with an embedded BulletEntityData the first object in
+            // traversal order is the projectile, not the PVZCharacterWeaponData that
+            // received the component, so prefer the caller's host and only fall back
+            // to the first object carrying the fields.
+            object countOwner = countHost;
+            if (countOwner == null || countOwner.GetType().GetProperty("ClientRuntimeComponentCount") == null)
             {
-                Type t = obj.GetType();
-                PropertyInfo cc = t.GetProperty("ClientRuntimeComponentCount");
-                PropertyInfo sc = t.GetProperty("ServerRuntimeComponentCount");
+                foreach (object obj in order)
+                {
+                    if (obj.GetType().GetProperty("ClientRuntimeComponentCount") != null)
+                    {
+                        countOwner = obj;
+                        break;
+                    }
+                }
+            }
+            if (countOwner != null)
+            {
+                Type et = countOwner.GetType();
+                PropertyInfo cc = et.GetProperty("ClientRuntimeComponentCount");
+                PropertyInfo sc = et.GetProperty("ServerRuntimeComponentCount");
                 if (cc != null && cc.CanWrite)
                 {
-                    cc.SetValue(obj, Convert.ChangeType(nextClient, cc.PropertyType));
+                    cc.SetValue(countOwner, Convert.ChangeType(nextClient, cc.PropertyType));
                     if (sc != null && sc.CanWrite)
-                        sc.SetValue(obj, Convert.ChangeType(nextServer, sc.PropertyType));
-                    break;
+                        sc.SetValue(countOwner, Convert.ChangeType(nextServer, sc.PropertyType));
                 }
             }
 
             return "renumbered client=" + nextClient + ", server=" + nextServer;
+        }
+
+        /// <summary>
+        /// Recomputes the component numbering and the runtime counters after any tool
+        /// changed which components the asset contains. Adding goes through
+        /// AssignComponentIndices and the two remove paths call RenumberComponentSlots
+        /// directly; every other mutation (insert into a Components list, a direct
+        /// Components write, a clipboard paste) goes through here, so the counters can
+        /// never keep describing the previous shape. Assets that declare no runtime
+        /// counters are left untouched. Returns the summary, or null when untouched.
+        /// </summary>
+        internal static string NormalizeComponentSlots(EbxAsset asset, object hintHost = null)
+        {
+            object host = FindRuntimeComponentCountHost(asset, hintHost);
+            if (host == null)
+                return null;
+            return RenumberComponentSlots(asset, null, false, false, host);
+        }
+
+        /// <summary>
+        /// Default array for a component when the caller did not name one. A weapon
+        /// blueprint's component table is PVZCharacterWeaponData.Components and a
+        /// character blueprint's is PVZCharacterEntityData.Components; neither is the
+        /// root Objects array. Appending to root Objects first and moving the pointer
+        /// later leaves a window where the wrong array is serialized and makes the
+        /// caller's success look correct while the runtime sees a bogus component.
+        /// Assets without either host keep the old root Objects behaviour (Rime
+        /// widgets and other blueprint types).
+        /// </summary>
+        /// <summary>
+        /// Audio.SoundEntityData is the one component type that belongs in the
+        /// blueprint's root Objects on a weapon blueprint even though the asset also
+        /// has a PVZCharacterWeaponData.Components table. Moving it into Components
+        /// changes which event path drives it, so keep it on the root array.
+        /// </summary>
+        private static bool MustStayOnRootObjects(object obj)
+        {
+            if (obj == null)
+                return false;
+            Type t = obj.GetType();
+            if (string.Equals(t.Name, "SoundEntityData", StringComparison.Ordinal))
+                return true;
+            string full = t.FullName ?? "";
+            return full.IndexOf(".Audio.", StringComparison.Ordinal) >= 0;
+        }
+
+        private static bool TryFindDefaultComponentArray(EbxAsset asset, out object host, out string arrayName)
+        {
+            host = null;
+            arrayName = null;
+            if (asset?.Objects == null)
+                return false;
+
+            foreach (object obj in asset.Objects)
+            {
+                if (obj == null)
+                    continue;
+                string typeName = obj.GetType().Name;
+                if (typeName != "PVZCharacterWeaponData" && typeName != "PVZCharacterEntityData")
+                    continue;
+                if (GetListMember(obj, "Components") is IList)
+                {
+                    host = obj;
+                    arrayName = "Components";
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Picks the object that stores ClientRuntimeComponentCount /
+        /// ServerRuntimeComponentCount. The caller's host wins when it carries those
+        /// fields; otherwise the first entity whose Components list is populated,
+        /// because a weapon blueprint embeds a projectile entity ahead of the weapon
+        /// data in traversal order and the empty one must not win.
+        /// </summary>
+        internal static object FindRuntimeComponentCountHost(EbxAsset asset, object hintHost = null)
+        {
+            if (CarriesRuntimeCounts(hintHost))
+                return hintHost;
+
+            object withList = null;
+            object any = null;
+            foreach (object obj in asset.Objects)
+            {
+                if (!CarriesRuntimeCounts(obj))
+                    continue;
+                if (any == null)
+                    any = obj;
+                if (withList == null)
+                {
+                    IList components = GetListMember(obj, "Components") as IList;
+                    if (components != null && components.Count > 0)
+                        withList = obj;
+                }
+            }
+            return withList ?? any;
+        }
+
+        private static bool CarriesRuntimeCounts(object obj)
+        {
+            if (obj == null)
+                return false;
+            Type t = obj.GetType();
+            return t.GetProperty("ClientRuntimeComponentCount") != null
+                || t.GetProperty("ServerRuntimeComponentCount") != null;
+        }
+
+        /// <summary>
+        /// True when a dotted path names a Components array (optionally with an element
+        /// index); a write there can change which components the asset contains.
+        /// </summary>
+        internal static bool PathTargetsComponentList(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return false;
+            string last = path;
+            int dot = last.LastIndexOf('.');
+            if (dot >= 0)
+                last = last.Substring(dot + 1);
+            int bracket = last.IndexOf('[');
+            if (bracket >= 0)
+                last = last.Substring(0, bracket);
+            return string.Equals(last.Trim(), "Components", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Finds the object whose named pointer list contains <paramref name="target"/>.
+        /// The runtime component counters live on that owner, which is not always the
+        /// first entity in traversal order (weapon blueprints embed a projectile entity).
+        /// </summary>
+        internal static object FindPointerListOwner(EbxAsset asset, object target, string listName)
+        {
+            foreach (object obj in asset.Objects)
+            {
+                if (obj == null || ReferenceEquals(obj, target))
+                    continue;
+                IList list = GetListMember(obj, listName) as IList;
+                if (list == null)
+                    continue;
+                if (FindPointerIndex(list, target) >= 0)
+                    return obj;
+            }
+            return null;
         }
 
         // TypeLibrary.CreateObject + new AssetClassGuid(guid, -1) leaves the object
@@ -3749,6 +4171,60 @@ namespace FrostyMcpPlugin.Bridge
         /// derived data for the editor, so a node that only sits there is written
         /// back as a null pointer.
         /// </summary>
+        private static bool IsSoundPatchAsset(EbxAsset asset)
+        {
+            try { return asset?.RootObject != null && asset.RootObject.GetType().Name.Contains("SoundPatchAsset"); }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// A node that carries SoundGraphPluginRef members needs its own voice and
+        /// plugin instances in SoundGraphInfo. This writer only appends the node to
+        /// Graph.Nodes, so such a node would share another voice's plugins at
+        /// runtime while the call still reported success. Detect it up front.
+        /// </summary>
+        private static bool HasValidSoundGraphPluginRefs(object value)
+        {
+            return HasValidSoundGraphPluginRefs(value, 0);
+        }
+
+        private static bool HasValidSoundGraphPluginRefs(object value, int depth)
+        {
+            if (value == null || depth > 4)
+                return false;
+
+            Type t = value.GetType();
+            if (t.Name == "SoundGraphPluginRef")
+            {
+                PropertyInfo valid = t.GetProperty("IsValid");
+                return valid != null && valid.GetValue(value) is bool b && b;
+            }
+
+            if (value is IList list)
+            {
+                int n = Math.Min(list.Count, 64);
+                for (int i = 0; i < n; i++)
+                    if (HasValidSoundGraphPluginRefs(list[i], depth + 1))
+                        return true;
+                return false;
+            }
+
+            if (value is PointerRef || value is string || value is Guid || value is CString || t.IsPrimitive || t.IsEnum)
+                return false;
+
+            foreach (PropertyInfo pi in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!pi.CanRead || pi.GetIndexParameters().Length > 0)
+                    continue;
+                object v;
+                try { v = pi.GetValue(value); }
+                catch { continue; }
+                if (HasValidSoundGraphPluginRefs(v, depth + 1))
+                    return true;
+            }
+            return false;
+        }
+
         private static string RegisterIntoSoundGraph(EbxAsset asset, PointerRef pref)
         {
             try
@@ -4265,6 +4741,19 @@ namespace FrostyMcpPlugin.Bridge
                 return null;
             if (value is CString cs)
                 return (string)cs;
+            // A BoxedValueRef wraps the real value (CString, enum, struct, array).
+            // The old fallback returned value.ToString(), which only named the boxed
+            // type, so an interface CString field read back as an empty-looking
+            // description instead of the stored string.
+            if (value is FrostySdk.Ebx.BoxedValueRef boxed)
+            {
+                return new Dictionary<string, object>
+                {
+                    ["boxed_type"] = boxed.Type.ToString(),
+                    ["array_type"] = boxed.ArrayType.ToString(),
+                    ["value"] = SerializeAny(boxed.Value)
+                };
+            }
             if (value is PointerRef pr)
                 return SerializePointerRef(pr);
             if (value is Guid g)
@@ -4672,6 +5161,12 @@ namespace FrostyMcpPlugin.Bridge
             int offset = Math.Max(0, p.Value<int?>("offset") ?? 0);
             bool includeConnections = p.Value<bool?>("include_connections") ?? true;
             bool compact = p.Value<bool?>("compact") ?? true;
+            int scanMs = p.Value<int?>("max_scan_ms") ?? 20000;
+            if (scanMs < 1000) scanMs = 1000;
+            if (scanMs > 60000) scanMs = 60000;
+            int maxNodes = p.Value<int?>("max_scan_nodes") ?? 500000;
+            if (maxNodes < 1000) maxNodes = 1000;
+            ScanBudget budget = new ScanBudget(scanMs, maxNodes);
 
             StringComparison cmp = caseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
             var matches = new List<object>();
@@ -4680,6 +5175,9 @@ namespace FrostyMcpPlugin.Bridge
             int objIndex = 0;
             foreach (object obj in asset.Objects)
             {
+                if (budget.Stop())
+                    break;
+                budget.Node();
                 string typeName = obj.GetType().Name;
                 if (!string.IsNullOrEmpty(typeFilter) &&
                     !typeName.Equals(typeFilter, StringComparison.OrdinalIgnoreCase) &&
@@ -4698,7 +5196,7 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 var visited = new HashSet<object>(ReferenceEqualityComparer.Instance);
-                WalkSearch(obj, "", objIndex, cg, typeName, query, scope, cmp, maxDepth, 0, visited, matches, ref total, limit + offset);
+                WalkSearch(obj, "", objIndex, cg, typeName, query, scope, cmp, maxDepth, 0, visited, budget, matches, ref total, limit + offset);
                 objIndex++;
             }
 
@@ -4706,11 +5204,12 @@ namespace FrostyMcpPlugin.Bridge
             // property walk never reaches: each entry is a DataField whose Name is
             // the interface field name. Without this pass search_ebx_fields reports
             // total:0 for a name that list_interface plainly shows.
-            SearchInterfaceFields(asset, typeFilter, query, scope, cmp, matches, ref total, limit + offset);
+            if (!budget.Expired)
+                SearchInterfaceFields(asset, typeFilter, query, scope, cmp, budget, matches, ref total, limit + offset);
 
             // total counts every match; matches only keeps the first limit+offset for paging.
-            if (includeConnections)
-                SearchConnections(asset, query, scope, cmp, matches, ref total, limit + offset);
+            if (includeConnections && !budget.Expired)
+                SearchConnections(asset, query, scope, cmp, budget, matches, ref total, limit + offset);
 
             List<object> page = matches.Skip(offset).Take(limit).ToList();
             if (compact)
@@ -4737,6 +5236,12 @@ namespace FrostyMcpPlugin.Bridge
                 ["limit"] = limit,
                 ["returned"] = page.Count,
                 ["compact"] = compact,
+                ["scan_truncated"] = budget.Expired,
+                ["scan_ms"] = scanMs,
+                ["scan_nodes"] = budget.Nodes,
+                ["note"] = budget.Expired
+                    ? "SCAN INCOMPLETE: the scan budget expired; matches are only from the objects/properties visited before the deadline."
+                    : null,
                 ["matches"] = page
             };
         }
@@ -4866,6 +5371,12 @@ namespace FrostyMcpPlugin.Bridge
                 }
 
                 SetPath(comp, path, p["value"], asset);
+                // A write into a Components array can replace the whole component set;
+                // renumber and rewrite the runtime counters before the save so the file
+                // never lands with counts that describe the previous shape.
+                string indexSides = PathTargetsComponentList(path)
+                    ? NormalizeComponentSlots(asset, comp)
+                    : null;
                 SaveAsset(entry, asset);
 
                 // The write is already saved at this point. Reading it back
@@ -4898,6 +5409,8 @@ namespace FrostyMcpPlugin.Bridge
                 };
                 if (readbackError != null)
                     result["readback_error"] = readbackError;
+                if (indexSides != null)
+                    result["index_sides"] = indexSides;
                 if (portWarning != null)
                     result["warning"] = portWarning;
                 return result;
@@ -4935,12 +5448,14 @@ namespace FrostyMcpPlugin.Bridge
             int maxDepth,
             int depth,
             HashSet<object> visited,
+            ScanBudget budget,
             List<object> matches,
             ref int total,
             int maxCollect)
         {
-            if (obj == null || depth > maxDepth)
+            if (obj == null || depth > maxDepth || budget.Stop())
                 return;
+            budget.Node();
 
             Type t = obj.GetType();
             if (!t.IsValueType)
@@ -4988,7 +5503,7 @@ namespace FrostyMcpPlugin.Bridge
                     }
                     else
                     {
-                        WalkSearch(item, itemPath, objectIndex, classGuid, objectType, query, scope, cmp, maxDepth, depth + 1, visited, matches, ref total, maxCollect);
+                        WalkSearch(item, itemPath, objectIndex, classGuid, objectType, query, scope, cmp, maxDepth, depth + 1, visited, budget, matches, ref total, maxCollect);
                     }
                 }
                 return;
@@ -5036,18 +5551,21 @@ namespace FrostyMcpPlugin.Bridge
                 {
                     if (value.GetType().IsPrimitive || value is decimal)
                         continue;
-                    WalkSearch(value, childPath, objectIndex, classGuid, objectType, query, scope, cmp, maxDepth, depth + 1, visited, matches, ref total, maxCollect);
+                    WalkSearch(value, childPath, objectIndex, classGuid, objectType, query, scope, cmp, maxDepth, depth + 1, visited, budget, matches, ref total, maxCollect);
                 }
             }
         }
 
-        private static void SearchConnections(EbxAsset asset, string query, string scope, StringComparison cmp, List<object> matches, ref int total, int maxCollect)
+        private static void SearchConnections(EbxAsset asset, string query, string scope, StringComparison cmp, ScanBudget budget, List<object> matches, ref int total, int maxCollect)
         {
             dynamic root = asset.RootObject;
             try
             {
                 for (int i = 0; i < root.PropertyConnections.Count; i++)
                 {
+                    if (budget.Stop())
+                        return;
+                    budget.Node();
                     dynamic c = root.PropertyConnections[i];
                     CheckConnField("$PropertyConnections[" + i + "].SourceField", (string)(CString)c.SourceField, query, scope, cmp, matches, ref total, maxCollect);
                     CheckConnField("$PropertyConnections[" + i + "].TargetField", (string)(CString)c.TargetField, query, scope, cmp, matches, ref total, maxCollect);
@@ -5059,6 +5577,9 @@ namespace FrostyMcpPlugin.Bridge
             {
                 for (int i = 0; i < root.EventConnections.Count; i++)
                 {
+                    if (budget.Stop())
+                        return;
+                    budget.Node();
                     dynamic c = root.EventConnections[i];
                     string se = "";
                     string te = "";
@@ -5074,6 +5595,9 @@ namespace FrostyMcpPlugin.Bridge
             {
                 for (int i = 0; i < root.LinkConnections.Count; i++)
                 {
+                    if (budget.Stop())
+                        return;
+                    budget.Node();
                     dynamic c = root.LinkConnections[i];
                     CheckConnField("$LinkConnections[" + i + "].SourceField", (string)(CString)c.SourceField, query, scope, cmp, matches, ref total, maxCollect);
                     CheckConnField("$LinkConnections[" + i + "].TargetField", (string)(CString)c.TargetField, query, scope, cmp, matches, ref total, maxCollect);
@@ -5083,7 +5607,7 @@ namespace FrostyMcpPlugin.Bridge
         }
 
         private static void SearchInterfaceFields(EbxAsset asset, string typeFilter, string query, string scope,
-            StringComparison cmp, List<object> matches, ref int total, int maxCollect)
+            StringComparison cmp, ScanBudget budget, List<object> matches, ref int total, int maxCollect)
         {
             if (!string.IsNullOrEmpty(typeFilter) &&
                 !typeFilter.Equals("InterfaceDescriptorData", StringComparison.OrdinalIgnoreCase))
@@ -5092,6 +5616,9 @@ namespace FrostyMcpPlugin.Bridge
             int objIndex = 0;
             foreach (object obj in asset.Objects)
             {
+                if (budget.Stop())
+                    return;
+                budget.Node();
                 if (obj.GetType().Name == "InterfaceDescriptorData")
                 {
                     // Interface fields are a dynamic member (DynamicDataContainer),

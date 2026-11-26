@@ -46,6 +46,14 @@ This plugin talks to **whatever profile Frosty has loaded**. Here it is driven a
 - `set_root_flags` requires `flags`; the Python wrapper no longer defaults the word to 15.
 - Listing tools count first and serialize only the requested page, and `EbxYamlWriter` caches
   the property table per type, which matters on large assets.
+- `list_connections` and `search_ebx_fields` now enforce a scan budget
+  (`max_scan_ms`, default 20 s; `max_scan_nodes` for field search) and return
+  `scan_truncated` + a note instead of hanging the editor on a self-referential
+  object graph. Pipe failures now report `ERROR_PIPE_BUSY (231)` separately from
+  "no editor", and a pinned pipe is named in the error.
+- `remove_connection` validates the removed element and verifies the list count
+  before saving; `get_component(component_type=...)` falls back to SDK subclasses
+  when no exact type name matches.
 
 ## Architecture
 
@@ -57,7 +65,7 @@ Wire protocol: `uint32_le(payload_length)` + UTF-8 JSON-RPC (same layout as the 
 
 Pipe name: `\\.\pipe\Frosty_MCP_Bridge_v1_<profile>` (falls back to `Frosty_MCP_Bridge_v1` when no profile is loaded)
 
-Plugin version: **2.3.11**
+Plugin version: **2.3.22**
 
 The `<profile>` suffix comes from Frosty's own profile database (`FrostySdk/Profiles.bin`). The table is generated at build time; no game names are hardcoded in the plugin or the Python server.
 
@@ -77,7 +85,7 @@ Build `FrostyMcpPlugin.sln` as **Developer - Debug | x64**. A PostBuild step cop
 Start Frosty, load a profile, and check the editor log:
 
 ```
-[MCP v2.3.11] Listening on: Frosty_MCP_Bridge_v1_<profile>
+[MCP v2.3.20] Listening on: Frosty_MCP_Bridge_v1_<profile>
 ```
 
 Menu: **Tools → MCP Bridge Status**
@@ -104,7 +112,7 @@ Shared stdio launch:
 |-------|--------|
 | `command` | `python` (or `C:/Users/You/AppData/Local/Python/pythoncore-3.14-64/python.exe`) |
 | `args` | `["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"]` |
-| `env` | `FROSTY_MCP_VERSION=2.3.11` (optional; bump it when tool schemas change so clients reload) |
+| `env` | `FROSTY_MCP_VERSION=2.3.20` (optional; bump it when tool schemas change so clients reload) |
 | `env` | `FROSTY_MCP_PROFILE=<profile name>` (optional; internal name or display name, used to build the pipe suffix. Leave it unset when one editor is running: the server then uses the only open bridge pipe) |
 | `env` | `FROSTY_MCP_PIPE=\\.\pipe\...` (optional; full pipe path override, wins over `FROSTY_MCP_PROFILE`) |
 
@@ -132,7 +140,7 @@ Or: Cursor Settings → MCP.
     "frosty": {
       "command": "python",
       "args": ["D:/path/to/FrostyMcpPlugin/MCP_Server/mcp_frosty.py"],
-      "env": { "FROSTY_MCP_VERSION": "2.3.11" }
+      "env": { "FROSTY_MCP_VERSION": "2.3.20" }
     }
   }
 }
@@ -191,7 +199,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 
 [mcp_servers.frosty.env]
-FROSTY_MCP_VERSION = "2.3.11"
+FROSTY_MCP_VERSION = "2.3.20"
 ```
 
 CLI equivalent:
