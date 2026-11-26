@@ -2840,7 +2840,23 @@ namespace FrostyMcpPlugin.Bridge
                 return "External [" + pref.External.FileGuid + "]";
             }
             if (pref.Type == PointerRefType.Internal && pref.Internal != null)
-                return pref.Internal.GetType().Name + " [" + GetClassGuid(pref.Internal) + "]";
+            {
+                // Read __Guid directly. GetClassGuid goes through a dynamic
+                // GetInstanceGuid call, which was the remaining blocker on GW1
+                // event connections; this reflection path is the same one the
+                // YAML writer uses for every object.
+                object obj = pref.Internal;
+                try
+                {
+                    FieldInfo guidField = obj.GetType().GetField("__Guid",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    object guid = guidField?.GetValue(obj);
+                    if (guid != null)
+                        return obj.GetType().Name + " [" + guid + "]";
+                }
+                catch { }
+                return obj.GetType().Name;
+            }
             return "null";
         }
 
