@@ -81,11 +81,16 @@ namespace FrostyMcpPlugin.Bridge
             {
                 EbxAsset asset = App.AssetManager.GetEbx(entry);
                 SetPropertyPath(asset.RootObject, path, p["value"]);
+                // Writing a Components array from the root must leave the runtime
+                // counters consistent with the new component set.
+                string indexSides = McpBlueprintHandlers.PathTargetsComponentList(path)
+                    ? McpBlueprintHandlers.NormalizeComponentSlots(asset, asset.RootObject)
+                    : null;
                 asset.Update();
                 App.AssetManager.ModifyEbx(entry.Name, asset);
 
                 object newValue = ResolvePropertyPath(asset.RootObject, path, out string resolvedType);
-                return new Dictionary<string, object>
+                var result = new Dictionary<string, object>
                 {
                     ["success"] = true,
                     ["name"] = entry.Name,
@@ -94,6 +99,9 @@ namespace FrostyMcpPlugin.Bridge
                     ["value"] = SerializeValue(newValue),
                     ["asset"] = McpHandlers.SerializeEbxEntry(entry)
                 };
+                if (indexSides != null)
+                    result["index_sides"] = indexSides;
+                return result;
             }
             catch (Exception ex)
             {
@@ -495,12 +503,14 @@ namespace FrostyMcpPlugin.Bridge
             }
 
             int revertedStrings = 0;
+            bool wasModified = entry.IsModified;
             var plan = new Dictionary<string, object>
             {
                 ["asset"] = entry.Name,
                 ["kind"] = kind,
                 ["data_only"] = dataOnly,
                 ["is_dirty"] = entry.IsDirty,
+                ["is_modified"] = wasModified,
                 ["localized_strings"] = ownsLocalizedStrings ? modifiedStrings : 0,
                 ["revert_strings"] = revertStrings
             };
@@ -519,13 +529,28 @@ namespace FrostyMcpPlugin.Bridge
                     }
 
                     App.AssetManager.RevertAsset(entry, dataOnly);
-                    return new Dictionary<string, object>
+
+                    // RevertAsset is a no-op when the entry is not modified, and a
+                    // silent failure is indistinguishable from success. Read the
+                    // entry back and report it, instead of always claiming success.
+                    bool stillModified = dataOnly
+                        ? entry.HasModifiedData
+                        : (entry.IsModified || entry.IsDirty);
+                    var result = new Dictionary<string, object>
                     {
-                        ["success"] = true,
+                        ["success"] = !stillModified,
                         ["asset"] = McpHandlers.SerializeAssetEntry(entry),
                         ["data_only"] = dataOnly,
-                        ["localized_strings_reverted"] = revertedStrings
+                        ["localized_strings_reverted"] = revertedStrings,
+                        ["was_modified"] = wasModified,
+                        ["verified_clean"] = !stillModified
                     };
+                    if (stillModified)
+                    {
+                        result["error"] = "RevertAsset returned but the entry still reports modified/dirty; the revert did not take effect.";
+                        result["error_code"] = "REVERT_INCOMPLETE";
+                    }
+                    return result;
                 }
                 catch (Exception ex)
                 {
@@ -1199,6 +1224,10 @@ namespace FrostyMcpPlugin.Bridge
             string format = (p.Value<string>("format") ?? "xml").ToLowerInvariant();
             if (string.IsNullOrWhiteSpace(path))
                 return McpHandlers.Error("path is required", "INVALID_PARAMS");
+            if (Directory.Exists(path) || path.EndsWith(Path.DirectorySeparatorChar.ToString()) || path.EndsWith(Path.AltDirectorySeparatorChar.ToString()))
+                return McpHandlers.Error(
+                    "path must be a full file path, not a directory: " + path,
+                    "INVALID_PARAMS");
 
             try
             {
@@ -1784,6 +1813,18 @@ namespace FrostyMcpPlugin.Bridge
 
             if (value is CString cs)
                 return (string)cs;
+
+            // BoxedValueRef wraps the real value; unwrap it so an interface CString
+            // field reads back as the stored string instead of a type description.
+            if (value is FrostySdk.Ebx.BoxedValueRef boxed)
+            {
+                return new Dictionary<string, object>
+                {
+                    ["boxed_type"] = boxed.Type.ToString(),
+                    ["array_type"] = boxed.ArrayType.ToString(),
+                    ["value"] = SerializeValue(boxed.Value)
+                };
+            }
 
             if (value is PointerRef pr)
             {

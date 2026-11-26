@@ -1,6 +1,7 @@
 ﻿using Frosty.Core;
 using Frosty.Core.Controls;
 using FrostySdk;
+using FrostySdk.Attributes;
 using FrostySdk.Ebx;
 using FrostySdk.IO;
 using FrostySdk.Managers;
@@ -427,35 +428,98 @@ namespace FrostyMcpPlugin.Bridge
                 if (sourceObj == null)
                     return McpHandlers.Error("Source object not found", "NOT_FOUND");
 
+                // Resolve the destination array and check the source type against it
+                // before the copy exists, so a source that cannot legally live there
+                // is rejected without touching the asset. Before 2.3.21 the paste
+                // appended whatever type the source was and returned success; the
+                // wrong member only surfaced when the asset was read back.
+                string arrayName = p.Value<string>("array") ?? "Objects";
+                if (!TryGetPointerList(targetAsset.RootObject, arrayName, out _) && arrayName == "Objects")
+                    arrayName = "Components";
+                Type expectedBase = GetPointerListBaseType(targetAsset.RootObject, arrayName);
+                if (expectedBase != null && expectedBase != typeof(object)
+                    && !expectedBase.IsAssignableFrom(sourceObj.GetType()))
+                {
+                    return McpHandlers.Error(
+                        "TYPE_MISMATCH: source object is '" + sourceObj.GetType().Name +
+                        "' but array '" + arrayName + "' holds '" + expectedBase.Name +
+                        "'. Note source_index indexes the source asset's root Objects list, " +
+                        "not the destination array.",
+                        "TYPE_MISMATCH");
+                }
+
                 FrostyClipboard.Current.SetData(sourceObj);
                 object copy = FrostyClipboard.Current.GetData(targetAsset, targetEntry);
                 if (copy == null)
                     return McpHandlers.Error("Clipboard paste returned null", "PASTE_FAILED");
 
-                // Ensure registered
+                // Only objects that carry an instance GUID belong in asset.Objects.
+                // Structure-like classes are written inline where they are referenced,
+                // and AddObject sends them down the instance-GUID path and throws.
+                bool copyHasGuid = HasInstanceGuid(copy);
                 bool contained = false;
                 foreach (object o in targetAsset.Objects)
                 {
                     if (ReferenceEquals(o, copy)) { contained = true; break; }
                 }
-                if (!contained)
+                if (!contained && copyHasGuid)
                     targetAsset.AddObject(copy);
 
-                // The paste keeps the source's ClientIndex/ServerIndex, which collides
-                // with the original in this file and crashes it at load time.
-                McpBlueprintHandlers.AssignComponentIndices(targetAsset, copy);
-
-                string arrayName = p.Value<string>("array") ?? "Objects";
                 PointerRef pref = new PointerRef(copy);
                 bool added = TryAddPointer(targetAsset.RootObject, arrayName, pref);
-                if (!added && arrayName == "Objects")
-                    added = TryAddPointer(targetAsset.RootObject, "Components", pref);
+
+                // The paste keeps the source's ClientIndex/ServerIndex, which collides
+                // with the original in this file and crashes it at load time. Number it
+                // after the pointer sits in its array, and let the entity that owns the
+                // list own the runtime counters.
+                object pasteHost = McpBlueprintHandlers.FindPointerListOwner(targetAsset, copy, "Components")
+                                   ?? McpBlueprintHandlers.FindPointerListOwner(targetAsset, copy, "Objects");
+                McpBlueprintHandlers.AssignComponentIndices(targetAsset, copy, null, null, pasteHost);
 
                 targetAsset.Update();
                 App.AssetManager.ModifyEbx(targetEntry.Name, targetAsset);
 
                 Guid newGuid = Guid.Empty;
-                try { newGuid = ((dynamic)copy).GetInstanceGuid().ExportedGuid; } catch { }
+                if (copyHasGuid)
+                {
+                    try { newGuid = ((dynamic)copy).GetInstanceGuid().ExportedGuid; } catch { }
+                }
+
+                // Read the array back: the serializer drops object types it cannot
+                // write, and a paste that silently loses its element (or keeps a null
+                // slot) has to fail instead of reporting success.
+                if (added)
+                {
+                    try
+                    {
+                        EbxAssetEntry refreshed = App.AssetManager.GetEbxEntry(targetEntry.Name) ?? targetEntry;
+                        EbxAsset after = App.AssetManager.GetEbx(refreshed);
+                        if (after != null && TryGetPointerList(after.RootObject, arrayName, out IList afterList)
+                            && afterList.Count > 0)
+                        {
+                            object slot = afterList[afterList.Count - 1];
+                            bool slotIsNull = slot is PointerRef nullRef && nullRef.Type != PointerRefType.Internal;
+                            object pasted = slot is PointerRef slotRef ? slotRef.Internal : slot;
+                            if (slotIsNull || pasted == null || pasted.GetType() != copy.GetType())
+                            {
+                                if (slotIsNull)
+                                    afterList.RemoveAt(afterList.Count - 1);
+                                after.Update();
+                                App.AssetManager.ModifyEbx(refreshed.Name, after);
+                                return new Dictionary<string, object>
+                                {
+                                    ["success"] = false,
+                                    ["source"] = sourceEntry.Name,
+                                    ["target"] = targetEntry.Name,
+                                    ["error"] = "The pasted object did not persist in '" + arrayName +
+                                                "' (the serializer dropped it); rolled back.",
+                                    ["error_code"] = "PASTE_NOT_PERSISTED"
+                                };
+                            }
+                        }
+                    }
+                    catch { }
+                }
 
                 return new Dictionary<string, object>
                 {
@@ -464,7 +528,8 @@ namespace FrostyMcpPlugin.Bridge
                     ["target"] = targetEntry.Name,
                     ["added_to_array"] = added ? arrayName : null,
                     ["class_guid"] = newGuid.ToString(),
-                    ["object_type"] = copy.GetType().Name
+                    ["object_type"] = copy.GetType().Name,
+                    ["source_index_space"] = sourceIndex >= 0 ? "sourceAsset.Objects" : null
                 };
             }
             catch (Exception ex)
@@ -953,14 +1018,40 @@ namespace FrostyMcpPlugin.Bridge
 
         private static bool TryAddPointer(object root, string arrayName, PointerRef pref)
         {
-            PropertyInfo pi = root.GetType().GetProperty(arrayName);
-            if (pi == null) return false;
-            if (pi.GetValue(root) is IList list)
-            {
-                list.Add(pref);
-                return true;
-            }
-            return false;
+            if (!TryGetPointerList(root, arrayName, out IList list))
+                return false;
+            list.Add(pref);
+            return true;
+        }
+
+        private static bool TryGetPointerList(object host, string arrayName, out IList list)
+        {
+            list = null;
+            if (host == null || string.IsNullOrEmpty(arrayName))
+                return false;
+            PropertyInfo pi = host.GetType().GetProperty(arrayName);
+            if (pi == null)
+                return false;
+            list = pi.GetValue(host) as IList;
+            return list != null;
+        }
+
+        // The element class a pointer list declares through EbxFieldMeta. Null means
+        // the field carries no metadata, so the caller cannot be checked either way.
+        private static Type GetPointerListBaseType(object host, string arrayName)
+        {
+            if (host == null || string.IsNullOrEmpty(arrayName))
+                return null;
+            PropertyInfo pi = host.GetType().GetProperty(arrayName);
+            return pi?.GetCustomAttribute<EbxFieldMetaAttribute>()?.BaseType;
+        }
+
+        // Objects that carry an instance GUID are registered in asset.Objects;
+        // structure-like classes are written inline and must not be added there.
+        internal static bool HasInstanceGuid(object o)
+        {
+            return o != null
+                && o.GetType().GetMethod("GetInstanceGuid", BindingFlags.Public | BindingFlags.Instance) != null;
         }
 
         private static void AppendOrSetStruct(object host, string path, object inst)

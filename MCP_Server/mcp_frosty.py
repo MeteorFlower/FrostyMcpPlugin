@@ -274,6 +274,9 @@ class FrostyNamedPipeBridgeClient:
         # Pipe chosen by use_profile, or None when the server follows whichever
         # editor is running.
         self.pinned_pipe = None
+        # Keep the Windows error from the last failed CreateFile so callers can
+        # distinguish "pipe busy" (231) from "no editor" instead of guessing.
+        self.last_connect_error = None
         if win32file is None or pywintypes is None:
             raise RuntimeError(
                 "Named pipe transport requires Windows and pywin32. "
@@ -307,8 +310,10 @@ class FrostyNamedPipeBridgeClient:
                     0,
                     None,
                 )
+                self.last_connect_error = None
                 return True
-            except pywintypes.error:
+            except pywintypes.error as exc:
+                self.last_connect_error = exc
                 return False
 
     def _read_exact(self, size):
@@ -412,16 +417,34 @@ class FrostyNamedPipeBridgeClient:
                 time.sleep(0.2 * (attempt + 1))
             if not connected:
                 running = _open_bridge_pipes()
+                err = self.last_connect_error
+                winerror = getattr(err, "winerror", None)
+                pinned = self.pinned_pipe or PIPE_NAME
+                if winerror == 231:
+                    raise ConnectionError(
+                        "Frosty pipe is busy (ERROR_PIPE_BUSY 231) at %s. "
+                        "Another request or client still holds the only server instance; "
+                        "this is not a profile-selection problem. Wait for the running "
+                        "command, close the stale client, or start a second editor with "
+                        "the same profile (the bridge allows multiple server instances)."
+                        % pinned
+                    )
+                if self.pinned_pipe:
+                    raise ConnectionError(
+                        "Pinned Frosty pipe %s is not reachable%s. "
+                        "The editor may have exited, or another process is holding the pipe."
+                        % (pinned, "" if err is None else " (%s)" % err)
+                    )
                 if len(running) > 1:
                     raise ConnectionError(
-                        "Several editors are listening (%s) and FROSTY_MCP_PROFILE is not set. "
+                        "Several editors are listening (%s) and no profile is pinned. "
                         "Call use_profile with one of them first."
                         % ", ".join(running)
                     )
                 raise ConnectionError(
-                    "Frosty MCP Bridge is not reachable at %s. "
+                    "Frosty MCP Bridge is not reachable at %s%s. "
                     "Start Frosty Editor with FrostyMcpPlugin loaded first."
-                    % PIPE_NAME
+                    % (pinned, "" if err is None else " (%s)" % err)
                 )
 
         request = {
@@ -493,7 +516,7 @@ mcp = FastMCP(
     MCP_SERVER_NAME,
     instructions=(
         "Frosty Editor MCP bridge v"
-        + os.environ.get("FROSTY_MCP_VERSION", "2.3.14")
+        + os.environ.get("FROSTY_MCP_VERSION", "2.3.22")
         + ". Tools that take a commit parameter are two-phase: the first call "
         "returns would_change + plan, and repeating the identical call with "
         "commit=true executes it. Tools without commit apply immediately. "
@@ -939,8 +962,10 @@ async def insert_ebx_item(name: str = "", guid: str = "", path: str = "", class_
                           index: int = -1, source_index: int = -1, commit: bool = False) -> str:
     """Insert an element into an EBX array, mirroring the property grid's Insert item.
 
-    With source_index the element at that position is reused; otherwise a default
-    value is inserted (a null PointerRef for PointerRef lists).
+    With source_index the element at that position (of the array being inserted into)
+    is deep-copied; otherwise a default value is inserted (a null PointerRef for
+    PointerRef lists). A failed commit rolls the insertion back, so INSERT_FAILED
+    means the list count did not change and the call can be retried.
 
     First call returns would_change; call again with commit=True to execute.
     """
@@ -2244,7 +2269,16 @@ async def clipboard_paste_object(
     source_index: int = -1,
     array: str = "Objects",
 ) -> str:
-    """Paste an object into target EBX via FrostyClipboard (regenerates GUIDs). Same as BF1 GetFrostyClipboardPasteData."""
+    """Paste an object into target EBX via FrostyClipboard (regenerates GUIDs). Same as BF1 GetFrostyClipboardPasteData.
+
+    Source selection: class_guid matches the object's ExportedGuid and only finds
+    exported objects; source_index is the position in the SOURCE ASSET's root Objects
+    list, not a position in the destination array and not a same-named list. The
+    source type is checked against the destination array's declared element class
+    before anything is copied, and the pasted slot is read back afterwards, so a
+    wrong type fails with TYPE_MISMATCH and a dropped element fails with
+    PASTE_NOT_PERSISTED instead of returning success.
+    """
     params = {
         "name": name, "guid": guid, "class_guid": class_guid,
         "source_name": source_name, "source_guid": source_guid, "array": array,

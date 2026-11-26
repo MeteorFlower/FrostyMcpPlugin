@@ -6,7 +6,7 @@ description: Use the Frosty Editor MCP bridge to inspect and edit Frostbite EBX 
 # Frosty Editor MCP
 
 Wraps a running Frosty Editor through a named pipe. 162 tools. The bridge reports version
-2.3.12 through `capabilities`; this file describes that build.
+2.3.20 through `capabilities`; this file describes that build.
 
 ## Servers and prerequisites
 
@@ -107,7 +107,9 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
   (`Transform.trans.x`, `Items[0]`); `Components` and `Objects` are interchangeable.
 - `search_ebx_fields`: find field names or values inside any component or connection.
 - `get_ebx_field` / `set_ebx_field`: one field, addressed by `class_guid`, `index`, or
-  `component_type` + `type_index`; `$PropertyConnections[0].SourceField` style paths reach
+  `component_type` + `type_index`. A value stored as a `BoxedValue` is returned unwrapped
+  as `{"boxed_type": ..., "array_type": ..., "value": ...}`.
+  `$PropertyConnections[0].SourceField` style paths reach
   connections. An external PointerRef that names only the asset takes its class GUID from
   the field's declared base type rather than defaulting to the target root; several
   candidates fail with `SET_FAILED` and an `AMBIGUOUS_POINTER` message, none fails with
@@ -129,7 +131,8 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
   require 15 on spatial prefab roots and others use a different value.
 - `research_component_usage`: how often one component type appears, with the field names
   and peer types it is wired to; `assets_json` studies an explicit asset list instead of
-  scanning.
+  scanning. `max_scan: 0` means the whole project; a positive value caps the scan and the
+  reply then reports `scan_truncated`.
 
 ### Creating, copying and reverting EBX
 - `create_ebx`: a bare EBX of a type; only suitable for pure-data types.
@@ -143,10 +146,14 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
   the linked RES and chunks, then renumber every exported object GUID the same way.
   NewWaveAsset is the exception: its GUIDs stay as the duplication extension made them,
   because the sound resource and bank key are derived from them.
-- `revert_asset`: undo edits on one EBX/RES/chunk. On the project's localization database
+- `revert_asset`: undo edits on one EBX/RES/chunk. It re-reads the asset afterwards and
+  reports `was_modified` and `verified_clean`; an asset that is still modified returns
+  `REVERT_INCOMPLETE` instead of a bare success. On the project's localization database
   it refuses with `LOCALIZED_STRINGS_PENDING` while edited strings exist; pass
   `revert_strings: true` to revert the string layer together with the asset.
 - `export_asset`: export through the editor's asset definition (format depends on type).
+  `path` is a full file path; passing a directory is rejected with `INVALID_PARAMS` before
+  the asset definition runs.
 - `export_ebx_bin` / `import_ebx_bin`: binary EBX round trip.
 - `diff_ebx`: line-level diff of an asset against its vanilla data. On the localization
   database it also reports `localized_strings_modified`, because edited strings live
@@ -199,26 +206,34 @@ Read `plan` before committing: it lists the resolved members, indices, counts an
 - `get_component`: one component, property dump optional (`include_properties`).
 - `create_component`: new EntityData on a blueprint; `at_index` inserts, `array_host_guid`
   targets an array on a nested host, and a missing array is an error rather than an orphan.
-  With neither argument the pointer goes into the root `Objects` array. A node added to a
+  With neither argument the pointer goes into `PVZCharacterWeaponData.Components` on a
+  weapon blueprint or `PVZCharacterEntityData.Components` on a character blueprint, and
+  into the root `Objects` array on assets that have neither host. `SoundEntityData`
+  (`Audio.SoundEntityData`) is the exception and stays on root `Objects`. A node added to a
   SoundPatch is also appended to `Graph.Nodes` and reported in `registered_in_graph`; an
   object added to the root `Objects` of an asset that carries a `WidgetSpawnerItemData` is
   also appended to its `Components` and reported in `registered_in`, which is what lets a
   Rime entity run at all.
 - `duplicate_component`: copy one component with fresh GUIDs, optional `properties`
-  overrides and the same extra registrations; `at_index` inserts, but the array is always
-  one of the root object's and `array_host_guid` is ignored. The numbering rules below
-  apply to it too.
+  overrides and the same extra registrations; the default array follows the same rule as
+  `create_component`. On a character blueprint the copy is registered in
+  `PVZCharacterEntityData.Components` and reported in `registered_in_entity`.
+  `array_host_guid` is still ignored. The numbering rules below apply to it too.
 - `remove_component`: drop a component and the arrays/connections touching it; reports
   `cleared_paths`.
 - `set_component_flags`: object flags and realm.
 - `get_component_property` / `set_component_property`: SDK properties by dotted path.
 - `remove_ebx_item`: delete elements from any EBX array (property-grid Remove item).
 - `insert_ebx_item`: insert into any array (property-grid Insert item). With
-  `source_index`, the element is deep-copied, so editing the inserted element does not
-  change the source; internal pointers get fresh identities in the host asset.
+  `source_index`, the element is copied, so editing the inserted element does not change
+  the source. Pointer elements go through FrostyClipboard and get fresh internal
+  identities; struct elements (e.g. `PropertyChannel`) are rebuilt field by field,
+  because the clipboard copy of a struct is dropped by the EBX writer on save.
 - `create_ebx_class` / `list_ebx_class_types`: create a class into a PointerRef field.
   `create_only` registers the object without assigning it, and is refused when nothing
-  references it.
+  references it. When the host is the root object, an object written into `Objects` is also
+  registered in `WidgetSpawnerItemData.Components` (`registered_in`) and, on a character
+  blueprint, in `PVZCharacterEntityData.Components` (`registered_in_entity`).
 - `create_struct`: new struct value, optionally appended to a list.
 - `clipboard_paste_object`: paste a copied object graph with regenerated GUIDs.
 
@@ -233,13 +248,19 @@ Every object added by `create_component`, `duplicate_component`, `create_ebx_cla
 
 - `ClientIndex` / `ServerIndex`: the whole asset is renumbered by **depth-first order**
   over the object tree, per side, densely from 0 with no gaps and no repeats; the two
-  `*RuntimeComponentCount` fields on the entity are set to the resulting totals. Which
+  `*RuntimeComponentCount` fields are set on the entity that owns the component list
+  (the `array_host_guid` host), not on the first entity in the asset — weapon blueprints
+  embed a projectile entity whose own counters must stay untouched. Which
   side an object occupies is preserved: an object that was 255 on a side stays 255 there,
   a new object mirrors the side of an existing instance of its type (or falls back to its
   realm). The walk follows `Components` only, and that list holds `PointerRef` wrappers,
-  not the objects. `remove_component` and `remove_ebx_item` run the same pass, because a
-  deleted component would otherwise leave a hole. "One past the highest value in use" is
-  wrong and used to leave a hole the game dereferences at load; do not reintroduce it.
+  not the objects. Every tool that changes the component set runs the same pass:
+  `remove_component` and `remove_ebx_item` (a deleted component would otherwise leave a
+  hole), `insert_ebx_item` into a Components array, `set_ebx_field` /
+  `set_component_property` / `set_ebx_property` when the path names `Components`, and
+  `clipboard_paste_object`. The reply carries `index_sides` with the resulting counts.
+  "One past the highest value in use" is wrong and used to leave a hole the game
+  dereferences at load; do not reintroduce it.
   Verifying a result: export the asset and check that the recorded values equal the
   depth-first position per side. Vanilla playable blueprints satisfy that exactly.
 - `InternalId`: a duplicated graph arrives with ids of -1 or with ids that repeat existing
@@ -297,6 +318,10 @@ earlier component had.
   the codec header, and the error reply carries `is_seekable: true`.
 - `import_sound`: re-encode any audio file with SoundEditorPlugin's tool, updating the
   chunk and the segment and variation tables.
+- There is no way to start a `NewWaveAsset` from nothing. `create_ebx` produces a wave with
+  an empty chunk table, and `import_sound` then refuses with `chunk_index out of range`.
+  This is a tool limitation, not a transient bug: create a wave by duplicating a template
+  with `duplicate_deep`, then import into the copy.
 - `export_ies`: IES profile as a DDS.
 - `refresh_mesh_variations`: reload MeshVariationDb.
 
@@ -557,9 +582,16 @@ protection actually reaches, because it is narrower than the flag suggests.
 
 **`set_component_flags` reports success when it changed nothing.** `ApplyObjectFlags` starts from the current word because `preserveGuidBits` is true and applies a key only when `p[key] != null`, so a misspelled flag name is ignored. An unrecognized `flag_preset`, meaning anything other than `client`, `server`, `client_and_server` or `both`, falls into the toggle branch with no keys present and rewrites the same value. `realm: ""` is swallowed by `SetEnumProperty`, which returns immediately on whitespace. Compare the `flags` value in the reply against the value before the call.
 
-**A failed section in `list_connections` looks exactly like an asset with no connections.** `AppendPropertyConnections`, `AppendEventConnections` and `AppendLinkConnections` each wrap their loop in a bare `catch`, and the reply has no `scan_errors` equivalent, so `success: true` with `total: 0` covers both nothing exists and the loop threw. With the default `compact: true` the serialiser also omits `flags_hex` and `source_cant_be_static`, hiding the bit 3 state. The `filter` argument is a case-insensitive substring over the whole serialised row, so `filter: "client"` matches realm text and `filter: "property"` matches the `kind` field.
+**A failed row in `list_connections` is visible but easy to miss.** Each Append function now
+serialises one row at a time; a row that throws becomes a placeholder
+(`serialization_failed: true` with `kind`, `index` and `error`) and the loop continues.
+The reply carries `scan_errors` and, when it is non-zero, a `note`. A non-zero count means
+some rows are placeholders rather than real connections. With the default `compact: true`
+the serialiser also omits `flags_hex` and `source_cant_be_static`, hiding the bit 3 state.
+The `filter` argument is a case-insensitive substring over the whole serialised row, so
+`filter: "client"` matches realm text and `filter: "property"` matches the `kind` field.
 
-**The array a new component lands in is not always the one you named.** In `create_component`, supplying `at_index` calls `TryInsertPointerToArray` directly, which has no fallback to `Components` or `Children` and clamps an out-of-range index down to `list.Count`; without `at_index` the same call walks `Objects`, `Components`, `Children` and reports whichever accepted it in `added_to_array`. The `index` inside `component` comes from `IndexOfObject` and is the position in `asset.Objects`, not the array position you asked for. `duplicate_component` never reads `array_host_guid` and always inserts on `asset.RootObject`, and it copies none of the source connections. Both tools then save and read the array back; an `OBJECT_NOT_PERSISTED` reply means the object was taken out again, so do not go looking for a half-added component.
+**The array a new component lands in is not always the one you named.** `create_component` and `duplicate_component` choose `PVZCharacterWeaponData.Components` or `PVZCharacterEntityData.Components` when `array` is omitted, and otherwise walk `Objects`, `Components`, `Children` and report whichever accepted the pointer in `added_to_array`. `at_index` still calls `TryInsertPointerToArray` directly and clamps an out-of-range index to `list.Count`. The `index` inside `component` comes from `IndexOfObject` and is the position in `asset.Objects`, not the array position you asked for. `duplicate_component` still ignores `array_host_guid` and copies none of the source connections. Both tools save and read the array back; an `OBJECT_NOT_PERSISTED` reply means the object was taken out again, so do not go looking for a half-added component.
 
 **`type` and `modified_only` in `list_bundle_contents` only filter EBX rows.** Both conditions sit inside the `EnumerateEbx` loop, after the RES and chunk loops have already appended their rows, so with `kind: "all"` a `type` filter is applied to part of the result only. The reply echoes `kind` and `total` without saying the filter was partly ignored. The three kinds are also concatenated in a fixed order (res, then chunk, then ebx), so paging with `offset` and `limit` crosses sections.
 
